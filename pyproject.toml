@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mtx"
+version = "0.1.0"
+description = "Master extractor: an exhaustive, reproducible measurement dump for lossless audio files. Measures; never interprets."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "projectoverseer" }]
+keywords = ["audio", "mastering", "loudness", "ebu-r128", "measurement", "dsp", "forensics"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Topic :: Multimedia :: Sound/Audio :: Analysis",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "soundfile>=0.12",
+  "mutagen>=1.46",
+  "pyloudnorm>=0.1.1",
+  "librosa>=0.10",
+]
+
+[project.optional-dependencies]
+plots = ["matplotlib>=3.7"]
+stems = ["demucs>=4.0"]
+dev = ["pytest>=7.0", "matplotlib>=3.7"]
+
+[project.scripts]
+mtx = "mtx.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/projectoverseer/mtx"
+Issues = "https://github.com/projectoverseer/mtx/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

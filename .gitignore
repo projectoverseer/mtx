@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+mtx_out/
+.pytest_cache/
+.mtx_cache/
+*.flac
+*.wav
+*.aiff
+*.aif
+!tests/data/*.wav
+
+# scratch
+selftest.err
+ci_out*/
+ci_signal.flac
