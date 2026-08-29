@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import platform
 import random
@@ -21,6 +20,7 @@ from .metrics import (dynamics as m_dynamics, fileinfo as m_fileinfo,
                       processing as m_processing, spectrum as m_spectrum,
                       stereo as m_stereo, structure as m_structure)
 from .params import PARAMS, profile_params
+from .split import DEFAULT_PART_BYTES
 from .util import Collector, jsonable
 
 SEED = 0
@@ -48,7 +48,7 @@ def _versions() -> dict[str, Any]:
     for tool in ("ffmpeg", "ffprobe"):
         try:
             p = subprocess.run([tool, "-version"], capture_output=True, text=True,
-                               timeout=30)
+                               encoding="utf-8", errors="replace", timeout=30)
             out[tool] = p.stdout.splitlines()[0] if p.stdout else None
         except Exception:
             out[tool] = None
@@ -194,19 +194,24 @@ def analyze_file(path: str, profile: str = "full", want_stems: bool = False,
 
 def write_outputs(res: dict[str, Any], out_dir: str, *, json_only: bool = False,
                   plots: bool = False, src_path: str | None = None,
+                  max_part_bytes: int | None = DEFAULT_PART_BYTES,
                   log=None) -> dict[str, str]:
-    """Write analysis.json, digest.md and optionally plots/.  Returns paths."""
+    """Write analysis.json, digest.md and optionally plots/.  Returns paths.
+
+    `analysis.json` is written whole when it fits under `max_part_bytes`, and
+    as an index plus `analysis.partNN.json` files when it does not: the
+    exhaustive dump of a four-minute track runs past the 5 MB per-file cap most
+    places put on an upload, and a file that cannot be uploaded stays on one
+    machine.  `max_part_bytes=None` always writes the single file.
+    """
     from .digest import render_digest
+    from .split import write_analysis
 
     os.makedirs(out_dir, exist_ok=True)
     written: dict[str, str] = {}
     t0 = time.time()
-    json_path = os.path.join(out_dir, "analysis.json")
-    with open(json_path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(jsonable(res), f, indent=1, sort_keys=True, ensure_ascii=False,
-                  allow_nan=False)
-        f.write("\n")
-    written["analysis.json"] = json_path
+    written.update(write_analysis(jsonable(res), out_dir, "analysis",
+                                  max_bytes=max_part_bytes, log=log))
     if log:
         log(f"  writing outputs: {time.time() - t0:.1f} s")
 

@@ -40,7 +40,8 @@ def ffmpeg_ebur128(path: str, collector: Collector) -> dict[str, Any]:
             ["ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-i", path,
              "-map", "0:a:0", "-af", "ebur128=peak=true:framelog=quiet",
              "-f", "null", "-"],
-            capture_output=True, text=True, timeout=1800,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=1800,
         )
     except FileNotFoundError:
         out["reason"] = "ffmpeg not found on PATH; loudness cross-validation unavailable"

@@ -6,7 +6,6 @@ wrong conclusion, so the gain is applied first and reported in the output.
 
 from __future__ import annotations
 
-import json
 import os
 from typing import Any
 
@@ -20,6 +19,7 @@ from .digest import hz, kv_rows, n, table
 from .dsp import (block_loudness, correlation, gated_integrated,
                   spectrum_table, third_octave_edges, welch_psd)
 from .params import BANDS, PARAMS, THIRD_OCTAVE_CENTRES
+from .split import DEFAULT_PART_BYTES, write_analysis
 from .util import Collector, db_amp, db_pow, jsonable
 
 # Metrics whose value moves with the level match, and those that do not.
@@ -155,7 +155,9 @@ def run_null_test(pa: str, pb: str, collector: Collector) -> dict[str, Any]:
 
 
 def compare_files(pa: str, pb: str, out_dir: str, *, null_test: bool = False,
-                  profile: str = "full", log=None) -> dict[str, str]:
+                  profile: str = "full",
+                  max_part_bytes: int | None = DEFAULT_PART_BYTES,
+                  log=None) -> dict[str, str]:
     do_null = null_test
     if log:
         log(f"analysing A: {os.path.basename(pa)}")
@@ -256,15 +258,15 @@ def compare_files(pa: str, pb: str, out_dir: str, *, null_test: bool = False,
     result["warnings"] = collector.warnings
 
     os.makedirs(out_dir, exist_ok=True)
-    jp = os.path.join(out_dir, "comparison.json")
-    with open(jp, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(jsonable(result), f, indent=1, sort_keys=True, ensure_ascii=False,
-                  allow_nan=False)
-        f.write("\n")
+    # Same part limit as `analyze`: a null test carries a per-second residual
+    # timeline, so a comparison of two long files is not automatically small.
+    written = write_analysis(jsonable(result), out_dir, "comparison",
+                             max_bytes=max_part_bytes, log=log)
     mp = os.path.join(out_dir, "comparison.md")
     with open(mp, "w", encoding="utf-8", newline="\n") as f:
         f.write(render_comparison(result))
-    return {"comparison.json": jp, "comparison.md": mp}
+    written["comparison.md"] = mp
+    return written
 
 
 def _delta(ra: dict, rb: dict, path: list[str]) -> dict[str, Any]:

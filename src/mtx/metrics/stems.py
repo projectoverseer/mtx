@@ -53,7 +53,8 @@ def separate(path: str, collector: Collector) -> dict[str, str] | None:
     os.makedirs(out_root, exist_ok=True)
     cmd = [sys.executable, "-m", "demucs", "-n", model, "-o", out_root, path]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=7200)
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         collector.warn("stems", f"demucs failed to run: {exc!r}")
         return None

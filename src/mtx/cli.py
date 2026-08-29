@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
+import re
 import sys
 import time
+import unicodedata
 from typing import Any
 
 from . import __version__
@@ -23,9 +26,48 @@ def _log(msg: str) -> None:
     print(f"[mtx] {msg}", file=sys.stderr, flush=True)
 
 
-def _default_out(base_out: str | None, path: str) -> str:
-    stem = os.path.splitext(os.path.basename(path))[0]
-    return os.path.join(base_out or "mtx_out", stem)
+_BAD_FS_CHARS = re.compile('[<>:"/\\\\|?*\\x00-\\x1f]')
+
+
+def _sanitise_component(s: str) -> str:
+    """Make a tag value usable as a single path component on Windows and POSIX."""
+    s = _BAD_FS_CHARS.sub("_", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _join_artists(raw: str) -> str:
+    """`ROSE;Bruno Mars;Rose` -> `ROSE, Bruno Mars` (multi-value tags, deduped)."""
+    parts, seen = [], set()
+    for chunk in re.split("[;" + chr(0) + "]| / ", raw):
+        chunk = chunk.strip()
+        # Fold accents for the duplicate check so "ROSE" and "ROSE" (accented) match.
+        key = "".join(c for c in unicodedata.normalize("NFKD", chunk.lower())
+                      if not unicodedata.combining(c))
+        if chunk and key not in seen:
+            seen.add(key)
+            parts.append(chunk)
+    return ", ".join(parts)
+
+
+def _folder_name(path: str, res: dict[str, Any] | None = None) -> str:
+    """`Artist - Title` from the embedded tags, falling back to the filename."""
+    named = ((res or {}).get("tags") or {}).get("named") or {}
+    title = _sanitise_component(str(named.get("title") or ""))
+    artist = _sanitise_component(_join_artists(
+        str(named.get("artist") or "") or str(named.get("albumartist") or "")))
+    if title and artist:
+        name = f"{artist} - {title}"
+    elif title:
+        name = title
+    else:
+        name = ""
+    name = name[:150].strip().rstrip(". ")   # Windows: no trailing dot or space
+    return name or os.path.splitext(os.path.basename(path))[0]
+
+
+def _default_out(base_out: str | None, path: str,
+                 res: dict[str, Any] | None = None) -> str:
+    return os.path.join(base_out or "mtx_out", _folder_name(path, res))
 
 
 def _check_readable(path: str) -> None:
@@ -40,16 +82,89 @@ def _check_readable(path: str) -> None:
         raise SystemExit(1)
 
 
+def _parse_bytes(text: str, flag: str, example: str) -> int:
+    """`20k`, `20kb`, `4.5m`, `20480` -> bytes."""
+    t = text.strip().lower().replace("_", "")
+    mult = 1
+    for suffix, m in (("kb", 1024), ("k", 1024), ("mb", 1024 * 1024), ("m", 1024 * 1024)):
+        if t.endswith(suffix):
+            t, mult = t[: -len(suffix)], m
+            break
+    try:
+        return int(round(float(t) * mult))
+    except ValueError:
+        _log(f"error: cannot read {flag} {text!r}; try {example}")
+        raise SystemExit(1)
+
+
+def parse_part_size(args: argparse.Namespace) -> int | None:
+    """The per-file cap the JSON output is split to fit under.
+
+    `None` means "never split".  The default exists because the exhaustive dump
+    of a normal track is past the 5 MB per-file limit an upload usually has,
+    and a measurement that cannot leave the machine is half a measurement.
+    """
+    from .split import DEFAULT_PART_BYTES, MIN_PART_BYTES, NOTION_UPLOAD_LIMIT
+
+    if getattr(args, "no_split", False):
+        return None
+    text = getattr(args, "max_part_size", None)
+    if text is None:
+        return DEFAULT_PART_BYTES
+    value = _parse_bytes(text, "--max-part-size", "4.5m or 4500000")
+    if value < MIN_PART_BYTES:
+        _log(f"error: --max-part-size {text!r} is below the "
+             f"{MIN_PART_BYTES // 1024} KB floor; below that the index and its "
+             "manifest do not fit in a part of their own")
+        raise SystemExit(1)
+    if value > NOTION_UPLOAD_LIMIT:
+        _log(f"note: --max-part-size {value / 1e6:.1f} MB is above the 5 MB "
+             "limit Notion enforces per upload; the parts will be too big for it")
+    return value
+
+
+def _add_part_size_args(p: argparse.ArgumentParser) -> None:
+    from .split import DEFAULT_PART_BYTES
+
+    p.add_argument("--max-part-size", metavar="BYTES",
+                   help="size a single JSON output file may reach before it is "
+                        f"written as an index plus parts (default "
+                        f"{DEFAULT_PART_BYTES / 1e6:.1f}m, under the 5 MB "
+                        "per-file upload limit); e.g. 4.5m or 2m")
+    p.add_argument("--no-split", action="store_true",
+                   help="always write one JSON file, however large")
+
+
+def cmd_join(args: argparse.Namespace) -> int:
+    """Put a split analysis back together."""
+    from .split import join
+
+    if not os.path.exists(args.path):
+        _log(f"error: no such file or directory: {args.path}")
+        return 1
+    try:
+        out = join(args.path, args.out)
+    except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+        _log(f"error: {exc}")
+        return 1
+    _log(f"rejoined -> {out} ({os.path.getsize(out) / 1e6:.1f} MB)")
+    print(out)
+    return 0
+
+
 def cmd_analyze(args: argparse.Namespace) -> int:
     from .analyze import analyze_file, write_outputs
 
     _check_readable(args.file)
+    part_size = parse_part_size(args)
     t0 = time.time()
     res = analyze_file(args.file, profile=args.profile, want_stems=args.stems,
                        log=lambda s: _log(f"  {s}"))
-    out_dir = args.out if args.out and args.single_out else _default_out(args.out, args.file)
+    out_dir = (args.out if args.out and args.single_out
+               else _default_out(args.out, args.file, res))
     written = write_outputs(res, out_dir, json_only=args.json_only,
-                            plots=args.plots, src_path=args.file, log=_log)
+                            plots=args.plots, src_path=args.file,
+                            max_part_bytes=part_size, log=_log)
     _log(f"done in {time.time() - t0:.1f} s -> {out_dir}")
     for k, v in written.items():
         _log(f"  {k}: {v}")
@@ -99,6 +214,7 @@ def cmd_batch(args: argparse.Namespace) -> int:
         return 1
     _log(f"{len(files)} file(s) to analyse")
 
+    part_size = parse_part_size(args)
     base_out = args.out or "mtx_out"
     rows: list[dict[str, Any]] = []
     failures = 0
@@ -111,9 +227,9 @@ def cmd_batch(args: argparse.Namespace) -> int:
             failures += 1
             _log(f"  failed: {exc!r}")
             continue
-        out_dir = _default_out(base_out, path)
+        out_dir = _default_out(base_out, path, res)
         write_outputs(res, out_dir, json_only=args.json_only, plots=args.plots,
-                      src_path=path, log=_log)
+                      src_path=path, max_part_bytes=part_size, log=_log)
         h = res["headline"]
         t = res.get("tags", {}).get("named", {})
         row = {k: h.get(k) for k in CSV_FIELDS if k in h}
@@ -150,7 +266,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
         os.path.splitext(os.path.basename(args.file_b))[0])
     paths = compare_files(args.file_a, args.file_b, out_dir,
                           null_test=args.null_test, profile=args.profile,
-                          log=_log)
+                          max_part_bytes=parse_part_size(args), log=_log)
     for k, v in paths.items():
         _log(f"  {k}: {v}")
     print(out_dir)
@@ -180,6 +296,7 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--stems", action="store_true",
                    help="separate stems with demucs and measure each")
     a.add_argument("--json-only", action="store_true", help="skip digest.md")
+    _add_part_size_args(a)
     a.set_defaults(func=cmd_analyze)
 
     b = sub.add_parser("batch", help="measure every audio file in a folder")
@@ -191,6 +308,7 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--plots", action="store_true")
     b.add_argument("--stems", action="store_true")
     b.add_argument("--json-only", action="store_true")
+    _add_part_size_args(b)
     b.set_defaults(func=cmd_batch)
 
     c = sub.add_parser("compare", help="level-matched comparison of two files")
@@ -200,7 +318,16 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--null-test", action="store_true",
                    help="align, invert and sum; report the residual")
     c.add_argument("--profile", choices=("quick", "full"), default="full")
+    _add_part_size_args(c)
     c.set_defaults(func=cmd_compare)
+
+    j = sub.add_parser("join", help="rebuild a split analysis.json from its "
+                                    "index and part files")
+    j.add_argument("path", help="the index file (analysis.json) or the "
+                                "directory holding it")
+    j.add_argument("--out", help="output path (default <name>.full.json "
+                                 "next to the index)")
+    j.set_defaults(func=cmd_join)
 
     s = sub.add_parser("selftest", help="synthetic signals with known answers")
     s.add_argument("--quiet", action="store_true")

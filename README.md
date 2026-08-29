@@ -51,8 +51,10 @@ with the measured value for each. It exits non-zero if anything fails.
 
 ```
 mtx analyze <file> [--out DIR] [--profile quick|full] [--plots] [--stems] [--json-only]
+                   [--max-part-size 4.5m] [--no-split]
 mtx batch <dir> [--out DIR] [--recursive] [--csv summary.csv]
 mtx compare <fileA> <fileB> [--out DIR] [--null-test]
+mtx join <analysis.json|DIR> [--out FILE]
 mtx selftest
 mtx --version
 ```
@@ -62,6 +64,8 @@ mtx --version
 - `batch` — one JSON per file plus a single CSV of headline metrics, one row per
   track. This is how you bootstrap a reference library from records you own.
 - `compare` — two files, **level-matched first**, with an optional null test.
+- `join` — puts a split `analysis.json` back together (see *Uploading the
+  analysis* below). Reads the index or the directory holding it.
 - Default output directory: `./mtx_out/<basename>/`.
 - Progress goes to stderr; stdout carries only the output path.
 - Exit codes: `0` success, `1` unreadable input, `2` a self-test assertion failed.
@@ -70,7 +74,8 @@ mtx --version
 
 | File | What it is |
 | --- | --- |
-| `analysis.json` | Everything, with the full parameter block. Large; stays on your machine. |
+| `analysis.json` | Everything, with the full parameter block. Large. Past the part size limit it becomes an index plus `analysis.partNN.json`. |
+| `analysis.partNN.json` | Only when the analysis is over the limit. One fragment each, listed in the index's `split` block. |
 | `digest.md` | `HEADLINE` / `FLAGS` / `DETAIL` / `CORPUS ROW` / `METHOD`. Hard cap ~12 KB. |
 | `plots/*.png` | Only with `--plots`. For your own eyes; never referenced by the digest. |
 
@@ -78,6 +83,35 @@ mtx --version
 low-confidence metric are the first thing you read.
 
 A worked example is in [`samples/digest.md`](samples/digest.md).
+
+### Uploading the analysis
+
+A full-profile analysis of a four-minute track is comfortably past 5 MB, which
+is the per-file cap on an upload to Notion and to most other places a
+measurement archive ends up. So `analysis.json` is written whole while it fits
+under the limit, and as an index plus numbered parts when it does not:
+
+```
+analysis.json            the index: the headline, run, params, warnings and
+                         every other section small enough to stay inline,
+                         plus `split` -- the manifest naming the parts
+analysis.part01.json     one fragment each, with the path it belongs at
+analysis.part02.json
+```
+
+Every file in the set is valid JSON on its own and every one is under the
+limit, so the whole set uploads. Nothing is dropped, rounded or summarised:
+the split is a transport detail.
+
+```
+mtx analyze track.flac --max-part-size 2m    # smaller parts
+mtx analyze track.flac --no-split            # one file, however large
+mtx join mtx_out/track/                      # -> analysis.full.json
+```
+
+The default is 4.5 MB, under the 5 MB limit with room for the part header.
+`--max-part-size` and `--no-split` apply to `analyze`, `batch` and `compare`
+alike; `comparison.json` is split by the same rule.
 
 ---
 
