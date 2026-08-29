@@ -10,8 +10,10 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 import time
+import unicodedata
 from typing import Any
 
 from . import __version__
@@ -24,9 +26,53 @@ def _log(msg: str) -> None:
     print(f"[mtx] {msg}", file=sys.stderr, flush=True)
 
 
-def _default_out(base_out: str | None, path: str) -> str:
-    stem = os.path.splitext(os.path.basename(path))[0]
-    return os.path.join(base_out or "mtx_out", stem)
+# Characters no Windows path component may contain (POSIX only bars "/").
+_BAD_FS_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _sanitise_component(s: str) -> str:
+    """Make a tag value usable as a single path component."""
+    return re.sub(r"\s+", " ", _BAD_FS_CHARS.sub("_", s)).strip()
+
+
+def _join_artists(raw: str) -> str:
+    """`ROSE;Bruno Mars;Rose` -> `ROSE, Bruno Mars`: multi-value tags, deduped.
+
+    Tags arrive joined by ";", NUL or " / " depending on the container and on
+    how mutagen flattened a list.
+    """
+    parts: list[str] = []
+    seen: set[str] = set()
+    for chunk in re.split(r"[;\x00]| / ", raw):
+        chunk = chunk.strip()
+        # Fold accents for the duplicate test so "ROSÉ" and "Rose" count as one.
+        key = "".join(c for c in unicodedata.normalize("NFKD", chunk.lower())
+                      if not unicodedata.combining(c))
+        if chunk and key not in seen:
+            seen.add(key)
+            parts.append(chunk)
+    return ", ".join(parts)
+
+
+def _folder_name(path: str, res: dict[str, Any] | None = None) -> str:
+    """`Artist - Title` from the embedded tags; the filename when untagged."""
+    named = ((res or {}).get("tags") or {}).get("named") or {}
+    title = _sanitise_component(str(named.get("title") or ""))
+    artist = _sanitise_component(_join_artists(
+        str(named.get("artist") or "") or str(named.get("albumartist") or "")))
+    if title and artist:
+        name = f"{artist} - {title}"
+    elif title:
+        name = title
+    else:
+        name = ""
+    name = name[:150].strip().rstrip(". ")  # Windows: no trailing dot or space
+    return name or os.path.splitext(os.path.basename(path))[0]
+
+
+def _default_out(base_out: str | None, path: str,
+                 res: dict[str, Any] | None = None) -> str:
+    return os.path.join(base_out or "mtx_out", _folder_name(path, res))
 
 
 def _check_readable(path: str) -> None:
@@ -93,7 +139,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     t0 = time.time()
     res = analyze_file(args.file, profile=args.profile, want_stems=args.stems,
                        log=lambda s: _log(f"  {s}"))
-    out_dir = args.out if args.out and args.single_out else _default_out(args.out, args.file)
+    out_dir = args.out if args.out and args.single_out else _default_out(args.out, args.file, res)
     written = write_outputs(res, out_dir, json_only=args.json_only,
                             plots=args.plots, src_path=args.file,
                             digest_budget=budget, sections=sections,
@@ -191,7 +237,7 @@ def cmd_batch(args: argparse.Namespace) -> int:
             failures += 1
             _log(f"  failed: {exc!r}")
             continue
-        out_dir = _default_out(base_out, path)
+        out_dir = _default_out(base_out, path, res)
         write_outputs(res, out_dir, json_only=args.json_only, plots=args.plots,
                       src_path=path, log=_log)
         h = res["headline"]
@@ -335,7 +381,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     a = sub.add_parser("analyze", help="measure one file")
     a.add_argument("file")
-    a.add_argument("--out", help="output directory (default ./mtx_out/<basename>/)")
+    a.add_argument("--out", help="output directory (default ./mtx_out/<artist - title>/)")
     a.add_argument("--single-out", action="store_true",
                    help="write directly into --out instead of --out/<basename>/")
     a.add_argument("--profile", choices=("quick", "full"), default="full")

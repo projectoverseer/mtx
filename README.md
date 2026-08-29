@@ -79,7 +79,8 @@ mtx --version
   interval held. It never says whether a prediction was a good one.
 - `validate-dr` — records this implementation's DR14 against a published rating
   for a track you own. See *DR14 and the validation record* below.
-- Default output directory: `./mtx_out/<basename>/`.
+- Default output directory: `./mtx_out/<artist - title>/`, taken from the
+  embedded tags; the filename is used when the file carries no title tag.
 - Progress goes to stderr; stdout carries only the output path.
 - Exit codes: `0` success, `1` unreadable input, `2` a self-test assertion failed.
 
