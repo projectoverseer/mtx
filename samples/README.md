@@ -1,13 +1,15 @@
 # Sample output
 
-`digest.md` here is a byte-for-byte copy of what `mtx analyze` wrote, so you can
-see the output format before running the tool on real music.
+`digest.md`, `corpus_row.json` and `predict.md` here are byte-for-byte copies of
+what `mtx analyze` wrote, so you can see the output format before running the
+tool on real music.
 
-Reproduce it with:
+Reproduce them with:
 
 ```bash
 python tools/make_test_signal.py sample.flac
 mtx analyze sample.flac --out .
+mtx analyze sample.flac --out . --blind      # adds predict.md
 ```
 
 The input is the synthetic track from [`tools/make_test_signal.py`](../tools/make_test_signal.py):

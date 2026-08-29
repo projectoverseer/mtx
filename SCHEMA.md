@@ -1,6 +1,11 @@
 # `analysis.json` schema
 
-`schema_version` **1.0.0**.
+`schema_version` **1.1.0**.
+
+Changes since 1.0.0, all additive: `processing.multiband_timeline.
+band_envelope_correlation` gains `offdiagonal`, `least_correlated_pairs` and
+`most_correlated_pair`; `loudness.dr14.validation` gains `record` and its
+`validated_against_published_reference` is no longer always `false`.
 
 One line per field. Units are in the field name wherever they exist. Any field
 may be `null`; a `null` always means "could not be computed", and the reason is
@@ -147,7 +152,8 @@ CBR. `note` says so without drawing the conclusion for you.
 | `psr` | `window_s`, `hop_s`, `times_s`, `psr_db`, `shortterm_true_peak_dbtp`, `shortterm_lufs`, `min_db`, `min_time(_s)`, `p10_db`, `median_db`, `max_db`, `definition`. |
 | `streaming_preview.<platform>` | `target_lufs`, `gain_db`, `true_peak_after_dbtp`, `gain_is_positive`, `note`. |
 | `dr14` | `dr`, `dr_unrounded`, `dr_alt_sample_peak2_unrounded`, `per_channel[]` (blocks, `rms_top20_dbfs`, both peak-2 definitions, both DR values), `blocks_used`, `peak2_definition`, `validation`. |
-| `dr14.validation` | `validated_against_published_reference` (always `false`), `status`, `reason`, `self_checked_synthetically`. Read this before quoting DR. |
+| `dr14.validation` | `validated_against_published_reference`, `status`, `reason`, `self_checked_synthetically`, `record`. Read this before quoting DR. |
+| `dr14.validation.record` | What `mtx validate-dr` has stored on this machine: `store_path`, `tracks_checked`, `tracks_within_tolerance`, `tolerance_dr`, `max_abs_delta_dr`, `mean_delta_dr`, `entries[]` (`title`, `artist`, `published_dr`, `measured_dr`, `delta`, `sha256`, `checked_utc`, `tool_version`), `validated`. Empty until a track with a published rating has been checked; the record is per machine, so it is part of what `mtx run` provenance is standing in for. |
 
 ## `dynamics`
 
@@ -222,7 +228,7 @@ what the number means without stating what it implies about the record.
 | `saturation_proxy` | `slope_db_per_db`, `r2`, `frames_used`, `per_section[]`, `params`, `reading`. Slope above 1 means the material gets brighter as it gets louder. |
 | `bus_compression` | `most_negative_correlation`, `most_negative_lag_ms`, `most_positive_correlation`, `most_positive_lag_ms`, `zero_lag_correlation`, `dip_depth_db`, `estimated_release_ms`, `release_method`. "Most negative" is literal: on material with no ducking the minimum over the lag range can itself be positive. |
 | `modulation_spectrum` | `beat_rate_hz`, `envelope_rate_hz`, `bands.<band>` with `beat_depth_db`, `half_beat_depth_db`, `quarter_beat_depth_db`, `dip_phase_fraction_of_beat`, `beat_profile_depth_db`. |
-| `multiband_timeline` | `hop_ms`, `times_s`, `rms_db.<band>`, `crest_db.<band>`, `band_envelope_correlation` (`bands`, `matrix`, `mean_offdiagonal`, `reading`). |
+| `multiband_timeline` | `hop_ms`, `times_s`, `rms_db.<band>`, `crest_db.<band>`, `band_envelope_correlation` (`bands`, `matrix`, `mean_offdiagonal`, `offdiagonal` with `min`/`median`/`max`/`mean`/`pairs`, `least_correlated_pairs[]` and `most_correlated_pair` as `{bands, r}`, `reading`). The summary and the extreme pairs are what the digest renders; the full matrix stays here. |
 | `hpss` | `percussive_to_harmonic_db`, `percussive_energy_fraction`, `per_band_percussive_to_harmonic_db`, `vocal_band_proxy` (`band_hz`, `times_s`, `values_db`, `confidence`). |
 | `reverb` | `per_octave_band[]` (`centre_hz`, `events_used`, `t20_s`, `t30_s`, `t20_iqr_s`, `early_to_late_db`), `tail_stereo_correlation`, `tail_correlation_method`, `params`. |
 | `transient_density` | `hop_s`, `bands.<band>` (onsets per second) and `rate_per_s.<band>`, plus `method`. |
@@ -291,6 +297,103 @@ list chunks concatenate.
 `schema_version` does not move for this: no measured field changed, and a
 rejoined document is identical to the one a `--no-split` run writes. The split
 describes how the document was carried, not what was measured.
+
+---
+
+## `corpus_row.json` (written next to `digest.md`)
+
+The `CORPUS ROW` block as typed JSON, so a measurement reaches an archive
+without a transcription step. Keys are the property names a corpus database
+uses rather than mtx's internal field names: `Title`, `Artist`, `Year`,
+`Genre`, `Engineers`, `LUFS-I`, `True peak`, `LRA`, `PLR`, `PSR min`,
+`PSR median`, `DR14`, `Crest (loudest 10s)`, `Tonal tilt notes`,
+`Width/mono notes`, `mtx run`. Numbers stay numbers; `_units` states what each
+is in; `_source` carries the filename, the full `sha256` and the timestamp of
+the PSR minimum. Anything mtx cannot measure is `null`, never guessed --
+`Engineers` always is, and no session field (calibration, lessons, verdict)
+appears at all.
+
+## `online.json` (`mtx enrich`)
+
+`online.schema_version` **1.0.0**. A **sidecar**, written beside
+`analysis.json` and never merged into it: `mtx analyze` guarantees
+byte-identical output for the same input, and a section whose content depends
+on what MusicBrainz looked like this morning cannot live inside that
+guarantee. Absent unless `mtx enrich` has been run.
+
+| Field | Description |
+| --- | --- |
+| `schema_version` | Version of this section. |
+| `queried_utc` | ISO 8601 timestamp of the lookup. |
+| `query` | What the file claimed about itself: `isrc`, `title`, `artist`, `album`, `barcode`, `date`, `genre_tag`, `duration_s`. These are the inputs every provider was matched against. |
+| `providers_requested[]` | Providers asked, in order. |
+| `providers_available[]` | Providers that returned a match above the score floor. |
+| `match_confidence` | Mean match score across the providers that matched. `0.0` when none did. |
+| `errors[]` | Every failure, prefixed by provider. A provider that raised is caught here rather than losing the run. |
+| `cache` | `hit` / `miss` / `error` / `skipped` request counts for this track. |
+| `elapsed_seconds` | Wall-clock time of the lookup. |
+
+### `genres`
+
+| Field | Description |
+| --- | --- |
+| `available` | `false` when no source returned a usable label; `primary` is then `null` rather than guessed. |
+| `primary` | Highest-scoring genre. |
+| `umbrella` | Its coarse bucket (`pop`, `hip hop`, `r&b/soul`, `electronic`, `rock`, `jazz`, `latin`, …), decided head-final: `ambient pop` is pop, `pop rock` is rock. |
+| `ranked[]` | `{name, score, confidence, umbrella, sources[]}`, descending. `confidence` is the score relative to the winner, so "how much weaker is the second guess" reads off directly. `sources[]` names every provider level that voted for it. |
+| `umbrella_ranked[]` | `{name, score}` — the ranked list collapsed into buckets, for filtering. |
+| `agreement` | Fraction of contributing sources that backed the winner. |
+| `source_count` | Number of sources that returned any genre. |
+| `by_source` | The raw normalised votes per source, before weighting. |
+
+Scoring: within a source each vote is scaled against **that source's own top
+vote**, then multiplied by the source's trust weight (a genre attached to this
+recording outranks one attached to the artist's whole career), and the products
+are summed. Scaling against the source's sum instead would hand the win to a
+shop returning one coarse word over a database returning nine precise ones.
+Normalisation repairs spelling only — `Hip-Hop/Rap` becomes `hip hop` — and
+never merges two genres a listener can tell apart.
+
+### `descriptive_tags[]`
+
+`{name, score, sources[]}`. Mood and context words that are *not* genres —
+`dark`, `nocturnal`, `party`. Kept separate so they cannot pollute a genre
+filter; years, chart names, review-site handles and personal shelf labels are
+dropped.
+
+### `cross_checks`
+
+| Field | Description |
+| --- | --- |
+| `tempo` | `local_bpm` and `local_confidence` from `structure.tempo`, against `published_bpm` from `published_source`. `verdict` is `agree` (within 2 %), `octave` (half or double — a metrical-level disagreement, not a tempo one), `triplet` (3:2), `disagree`, or `unavailable`. `resolved_bpm` and `resolved_confidence` are the conclusion: agreement promotes a low-confidence estimate to `high`; an `octave` verdict resolves to the published value at `medium` and keeps the other reading in `alternate_bpm`, because the relationship is certain while which level to call "the tempo" is not; a real disagreement keeps the local value at `low`. |
+| `duration` | `local_s`, `providers_s`, `deltas_s`, `max_abs_delta_s`, and `verdict` (`exact` ≤ 2 s, `close` ≤ 5 s, `differs`). This is what makes a match verifiable rather than assumed. |
+| `release_date` | `sources` (tag, MusicBrainz release and release group, Deezer, Apple), `earliest`, and `agree`. |
+
+### `credits`
+
+`{role: [{name, sources[]}]}`, merged across MusicBrainz relations, Discogs
+sleeve credits, Deezer contributors and the file's own tags. A name backed by
+more than one source is a confirmed credit; the `sources[]` list is what makes
+that visible. Songwriting comes from the MusicBrainz *work* behind the
+recording, which is the one place composer and lyricist are reliably recorded.
+
+### `identity` and `popularity`
+
+`identity` carries the stable handles: `isrc`, `recording_mbid`,
+`release_mbid`, `release_group_mbid`, `work_mbid`, `iswcs[]`, `deezer_id`,
+`itunes_id`, `discogs_release_id`, `label`. `popularity` carries
+`deezer_rank`, `deezer_album_fans`, and — with a Last.fm key —
+`lastfm_listeners`, `lastfm_playcount`, `lastfm_artist_listeners`.
+
+### Per-provider blocks
+
+`musicbrainz`, `deezer`, `itunes`, `lastfm`, `discogs` each keep their own raw
+result: `available`, `errors[]`, `requests`, the `match` breakdown
+(`score`, `duration_delta_s`, `title_score`, `artist_score`, `matched_by`), and
+`candidates[]` — the rows that were considered and rejected, with their scores.
+A wrong match is therefore auditable rather than invisible.
+
+---
 
 ## `comparison.json` (`mtx compare`)
 

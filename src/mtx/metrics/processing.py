@@ -282,10 +282,29 @@ def _multiband_timeline(src: AudioSource) -> dict[str, Any]:
         ok = sd > 0
         C = np.corrcoef(M[ok]) if ok.sum() > 1 else np.zeros((0, 0))
         iu = np.triu_indices(C.shape[0], 1) if C.size else ([], [])
+        kept = [n for n, o in zip(names, ok) if o]
+        vals = C[iu] if C.size else np.zeros(0)
+        # The off-diagonal summary and the extreme pairs carry nearly all of
+        # what the full matrix says, in a form that fits the digest.
+        order = np.argsort(vals) if vals.size else np.zeros(0, dtype=int)
+
+        def _pair(idx: int) -> dict[str, Any]:
+            i, j = int(iu[0][idx]), int(iu[1][idx])
+            return {"bands": [kept[i], kept[j]], "r": float(vals[idx])}
+
         out["band_envelope_correlation"] = {
-            "bands": [n for n, o in zip(names, ok) if o],
+            "bands": kept,
             "matrix": C,
-            "mean_offdiagonal": float(np.mean(C[iu])) if C.size else None,
+            "mean_offdiagonal": float(np.mean(vals)) if vals.size else None,
+            "offdiagonal": {
+                "min": float(np.min(vals)) if vals.size else None,
+                "median": float(np.median(vals)) if vals.size else None,
+                "max": float(np.max(vals)) if vals.size else None,
+                "mean": float(np.mean(vals)) if vals.size else None,
+                "pairs": int(vals.size),
+            },
+            "least_correlated_pairs": [_pair(int(k)) for k in order[:2]],
+            "most_correlated_pair": _pair(int(order[-1])) if vals.size else None,
             "reading": "bands that move together indicate broadband processing; "
                        "bands that move independently indicate multiband",
         }

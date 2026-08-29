@@ -227,6 +227,8 @@ def read_tags(path: str, collector: Collector) -> dict[str, Any]:
 
 def run_ffprobe(path: str, collector: Collector) -> dict[str, Any] | None:
     try:
+        # utf-8 explicitly: ffprobe prints tags as UTF-8, and decoding them with
+        # the machine's locale codec fails outright on non-Latin-1 metadata.
         proc = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json",
              "-show_format", "-show_streams", path],

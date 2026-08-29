@@ -4,7 +4,7 @@ file: sample.flac
 title: (no title tag)
 artist: (no artist tag)
 sha256: 0227c4847d647f68...
-tool: mtx 0.1.0 / schema 1.0.0 / profile full
+tool: mtx 0.2.0 / schema 1.1.0 / profile full
 audio: 44100 Hz, 2 ch, PCM_24, 75.5 s
 
 ## HEADLINE
@@ -50,7 +50,7 @@ Duration              75.500 s
 - [low] processing.saturation: regression R2 is 0.04
 - [medium] processing.pumping: envelope cross-correlation reflects arrangement as well as gain reduction
 - [medium] processing.reverb: 3130 usable decays across all bands; on dense material the decay after an onset is masked by the next one, so T20/T30 are upper bounds at best
-- [unverified] DR14: not validated against a published DR rating; synthetic checks only (see METHOD)
+- [unverified] DR14: not validated against a published DR rating; synthetic checks only (run mtx validate-dr once, see METHOD)
 
 ## DETAIL
 
@@ -172,6 +172,14 @@ mono-sum loss, broadband: -0.60 dB
 mono-sum loss, worst bands: 10000 Hz -3.1 dB, 2500 Hz -3.1 dB, 6300 Hz -3.1 dB, 3150 Hz -3.1 dB, 5000 Hz -3.1 dB, 8000 Hz -3.1 dB
 ```
 
+### Band-envelope correlation (10 ms envelopes, dB domain)
+
+```
+Off-diagonal r    min 0.11  median 0.35  max 1.00  mean 0.49  over 28 band pairs
+Least correlated  low_mid/presence 0.11; low_mid/air 0.11
+Most correlated   presence/air 1.00
+```
+
 ### Processing forensics (all inferred)
 
 ```
@@ -228,17 +236,7 @@ ch  0.1    0.5    1      3      6
 1   0.717  0.892  1.183  3.525  11.471
 ```
 
-### Spectral descriptors (whole track)
-
-```
-Centroid / spread   231.8 / 611.6 Hz
-Skew / kurtosis     23.23 / 656.99
-Flatness            0.0028
-Rolloff 85/95/99    586.8 / 589.5 / 589.5 Hz
-Zero-crossing rate  0.0177
-```
-
-_Dropped to stay under the 12 KB digest budget (full detail is in analysis.json): arrangement gaps, resonances._
+_Dropped to stay under the 12 KB digest budget (full detail is in analysis.json; --sections or --digest-budget keeps a block that a session needs): arrangement gaps, resonances, spectral descriptors._
 
 ## CORPUS ROW
 
@@ -254,8 +252,13 @@ LUFS-I: -10.60
 True peak: -0.24 dBTP
 LRA: 2.5 LU
 PLR: 10.4 dB
+PSR min: 8.0 dB
+PSR median: 10.3 dB
+DR14: 6
+Crest (loudest 10s): 9.5 dB
 Tonal tilt notes: tilt -3.30 dB/oct (R2 0.54); 30.0-120.0 -1.83 dB/oct; 120.0-1000 -10.51 dB/oct; 1000-6000 -0.40 dB/oct; 6000-20000 -0.73 dB/oct; air 0.08%, sub 11.38%
 Width/mono notes: side/mid -8.3 dB overall, -39.8 dB below 120 Hz; mono crossover 125.0 Hz; correlation mean 0.74, min 0.53
+mtx run: mtx 0.2.0 / schema 1.1.0 / profile full / sha256 0227c4847d647f68
 ```
 
 ## METHOD

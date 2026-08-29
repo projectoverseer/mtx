@@ -2,8 +2,9 @@
 
 `mtx` reads a lossless audio file on your machine and writes an exhaustive,
 reproducible measurement dump: a large `analysis.json` that stays local, and a
-compact `digest.md` (hard cap ~12 KB) you can paste into an analysis workflow
-somewhere else.
+compact `digest.md` (~12 KB by default, `--digest-budget` to change it) you can
+paste into an analysis workflow somewhere else, plus a `corpus_row.json` for the
+archive.
 
 **This tool measures. It does not interpret, score, grade or recommend.** There
 is no "good", "bad" or "too loud" anywhere in its output. Where a number is an
@@ -50,11 +51,16 @@ with the measured value for each. It exits non-zero if anything fails.
 ## Usage
 
 ```
-mtx analyze <file> [--out DIR] [--profile quick|full] [--plots] [--stems] [--json-only]
+mtx analyze <file> [--out DIR] [--profile quick|full] [--plots] [--stems]
+                   [--blind] [--sections A,B,C] [--digest-budget 20k] [--json-only]
                    [--max-part-size 4.5m] [--no-split]
 mtx batch <dir> [--out DIR] [--recursive] [--csv summary.csv]
+                [--csv-schema internal|corpus]
 mtx compare <fileA> <fileB> [--out DIR] [--null-test]
+mtx enrich <DIR> [--providers A,B,C] [--cache DIR] [--offline] [--refresh]
 mtx join <analysis.json|DIR> [--out FILE]
+mtx predict --check <predictions> <digest.md|analysis.json>
+mtx validate-dr <file> --published <DR> [--source TEXT] [--show]
 mtx selftest
 mtx --version
 ```
@@ -63,12 +69,65 @@ mtx --version
   expensive DSP (see the profile table below).
 - `batch` — one JSON per file plus a single CSV of headline metrics, one row per
   track. This is how you bootstrap a reference library from records you own.
+  `--csv-schema corpus` names the columns after the properties a corpus
+  database is likely to already have (`LUFS-I`, `True peak`, `PSR min`, `DR14`,
+  `Crest (loudest 10s)`, `mtx run`, …) so the CSV imports as a populated table
+  instead of a mapping exercise. CSV values are rounded to 3 decimals — the
+  unrounded number stays in `analysis.json`. Bootstrap a corpus with the full
+  profile: `quick` skips the 16x true peak, which leaves the `True peak` column
+  empty in every row, and `batch` says so before it starts.
+- `enrich` — the one command that uses the network, and it is off unless you
+  run it. Looks each analysed folder up in the public music databases and
+  writes `online.json` beside `analysis.json`. See *Enrichment* below.
 - `compare` — two files, **level-matched first**, with an optional null test.
 - `join` — puts a split `analysis.json` back together (see *Uploading the
   analysis* below). Reads the index or the directory holding it.
-- Default output directory: `./mtx_out/<basename>/`.
+- `predict` — scores a filled-in prediction sheet against the measurements.
+  Arithmetic only: signed error, absolute error, and whether the stated
+  interval held. It never says whether a prediction was a good one.
+- `validate-dr` — records this implementation's DR14 against a published rating
+  for a track you own. See *DR14 and the validation record* below.
+- Default output directory: `./mtx_out/<artist - title>/`, taken from the
+  embedded tags; the filename is used when the file carries no title tag.
 - Progress goes to stderr; stdout carries only the output path.
 - Exit codes: `0` success, `1` unreadable input, `2` a self-test assertion failed.
+
+### Predicting before measuring
+
+`--blind` writes the digest without printing it, and prints the path of a
+prediction sheet instead:
+
+```
+$ mtx analyze track.flac --blind
+[mtx] blind mode: digest.md was written and is NOT printed; commit the prediction first, then read it
+mtx_out/track/predict.md
+
+$ $EDITOR mtx_out/track/predict.md          # fill in value, +/- range, confidence
+$ mtx predict --check mtx_out/track/predict.md mtx_out/track/digest.md
+```
+
+The sheet carries the field list, the units, `FLAGS` and `METHOD` — knowing
+*how* a number is derived is fair information for a prediction — and none of
+the values, including the ones `DETAIL` and `CORPUS ROW` would otherwise
+restate. Score against `analysis.json` instead of `digest.md` if you want the
+unrounded values.
+
+### Choosing what the digest spends its budget on
+
+The digest has a size cap and a fixed drop order, which means a
+stereo-focused session can lose the stereo detail it needed while carrying a
+reverb block it did not. Two ways out, neither of them the default:
+
+```
+mtx analyze track.flac --sections stereo,forensics,structure
+mtx analyze track.flac --digest-budget 20k
+```
+
+`--sections` takes groups (`loudness`, `dynamics`, `spectrum`, `stereo`,
+`forensics`, `structure`, `processing`) or exact block names; an unrecognised
+name is an error rather than a silent no-op. A `--stems` run raises the cap by
+4 KB on its own, because the stem table exists nowhere else in the paste-able
+output.
 
 ### Output
 
@@ -76,8 +135,11 @@ mtx --version
 | --- | --- |
 | `analysis.json` | Everything, with the full parameter block. Large. Past the part size limit it becomes an index plus `analysis.partNN.json`. |
 | `analysis.partNN.json` | Only when the analysis is over the limit. One fragment each, listed in the index's `split` block. |
-| `digest.md` | `HEADLINE` / `FLAGS` / `DETAIL` / `CORPUS ROW` / `METHOD`. Hard cap ~12 KB. |
+| `digest.md` | `HEADLINE` / `FLAGS` / `DETAIL` / `STEMS` (with `--stems`) / `CORPUS ROW` / `METHOD`. ~12 KB by default. |
+| `corpus_row.json` | The corpus row as typed JSON, keyed by property name, for import rather than retyping. |
+| `predict.md` | Only with `--blind`. The headline as a form to fill in before reading the digest. |
 | `plots/*.png` | Only with `--plots`. For your own eyes; never referenced by the digest. |
+| `online.json` | Only after `mtx enrich`. Genre vote, credits, identifiers and cross-checks from the public databases. Never merged into `analysis.json`. |
 
 `FLAGS` comes **before** the detail: warnings, method disagreements and every
 low-confidence metric are the first thing you read.
@@ -111,9 +173,70 @@ mtx join mtx_out/track/                      # -> analysis.full.json
 
 The default is 4.5 MB, under the 5 MB limit with room for the part header.
 `--max-part-size` and `--no-split` apply to `analyze`, `batch` and `compare`
-alike; `comparison.json` is split by the same rule.
+alike; `comparison.json` is split by the same rule. `mtx predict --check` reads
+a split `analysis.json` directly — the headline stays in the index.
 
 ---
+
+### Enrichment: what the file does not know about itself
+
+`mtx analyze` never touches the network. `mtx enrich` does, deliberately and
+separately, because a purchased download keeps the ISRC and throws away almost
+everything else: who mixed it, who wrote it, what a listener would call it.
+
+```
+mtx enrich ./mtx_out                      # a whole corpus
+mtx enrich ./mtx_out/"Artist - Title"     # one track, --print to see it
+mtx enrich ./mtx_out --providers all      # add the two that need credentials
+mtx enrich ./mtx_out --offline            # answer only from the cache
+```
+
+Keyless by default: **MusicBrainz** (community-voted genres at recording,
+release-group and artist level, plus engineer and songwriter credits),
+**Deezer** (exact ISRC addressing, a published BPM, popularity), **Apple /
+iTunes** (a third, independent genre taxonomy). Two more switch on when their
+credentials are present: **Last.fm** (`LASTFM_API_KEY`) for listener tags and
+real play counts, **Discogs** (`DISCOGS_TOKEN`) for sleeve credits and a
+genre/style split.
+
+Three things make the result trustworthy rather than merely present:
+
+**A database row is not accepted just because the ISRC matched.** Labels reuse
+an ISRC across a radio edit and the album cut. `bad guy`'s returns three
+MusicBrainz recordings and lists the 175 s radio edit first; the file is 194 s.
+Every candidate is scored against what mtx already measured — duration
+loudest, since that is the one field the analysis knows exactly — and the
+losing candidates stay in the output with their scores, so a wrong match is
+auditable instead of invisible.
+
+**The genre vote does not reward coarseness.** Each source is scaled against
+its own top vote, not against the sum of its votes. Sharing the total would
+punish exactly the sources worth having: MusicBrainz spreads nine genres over a
+record, so each would land near a ninth, while a shop returning the single word
+`Alternative` would collect its full weight and win. Every genre carries the
+sources that voted for it, and a coarse `umbrella` is offered *alongside* the
+ranked list, never instead of it — so a query can filter on `pop` and still
+read `avant-garde pop`.
+
+**Disagreement is the output, not an error to be smoothed away.** Where an
+outside number can be compared with one mtx derived, both are kept:
+
+| Check | What it settles |
+| --- | --- |
+| `cross_checks.tempo` | mtx estimates tempo from an onset envelope and marks it low-confidence on most of a pop corpus. A published BPM that agrees promotes it to `high`; one that is exactly double is reported as `octave` — the beat tracker locked to a different metrical level, not a different tempo — and a real disagreement leaves the local value alone at `low`. |
+| `cross_checks.duration` | `exact` / `close` / `differs` against every provider, which is what makes the match itself verifiable. |
+| `cross_checks.release_date` | The tag, the release, the release group and two shops, plus the earliest of them and whether they agree. |
+
+Nothing measured is ever overwritten. `online.json` is a **sidecar**, not a
+section of `analysis.json`, because `mtx analyze` promises byte-identical
+output for the same input and a section built from whatever MusicBrainz looked
+like this morning cannot live inside that promise.
+
+Responses are cached under `.mtx_cache/`, so a second pass over an enriched
+corpus makes no requests and `--offline` works with the network unplugged.
+Per-host rate limits are honoured — MusicBrainz's one-request-per-second above
+all — and the whole subpackage is stdlib-only, so enrichment adds no dependency
+to a tool whose point is reproducible local measurement.
 
 ## The five properties this tool is built around
 
@@ -169,11 +292,25 @@ the threshold can be second-guessed later.
 
 ### Two things the tool tells you it has *not* verified
 
-- **DR14 is not validated against a published DR rating.** `mtx` ships no
-  copyrighted reference track, so the implementation is only checked against
-  analytically known synthetic cases (a continuous sine must give DR 0.0).
-  Every run says so in `loudness.dr14.validation` and in `FLAGS`. Compare one
-  track whose rating you already know before trusting the number.
+- **DR14 starts out unvalidated against a published DR rating.** `mtx` ships no
+  copyrighted reference track, so out of the box the implementation is only
+  checked against analytically known synthetic cases (a continuous sine must
+  give DR 0.0). Every run says so in `loudness.dr14.validation` and in `FLAGS`.
+
+  This is fixable once, permanently, on your own machine. Measure a track whose
+  published DR rating you already know:
+
+  ```
+  mtx validate-dr "Some Track.flac" --published 12 --source "dr.loudness-war.info"
+  mtx validate-dr --show      # the record, at any time
+  ```
+
+  The pair is stored (default: the platform config directory, override with
+  `MTX_DR14_VALIDATION`), and from then on `FLAGS` and `METHOD` report what the
+  record says — `[validated against N track(s)]` with the worst disagreement,
+  or `[disputed]` if a recorded rating is more than 1 DR out. The record holds
+  measured value, published value and the difference; it draws no conclusion
+  beyond that.
 - **The specification's own sine test is self-contradictory** — it asks for
   LUFS-I ≈ -20.0 *and* a sample peak of -20.0 dBFS from the same 1 kHz sine,
   which differ by the 3.01 dB crest of a sine. The self-test asserts both
@@ -308,7 +445,7 @@ Convention, stated in the output as well: `mid = (L+R)/2`, `side = (L-R)/2`.
 | `reverb` | s, dB | Schroeder reverse integration after strong onsets, per octave band: T20, T30, early-to-late, tail L/R correlation | `reverb` |
 | `transient_density` | per s | per-band envelope rises of 6 dB within 20 ms | — |
 
-### Stems (`stems`, only with `--stems`)
+### Stems (`stems`, only with `--stems`, rendered as `## STEMS` in the digest)
 
 `demucs` (htdemucs, 4 stems) runs locally and the loudness, dynamics, spectrum
 and stereo metric sets are computed on each stem, plus its level relative to the
@@ -344,7 +481,10 @@ measurement.
 `stereo.goniometer` · `spectrum.resonances` · `spectrum.descriptor_timeline` ·
 `forensics.cutoff_stability` · `structure.sections` · `structure.tempo` ·
 `structure.key` · `processing.*` (reverb, modulation, HPSS, multiband,
-transients) · `spectrum.ltas_lowfreq` · `forensics.wow_flutter` · `stems`
+transients) · `spectrum.ltas_lowfreq` · `forensics.wow_flutter`
+
+`--stems` is not a profile switch: it is opt-in at either profile, and the
+per-stem measurements inherit whichever profile the run used.
 
 In quick mode PLR and the streaming preview fall back to the 4x true peak, and
 `loudness.plr_true_peak_source` says so.

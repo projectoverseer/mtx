@@ -49,3 +49,21 @@ jobs:
           mtx analyze ci_signal.flac --out ci_out --single-out
           mtx analyze ci_signal.flac --profile quick --out ci_out_quick --single-out
           python -c "import os,sys; s=os.path.getsize('ci_out/digest.md'); print(f'digest {s} bytes'); sys.exit(0 if s <= 12*1024 else 'digest exceeded the 12 KB budget')"
+
+      - name: Blind mode, prediction scoring, sections, budget and the CSV schema
+        run: |
+          mtx analyze ci_signal.flac --out ci_blind --single-out --profile quick --blind
+          python -c "import re,sys; t=open('ci_blind/predict.md',encoding='utf-8').read(); h=open('ci_blind/digest.md',encoding='utf-8').read(); v=re.search(r'^LUFS-I\s+(\S+)',h.split('## HEADLINE')[1],re.M).group(1); sys.exit(0 if v not in t else 'the prediction sheet leaked a measured value')"
+          python -c "open('ci_pred.txt','w',encoding='utf-8').write('LUFS-I = -9.0 +/- 1.0 conf 70%')"
+          mtx predict --check ci_pred.txt ci_blind/digest.md
+          mtx analyze ci_signal.flac --out ci_sec --single-out --profile quick --sections stereo,forensics
+          mtx analyze ci_signal.flac --out ci_big --single-out --profile quick --digest-budget 20k
+          mtx batch . --out ci_batch --profile quick --csv ci_masters.csv --csv-schema corpus
+          python -c "import csv; h=next(csv.reader(open('ci_masters.csv',encoding='utf-8'))); assert 'LUFS-I' in h and 'PSR min' in h and 'mtx run' in h, h"
+          mtx validate-dr --show
+
+      - name: Enrichment stays offline unless it is asked to go online
+        run: |
+          mtx enrich ci_out --offline --cache ci_cache
+          python -c "import json,sys; d=json.load(open('ci_out/online.json',encoding='utf-8')); sys.exit(0 if d['providers_available']==[] and d['genres']['available'] is False and d['cross_checks']['tempo']['verdict']=='unavailable' and d['errors'] else 'offline enrich did not degrade cleanly')"
+          python -c "import json,sys,os; sys.exit(0 if os.path.getsize('ci_out/analysis.json') and 'online' not in json.load(open('ci_out/analysis.json',encoding='utf-8')) else 'enrich must not write into analysis.json')"

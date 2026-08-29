@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 import random
@@ -194,17 +195,23 @@ def analyze_file(path: str, profile: str = "full", want_stems: bool = False,
 
 def write_outputs(res: dict[str, Any], out_dir: str, *, json_only: bool = False,
                   plots: bool = False, src_path: str | None = None,
+                  digest_budget: int | None = None,
+                  sections: list[str] | None = None,
                   max_part_bytes: int | None = DEFAULT_PART_BYTES,
-                  log=None) -> dict[str, str]:
-    """Write analysis.json, digest.md and optionally plots/.  Returns paths.
+                  blind: bool = False, log=None) -> dict[str, str]:
+    """Write analysis.json, digest.md, corpus_row.json and optionally plots/.
 
     `analysis.json` is written whole when it fits under `max_part_bytes`, and
     as an index plus `analysis.partNN.json` files when it does not: the
     exhaustive dump of a four-minute track runs past the 5 MB per-file cap most
     places put on an upload, and a file that cannot be uploaded stays on one
     machine.  `max_part_bytes=None` always writes the single file.
+
+    With `blind`, a prediction sheet is written as well: the digest is still
+    produced, but the caller is expected to hand over only `predict.md` until
+    the prediction has been committed.  Returns the paths written.
     """
-    from .digest import render_digest
+    from .digest import corpus_row_dict, render_digest
     from .split import write_analysis
 
     os.makedirs(out_dir, exist_ok=True)
@@ -216,11 +223,27 @@ def write_outputs(res: dict[str, Any], out_dir: str, *, json_only: bool = False,
         log(f"  writing outputs: {time.time() - t0:.1f} s")
 
     if not json_only:
-        digest = render_digest(res)
+        digest = render_digest(res, budget=digest_budget, sections=sections)
         d_path = os.path.join(out_dir, "digest.md")
         with open(d_path, "w", encoding="utf-8", newline="\n") as f:
             f.write(digest)
         written["digest.md"] = d_path
+
+        # The corpus row, already typed: the last transcription step between a
+        # measurement and the archive it is stored in.
+        c_path = os.path.join(out_dir, "corpus_row.json")
+        with open(c_path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(jsonable(corpus_row_dict(res)), f, indent=1, sort_keys=True,
+                      ensure_ascii=False, allow_nan=False)
+            f.write("\n")
+        written["corpus_row.json"] = c_path
+
+        if blind:
+            from .predict import render_predict_sheet
+            p_path = os.path.join(out_dir, "predict.md")
+            with open(p_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(render_predict_sheet(res))
+            written["predict.md"] = p_path
 
     if plots and src_path:
         try:
