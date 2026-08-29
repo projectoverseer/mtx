@@ -197,6 +197,7 @@ def write_outputs(res: dict[str, Any], out_dir: str, *, json_only: bool = False,
                   plots: bool = False, src_path: str | None = None,
                   digest_budget: int | None = None,
                   sections: list[str] | None = None,
+<<<<<<< HEAD
                   max_part_bytes: int | None = DEFAULT_PART_BYTES,
                   blind: bool = False, log=None) -> dict[str, str]:
     """Write analysis.json, digest.md, corpus_row.json and optionally plots/.
@@ -207,12 +208,20 @@ def write_outputs(res: dict[str, Any], out_dir: str, *, json_only: bool = False,
     places put on an upload, and a file that cannot be uploaded stays on one
     machine.  `max_part_bytes=None` always writes the single file.
 
+=======
+                  blind: bool = False, log=None) -> dict[str, str]:
+    """Write analysis.json, digest.md, corpus_row.json and optionally plots/.
+
+>>>>>>> 425d1b1c98d36da4d8be6bf9a20bfab8da99db3a
     With `blind`, a prediction sheet is written as well: the digest is still
     produced, but the caller is expected to hand over only `predict.md` until
     the prediction has been committed.  Returns the paths written.
     """
     from .digest import corpus_row_dict, render_digest
+<<<<<<< HEAD
     from .split import write_analysis
+=======
+>>>>>>> 425d1b1c98d36da4d8be6bf9a20bfab8da99db3a
 
     os.makedirs(out_dir, exist_ok=True)
     written: dict[str, str] = {}

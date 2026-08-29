@@ -87,8 +87,15 @@ def _check_readable(path: str) -> None:
         raise SystemExit(1)
 
 
+<<<<<<< HEAD
 def _parse_bytes(text: str, flag: str, example: str) -> int:
     """`20k`, `20kb`, `4.5m`, `20480` -> bytes."""
+=======
+def parse_budget(text: str | None) -> int | None:
+    """`20k`, `20kb`, `20480` -> bytes."""
+    if text is None:
+        return None
+>>>>>>> 425d1b1c98d36da4d8be6bf9a20bfab8da99db3a
     t = text.strip().lower().replace("_", "")
     mult = 1
     for suffix, m in (("kb", 1024), ("k", 1024), ("mb", 1024 * 1024), ("m", 1024 * 1024)):
@@ -96,6 +103,7 @@ def _parse_bytes(text: str, flag: str, example: str) -> int:
             t, mult = t[: -len(suffix)], m
             break
     try:
+<<<<<<< HEAD
         return int(round(float(t) * mult))
     except ValueError:
         _log(f"error: cannot read {flag} {text!r}; try {example}")
@@ -107,6 +115,12 @@ def parse_budget(text: str | None) -> int | None:
     if text is None:
         return None
     value = _parse_bytes(text, "--digest-budget", "20k or 20480")
+=======
+        value = int(round(float(t) * mult))
+    except ValueError:
+        _log(f"error: cannot read --digest-budget {text!r}; try 20k or 20480")
+        raise SystemExit(1)
+>>>>>>> 425d1b1c98d36da4d8be6bf9a20bfab8da99db3a
     if value < 6144:
         # The never-dropped sections (header, HEADLINE, FLAGS, CORPUS ROW,
         # METHOD) are around 5 KB on their own; a lower cap could only be met
@@ -117,6 +131,7 @@ def parse_budget(text: str | None) -> int | None:
     return value
 
 
+<<<<<<< HEAD
 def parse_part_size(args: argparse.Namespace) -> int | None:
     """The per-file cap the JSON output is split to fit under.
 
@@ -260,6 +275,8 @@ def cmd_enrich(args: argparse.Namespace) -> int:
     return 0
 
 
+=======
+>>>>>>> 425d1b1c98d36da4d8be6bf9a20bfab8da99db3a
 def _split_sections(text: str | None) -> list[str] | None:
     if not text:
         return None
@@ -272,7 +289,10 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     _check_readable(args.file)
     sections = _split_sections(getattr(args, "sections", None))
     budget = parse_budget(getattr(args, "digest_budget", None))
+<<<<<<< HEAD
     part_size = parse_part_size(args)
+=======
+>>>>>>> 425d1b1c98d36da4d8be6bf9a20bfab8da99db3a
     if sections:
         from .digest import resolve_sections
         try:
@@ -292,7 +312,11 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     written = write_outputs(res, out_dir, json_only=args.json_only,
                             plots=args.plots, src_path=args.file,
                             digest_budget=budget, sections=sections,
+<<<<<<< HEAD
                             max_part_bytes=part_size, blind=blind, log=_log)
+=======
+                            blind=blind, log=_log)
+>>>>>>> 425d1b1c98d36da4d8be6bf9a20bfab8da99db3a
     _log(f"done in {time.time() - t0:.1f} s -> {out_dir}")
     for k, v in written.items():
         _log(f"  {k}: {v}")
@@ -552,7 +576,10 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--digest-budget", metavar="BYTES",
                    help="raise or lower the digest size cap, e.g. 20k "
                         "(default 12k, plus 4k when --stems renders)")
+<<<<<<< HEAD
     _add_part_size_args(a)
+=======
+>>>>>>> 425d1b1c98d36da4d8be6bf9a20bfab8da99db3a
     a.set_defaults(func=cmd_analyze)
 
     b = sub.add_parser("batch", help="measure every audio file in a folder")
@@ -568,7 +595,10 @@ def build_parser() -> argparse.ArgumentParser:
                    default="internal",
                    help="'corpus' names the columns after the corpus database's "
                         "properties so the CSV imports as a populated table")
+<<<<<<< HEAD
     _add_part_size_args(b)
+=======
+>>>>>>> 425d1b1c98d36da4d8be6bf9a20bfab8da99db3a
     b.set_defaults(func=cmd_batch)
 
     c = sub.add_parser("compare", help="level-matched comparison of two files")
@@ -581,6 +611,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_part_size_args(c)
     c.set_defaults(func=cmd_compare)
 
+<<<<<<< HEAD
     e = sub.add_parser("enrich",
                        help="look analysed folders up in the public music "
                             "databases and write online.json beside each")
@@ -611,6 +642,8 @@ def build_parser() -> argparse.ArgumentParser:
                                  "next to the index)")
     j.set_defaults(func=cmd_join)
 
+=======
+>>>>>>> 425d1b1c98d36da4d8be6bf9a20bfab8da99db3a
     pr = sub.add_parser("predict", help="score a filled-in prediction sheet")
     pr.add_argument("--check", dest="predictions", required=True,
                     metavar="PREDICTIONS",

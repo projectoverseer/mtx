@@ -92,11 +92,14 @@ def _actuals_from_json(path: str) -> dict[str, float | None]:
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
     h = data.get("headline", {})
+<<<<<<< HEAD
     if data.get("split") and (not isinstance(h, dict) or h.get("mtx_moved")):
         # A split analysis keeps the headline in the index, so this is the rare
         # case; rejoining is still cheaper than telling the caller to do it.
         from .split import load_analysis
         h = load_analysis(path).get("headline", {})
+=======
+>>>>>>> 425d1b1c98d36da4d8be6bf9a20bfab8da99db3a
     return {label: h.get(key) for label, key, _, _ in PREDICT_FIELDS}
 
 

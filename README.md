@@ -53,12 +53,18 @@ with the measured value for each. It exits non-zero if anything fails.
 ```
 mtx analyze <file> [--out DIR] [--profile quick|full] [--plots] [--stems]
                    [--blind] [--sections A,B,C] [--digest-budget 20k] [--json-only]
+<<<<<<< HEAD
                    [--max-part-size 4.5m] [--no-split]
 mtx batch <dir> [--out DIR] [--recursive] [--csv summary.csv]
                 [--csv-schema internal|corpus]
 mtx compare <fileA> <fileB> [--out DIR] [--null-test]
 mtx enrich <DIR> [--providers A,B,C] [--cache DIR] [--offline] [--refresh]
 mtx join <analysis.json|DIR> [--out FILE]
+=======
+mtx batch <dir> [--out DIR] [--recursive] [--csv summary.csv]
+                [--csv-schema internal|corpus]
+mtx compare <fileA> <fileB> [--out DIR] [--null-test]
+>>>>>>> 425d1b1c98d36da4d8be6bf9a20bfab8da99db3a
 mtx predict --check <predictions> <digest.md|analysis.json>
 mtx validate-dr <file> --published <DR> [--source TEXT] [--show]
 mtx selftest
@@ -76,12 +82,16 @@ mtx --version
   unrounded number stays in `analysis.json`. Bootstrap a corpus with the full
   profile: `quick` skips the 16x true peak, which leaves the `True peak` column
   empty in every row, and `batch` says so before it starts.
+<<<<<<< HEAD
 - `enrich` — the one command that uses the network, and it is off unless you
   run it. Looks each analysed folder up in the public music databases and
   writes `online.json` beside `analysis.json`. See *Enrichment* below.
 - `compare` — two files, **level-matched first**, with an optional null test.
 - `join` — puts a split `analysis.json` back together (see *Uploading the
   analysis* below). Reads the index or the directory holding it.
+=======
+- `compare` — two files, **level-matched first**, with an optional null test.
+>>>>>>> 425d1b1c98d36da4d8be6bf9a20bfab8da99db3a
 - `predict` — scores a filled-in prediction sheet against the measurements.
   Arithmetic only: signed error, absolute error, and whether the stated
   interval held. It never says whether a prediction was a good one.
@@ -133,8 +143,12 @@ output.
 
 | File | What it is |
 | --- | --- |
+<<<<<<< HEAD
 | `analysis.json` | Everything, with the full parameter block. Large. Past the part size limit it becomes an index plus `analysis.partNN.json`. |
 | `analysis.partNN.json` | Only when the analysis is over the limit. One fragment each, listed in the index's `split` block. |
+=======
+| `analysis.json` | Everything, with the full parameter block. Large; stays on your machine. |
+>>>>>>> 425d1b1c98d36da4d8be6bf9a20bfab8da99db3a
 | `digest.md` | `HEADLINE` / `FLAGS` / `DETAIL` / `STEMS` (with `--stems`) / `CORPUS ROW` / `METHOD`. ~12 KB by default. |
 | `corpus_row.json` | The corpus row as typed JSON, keyed by property name, for import rather than retyping. |
 | `predict.md` | Only with `--blind`. The headline as a form to fill in before reading the digest. |
