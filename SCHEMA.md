@@ -1,6 +1,11 @@
 # `analysis.json` schema
 
-`schema_version` **1.0.0**.
+`schema_version` **1.1.0**.
+
+Changes since 1.0.0, all additive: `processing.multiband_timeline.
+band_envelope_correlation` gains `offdiagonal`, `least_correlated_pairs` and
+`most_correlated_pair`; `loudness.dr14.validation` gains `record` and its
+`validated_against_published_reference` is no longer always `false`.
 
 One line per field. Units are in the field name wherever they exist. Any field
 may be `null`; a `null` always means "could not be computed", and the reason is
@@ -147,7 +152,8 @@ CBR. `note` says so without drawing the conclusion for you.
 | `psr` | `window_s`, `hop_s`, `times_s`, `psr_db`, `shortterm_true_peak_dbtp`, `shortterm_lufs`, `min_db`, `min_time(_s)`, `p10_db`, `median_db`, `max_db`, `definition`. |
 | `streaming_preview.<platform>` | `target_lufs`, `gain_db`, `true_peak_after_dbtp`, `gain_is_positive`, `note`. |
 | `dr14` | `dr`, `dr_unrounded`, `dr_alt_sample_peak2_unrounded`, `per_channel[]` (blocks, `rms_top20_dbfs`, both peak-2 definitions, both DR values), `blocks_used`, `peak2_definition`, `validation`. |
-| `dr14.validation` | `validated_against_published_reference` (always `false`), `status`, `reason`, `self_checked_synthetically`. Read this before quoting DR. |
+| `dr14.validation` | `validated_against_published_reference`, `status`, `reason`, `self_checked_synthetically`, `record`. Read this before quoting DR. |
+| `dr14.validation.record` | What `mtx validate-dr` has stored on this machine: `store_path`, `tracks_checked`, `tracks_within_tolerance`, `tolerance_dr`, `max_abs_delta_dr`, `mean_delta_dr`, `entries[]` (`title`, `artist`, `published_dr`, `measured_dr`, `delta`, `sha256`, `checked_utc`, `tool_version`), `validated`. Empty until a track with a published rating has been checked; the record is per machine, so it is part of what `mtx run` provenance is standing in for. |
 
 ## `dynamics`
 
@@ -222,7 +228,7 @@ what the number means without stating what it implies about the record.
 | `saturation_proxy` | `slope_db_per_db`, `r2`, `frames_used`, `per_section[]`, `params`, `reading`. Slope above 1 means the material gets brighter as it gets louder. |
 | `bus_compression` | `most_negative_correlation`, `most_negative_lag_ms`, `most_positive_correlation`, `most_positive_lag_ms`, `zero_lag_correlation`, `dip_depth_db`, `estimated_release_ms`, `release_method`. "Most negative" is literal: on material with no ducking the minimum over the lag range can itself be positive. |
 | `modulation_spectrum` | `beat_rate_hz`, `envelope_rate_hz`, `bands.<band>` with `beat_depth_db`, `half_beat_depth_db`, `quarter_beat_depth_db`, `dip_phase_fraction_of_beat`, `beat_profile_depth_db`. |
-| `multiband_timeline` | `hop_ms`, `times_s`, `rms_db.<band>`, `crest_db.<band>`, `band_envelope_correlation` (`bands`, `matrix`, `mean_offdiagonal`, `reading`). |
+| `multiband_timeline` | `hop_ms`, `times_s`, `rms_db.<band>`, `crest_db.<band>`, `band_envelope_correlation` (`bands`, `matrix`, `mean_offdiagonal`, `offdiagonal` with `min`/`median`/`max`/`mean`/`pairs`, `least_correlated_pairs[]` and `most_correlated_pair` as `{bands, r}`, `reading`). The summary and the extreme pairs are what the digest renders; the full matrix stays here. |
 | `hpss` | `percussive_to_harmonic_db`, `percussive_energy_fraction`, `per_band_percussive_to_harmonic_db`, `vocal_band_proxy` (`band_hz`, `times_s`, `values_db`, `confidence`). |
 | `reverb` | `per_octave_band[]` (`centre_hz`, `events_used`, `t20_s`, `t30_s`, `t20_iqr_s`, `early_to_late_db`), `tail_stereo_correlation`, `tail_correlation_method`, `params`. |
 | `transient_density` | `hop_s`, `bands.<band>` (onsets per second) and `rate_per_s.<band>`, plus `method`. |
@@ -260,6 +266,19 @@ metric reported below full confidence.
 Both are rendered into the digest's `FLAGS` section, before the detail.
 
 ---
+
+## `corpus_row.json` (written next to `digest.md`)
+
+The `CORPUS ROW` block as typed JSON, so a measurement reaches an archive
+without a transcription step. Keys are the property names a corpus database
+uses rather than mtx's internal field names: `Title`, `Artist`, `Year`,
+`Genre`, `Engineers`, `LUFS-I`, `True peak`, `LRA`, `PLR`, `PSR min`,
+`PSR median`, `DR14`, `Crest (loudest 10s)`, `Tonal tilt notes`,
+`Width/mono notes`, `mtx run`. Numbers stay numbers; `_units` states what each
+is in; `_source` carries the filename, the full `sha256` and the timestamp of
+the PSR minimum. Anything mtx cannot measure is `null`, never guessed --
+`Engineers` always is, and no session field (calibration, lessons, verdict)
+appears at all.
 
 ## `comparison.json` (`mtx compare`)
 

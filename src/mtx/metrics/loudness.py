@@ -40,7 +40,8 @@ def ffmpeg_ebur128(path: str, collector: Collector) -> dict[str, Any]:
             ["ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-i", path,
              "-map", "0:a:0", "-af", "ebur128=peak=true:framelog=quiet",
              "-f", "null", "-"],
-            capture_output=True, text=True, timeout=1800,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=1800,
         )
     except FileNotFoundError:
         out["reason"] = "ffmpeg not found on PATH; loudness cross-validation unavailable"
@@ -144,18 +145,49 @@ def dr14(src: AudioSource, collector: Collector) -> dict[str, Any]:
 
 
 def _dr_validation(computed: bool) -> dict[str, Any]:
-    return {
-        "validated_against_published_reference": False,
-        "status": "NOT VALIDATED against a published DR rating",
-        "reason": "mtx runs offline and ships no copyrighted reference track, so "
-                  "the implementation could not be checked against a published "
-                  "DR value. It is checked against analytically known synthetic "
-                  "cases in `mtx selftest` (a full-scale sine must give DR 0.0, "
-                  "a 20 dB crest square-burst must give DR 20.0). Treat the DR "
-                  "number as unverified against the reference implementation "
-                  "until you compare one track you already have a rating for.",
+    """The validation state of the DR14 implementation on *this* machine.
+
+    mtx ships no copyrighted reference track, so the only way this metric can
+    reach a published scale is for the user to measure a track whose published
+    DR rating they already know.  `mtx validate-dr` records that check and this
+    block reports whatever the record holds --- including nothing.
+    """
+    from ..validation import summary as _validation_summary
+
+    rec = _validation_summary()
+    out = {
+        "validated_against_published_reference": bool(rec["validated"]),
         "self_checked_synthetically": computed,
+        "record": rec,
     }
+    if rec["validated"]:
+        out["status"] = (f"validated against {rec['tracks_checked']} published DR "
+                         f"rating(s); worst disagreement "
+                         f"{rec['max_abs_delta_dr']:.1f} DR")
+        out["reason"] = ("Checked against published DR ratings recorded by "
+                         "`mtx validate-dr` (see loudness.dr14.validation.record "
+                         "for the tracks and deltas), and against analytically "
+                         "known synthetic cases in `mtx selftest`.")
+    elif rec["tracks_checked"]:
+        out["status"] = (f"DISAGREES with {rec['tracks_checked'] - rec['tracks_within_tolerance']} "
+                         f"of {rec['tracks_checked']} published DR rating(s); worst "
+                         f"{rec['max_abs_delta_dr']:.1f} DR")
+        out["reason"] = ("Published ratings have been recorded by `mtx validate-dr` "
+                         "and at least one is outside the "
+                         f"{rec['tolerance_dr']} DR tolerance. Read the deltas in "
+                         "validation.record before using the number on a published "
+                         "scale.")
+    else:
+        out["status"] = "NOT VALIDATED against a published DR rating"
+        out["reason"] = ("mtx runs offline and ships no copyrighted reference "
+                         "track, so the implementation could not be checked "
+                         "against a published DR value. It is checked against "
+                         "analytically known synthetic cases in `mtx selftest` "
+                         "(a full-scale sine must give DR 0.0, a 20 dB crest "
+                         "square-burst must give DR 20.0). Run `mtx validate-dr "
+                         "<file> --published <DR>` on one track you already have "
+                         "a rating for to put it on the published scale.")
+    return out
 
 
 def analyse(src: AudioSource, collector: Collector,

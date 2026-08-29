@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
+import re
 import sys
 import time
+import unicodedata
 from typing import Any
 
 from . import __version__
@@ -23,9 +26,53 @@ def _log(msg: str) -> None:
     print(f"[mtx] {msg}", file=sys.stderr, flush=True)
 
 
-def _default_out(base_out: str | None, path: str) -> str:
-    stem = os.path.splitext(os.path.basename(path))[0]
-    return os.path.join(base_out or "mtx_out", stem)
+# Characters no Windows path component may contain (POSIX only bars "/").
+_BAD_FS_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _sanitise_component(s: str) -> str:
+    """Make a tag value usable as a single path component."""
+    return re.sub(r"\s+", " ", _BAD_FS_CHARS.sub("_", s)).strip()
+
+
+def _join_artists(raw: str) -> str:
+    """`ROSE;Bruno Mars;Rose` -> `ROSE, Bruno Mars`: multi-value tags, deduped.
+
+    Tags arrive joined by ";", NUL or " / " depending on the container and on
+    how mutagen flattened a list.
+    """
+    parts: list[str] = []
+    seen: set[str] = set()
+    for chunk in re.split(r"[;\x00]| / ", raw):
+        chunk = chunk.strip()
+        # Fold accents for the duplicate test so "ROSÉ" and "Rose" count as one.
+        key = "".join(c for c in unicodedata.normalize("NFKD", chunk.lower())
+                      if not unicodedata.combining(c))
+        if chunk and key not in seen:
+            seen.add(key)
+            parts.append(chunk)
+    return ", ".join(parts)
+
+
+def _folder_name(path: str, res: dict[str, Any] | None = None) -> str:
+    """`Artist - Title` from the embedded tags; the filename when untagged."""
+    named = ((res or {}).get("tags") or {}).get("named") or {}
+    title = _sanitise_component(str(named.get("title") or ""))
+    artist = _sanitise_component(_join_artists(
+        str(named.get("artist") or "") or str(named.get("albumartist") or "")))
+    if title and artist:
+        name = f"{artist} - {title}"
+    elif title:
+        name = title
+    else:
+        name = ""
+    name = name[:150].strip().rstrip(". ")  # Windows: no trailing dot or space
+    return name or os.path.splitext(os.path.basename(path))[0]
+
+
+def _default_out(base_out: str | None, path: str,
+                 res: dict[str, Any] | None = None) -> str:
+    return os.path.join(base_out or "mtx_out", _folder_name(path, res))
 
 
 def _check_readable(path: str) -> None:
@@ -40,16 +87,63 @@ def _check_readable(path: str) -> None:
         raise SystemExit(1)
 
 
+def parse_budget(text: str | None) -> int | None:
+    """`20k`, `20kb`, `20480` -> bytes."""
+    if text is None:
+        return None
+    t = text.strip().lower().replace("_", "")
+    mult = 1
+    for suffix, m in (("kb", 1024), ("k", 1024), ("mb", 1024 * 1024), ("m", 1024 * 1024)):
+        if t.endswith(suffix):
+            t, mult = t[: -len(suffix)], m
+            break
+    try:
+        value = int(round(float(t) * mult))
+    except ValueError:
+        _log(f"error: cannot read --digest-budget {text!r}; try 20k or 20480")
+        raise SystemExit(1)
+    if value < 6144:
+        # The never-dropped sections (header, HEADLINE, FLAGS, CORPUS ROW,
+        # METHOD) are around 5 KB on their own; a lower cap could only be met
+        # by dropping something the digest promises to always carry.
+        _log(f"error: --digest-budget {text!r} is below the 6 KB floor; the "
+             "sections that are never dropped do not fit under it")
+        raise SystemExit(1)
+    return value
+
+
+def _split_sections(text: str | None) -> list[str] | None:
+    if not text:
+        return None
+    return [part for part in (p.strip() for p in text.split(",")) if part]
+
+
 def cmd_analyze(args: argparse.Namespace) -> int:
     from .analyze import analyze_file, write_outputs
 
     _check_readable(args.file)
+    sections = _split_sections(getattr(args, "sections", None))
+    budget = parse_budget(getattr(args, "digest_budget", None))
+    if sections:
+        from .digest import resolve_sections
+        try:
+            resolve_sections(sections)
+        except ValueError as exc:
+            _log(f"error: {exc}")
+            return 1
+    blind = bool(getattr(args, "blind", False))
+    if blind and args.json_only:
+        _log("error: --blind and --json-only are contradictory; the prediction "
+             "sheet is a digest rendering")
+        return 1
     t0 = time.time()
     res = analyze_file(args.file, profile=args.profile, want_stems=args.stems,
                        log=lambda s: _log(f"  {s}"))
-    out_dir = args.out if args.out and args.single_out else _default_out(args.out, args.file)
+    out_dir = args.out if args.out and args.single_out else _default_out(args.out, args.file, res)
     written = write_outputs(res, out_dir, json_only=args.json_only,
-                            plots=args.plots, src_path=args.file, log=_log)
+                            plots=args.plots, src_path=args.file,
+                            digest_budget=budget, sections=sections,
+                            blind=blind, log=_log)
     _log(f"done in {time.time() - t0:.1f} s -> {out_dir}")
     for k, v in written.items():
         _log(f"  {k}: {v}")
@@ -59,7 +153,14 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     n_warn = len(res.get("warnings", []))
     if n_warn:
         _log(f"  {n_warn} warning(s) in FLAGS")
-    print(out_dir)
+    if blind:
+        # Only the prediction sheet reaches stdout: a prediction made with the
+        # digest one `cat` away is not a commitment.
+        _log("blind mode: digest.md was written and is NOT printed; commit the "
+             "prediction first, then read it")
+        print(written["predict.md"])
+    else:
+        print(out_dir)
     return 0
 
 
@@ -72,12 +173,33 @@ CSV_FIELDS = [
     "side_minus_mid_below_120hz_db", "mono_crossover_hz", "correlation_mean",
     "correlation_min", "flat_top_sample_count", "flat_top_longest_run_ms",
     "hf_cutoff_hz", "effective_bit_depth", "tempo_bpm", "key", "section_count",
-    "warnings",
+    "mtx_run", "warnings",
 ]
+
+# `--csv-schema corpus` renames the columns a corpus database already has a
+# property for, and leaves the rest under their internal names.  A folder of
+# records then imports as a populated table instead of a mapping exercise;
+# breadth across genres and eras is what makes a reference atlas teach craft
+# rather than one style, so the cost of breadth is worth lowering.
+CSV_CORPUS_NAMES = {
+    "title": "Title",
+    "artist": "Artist",
+    "date": "Year",
+    "lufs_i": "LUFS-I",
+    "true_peak_dbtp_16x": "True peak",
+    "lra_lu": "LRA",
+    "plr_db": "PLR",
+    "psr_min_db": "PSR min",
+    "psr_median_db": "PSR median",
+    "dr14": "DR14",
+    "crest_loudest_10s_db": "Crest (loudest 10s)",
+    "mtx_run": "mtx run",
+}
 
 
 def cmd_batch(args: argparse.Namespace) -> int:
     from .analyze import analyze_file, write_outputs
+    from .digest import run_provenance
 
     if not os.path.isdir(args.dir):
         _log(f"error: not a directory: {args.dir}")
@@ -98,6 +220,10 @@ def cmd_batch(args: argparse.Namespace) -> int:
         _log(f"error: no audio files found in {args.dir}")
         return 1
     _log(f"{len(files)} file(s) to analyse")
+    if args.profile == "quick" and getattr(args, "csv_schema", "internal") != "internal":
+        _log("warning: --profile quick skips the 16x true peak, so the "
+             "'True peak' column will be empty in every row; use the full "
+             "profile for a corpus the rows are meant to be kept in")
 
     base_out = args.out or "mtx_out"
     rows: list[dict[str, Any]] = []
@@ -111,7 +237,7 @@ def cmd_batch(args: argparse.Namespace) -> int:
             failures += 1
             _log(f"  failed: {exc!r}")
             continue
-        out_dir = _default_out(base_out, path)
+        out_dir = _default_out(base_out, path, res)
         write_outputs(res, out_dir, json_only=args.json_only, plots=args.plots,
                       src_path=path, log=_log)
         h = res["headline"]
@@ -123,15 +249,26 @@ def cmd_batch(args: argparse.Namespace) -> int:
             "sample_rate_hz": res["audio"]["sample_rate_hz"],
             "channels": res["audio"]["channels"],
             "subtype": res["audio"]["subtype"],
+            "mtx_run": run_provenance(res),
             "warnings": len(res.get("warnings", [])),
         })
         rows.append(row)
 
     csv_path = args.csv or os.path.join(base_out, "summary.csv")
     os.makedirs(os.path.dirname(os.path.abspath(csv_path)) or ".", exist_ok=True)
+    schema = getattr(args, "csv_schema", "internal")
+    if schema == "masters":  # the name the corpus database uses at the far end
+        schema = "corpus"
+    for r in rows:  # a stored row is read by people; full float precision is not
+        for k, v in r.items():
+            if isinstance(v, float):
+                r[k] = round(v, 3)
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
-        w.writeheader()
+        if schema == "corpus":
+            w.writerow({k: CSV_CORPUS_NAMES.get(k, k) for k in CSV_FIELDS})
+        else:
+            w.writeheader()
         for r in rows:
             w.writerow(r)
     _log(f"summary: {csv_path} ({len(rows)} row(s), {failures} failure(s))")
@@ -157,6 +294,78 @@ def cmd_compare(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_predict(args: argparse.Namespace) -> int:
+    from .predict import check, parse_predictions, read_actuals, render_check
+
+    for p in (args.predictions, args.measured):
+        if not os.path.isfile(p):
+            _log(f"error: not a file: {p}")
+            return 1
+    with open(args.predictions, encoding="utf-8") as f:
+        preds = parse_predictions(f.read())
+    if not preds:
+        _log(f"error: no filled-in predictions found in {args.predictions}. "
+             "Lines look like `LUFS-I = -8.5 +/- 1.0 conf 70%`.")
+        return 1
+    try:
+        actuals = read_actuals(args.measured)
+    except (ValueError, OSError) as exc:
+        _log(f"error: cannot read measurements from {args.measured}: {exc}")
+        return 1
+    result = check(preds, actuals)
+    _log(f"{result['fields_scored']} of {result['fields_predicted']} predicted "
+         "field(s) had a measured value to compare against")
+    print(render_check(result, args.predictions, args.measured), end="")
+    return 0
+
+
+def cmd_validate_dr(args: argparse.Namespace) -> int:
+    """Record one measured-vs-published DR pair, or show the record."""
+    from . import __version__ as tool_version
+    from .validation import add_entry, summary
+
+    if args.show or args.file is None:
+        rec = summary(args.store)
+        _log(f"store: {rec['store_path']}")
+        print(json.dumps(rec, indent=1, sort_keys=True, ensure_ascii=False))
+        return 0
+    if args.published is None:
+        _log("error: --published <DR> is required; that published rating is the "
+             "only thing mtx cannot measure for itself")
+        return 1
+    _check_readable(args.file)
+    from .analyze import analyze_file
+    res = analyze_file(args.file, profile="quick", log=lambda s: _log(f"  {s}"))
+    measured = res["headline"]["dr14"]
+    if measured is None:
+        _log("error: DR14 came back null for this file; see warnings")
+        return 1
+    tags = res.get("tags", {}).get("named", {})
+    delta = float(measured) - float(args.published)
+    entry = {
+        "title": tags.get("title"),
+        "artist": tags.get("artist"),
+        "filename": res.get("file", {}).get("filename"),
+        "sha256": res.get("file", {}).get("sha256"),
+        "published_dr": float(args.published),
+        "measured_dr": round(float(measured), 2),
+        "delta": round(delta, 2),
+        "source": args.source,
+        "tool_version": tool_version,
+        "schema_version": res["run"]["schema_version"],
+        "checked_utc": res["run"]["generated_utc"],
+    }
+    path = add_entry(entry, args.store)
+    rec = summary(args.store)
+    _log(f"measured DR {measured:.2f} vs published {float(args.published):.1f} "
+         f"-> delta {delta:+.2f}")
+    _log(f"record now: {rec['tracks_checked']} track(s), "
+         f"{rec['tracks_within_tolerance']} within {rec['tolerance_dr']} DR, "
+         f"validated={rec['validated']}")
+    print(path)
+    return 0
+
+
 def cmd_selftest(args: argparse.Namespace) -> int:
     from .selftest import run_selftest
     return run_selftest(verbose=not args.quiet)
@@ -172,7 +381,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     a = sub.add_parser("analyze", help="measure one file")
     a.add_argument("file")
-    a.add_argument("--out", help="output directory (default ./mtx_out/<basename>/)")
+    a.add_argument("--out", help="output directory (default ./mtx_out/<artist - title>/)")
     a.add_argument("--single-out", action="store_true",
                    help="write directly into --out instead of --out/<basename>/")
     a.add_argument("--profile", choices=("quick", "full"), default="full")
@@ -180,6 +389,17 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--stems", action="store_true",
                    help="separate stems with demucs and measure each")
     a.add_argument("--json-only", action="store_true", help="skip digest.md")
+    a.add_argument("--blind", action="store_true",
+                   help="also write predict.md (the headline redacted to a form) "
+                        "and print only its path, so a prediction can be "
+                        "committed before the numbers are read")
+    a.add_argument("--sections", metavar="A,B,C",
+                   help="restrict DETAIL to these groups or blocks "
+                        "(groups: loudness, dynamics, spectrum, stereo, "
+                        "forensics, structure, processing)")
+    a.add_argument("--digest-budget", metavar="BYTES",
+                   help="raise or lower the digest size cap, e.g. 20k "
+                        "(default 12k, plus 4k when --stems renders)")
     a.set_defaults(func=cmd_analyze)
 
     b = sub.add_parser("batch", help="measure every audio file in a folder")
@@ -191,6 +411,10 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--plots", action="store_true")
     b.add_argument("--stems", action="store_true")
     b.add_argument("--json-only", action="store_true")
+    b.add_argument("--csv-schema", choices=("internal", "corpus", "masters"),
+                   default="internal",
+                   help="'corpus' names the columns after the corpus database's "
+                        "properties so the CSV imports as a populated table")
     b.set_defaults(func=cmd_batch)
 
     c = sub.add_parser("compare", help="level-matched comparison of two files")
@@ -201,6 +425,27 @@ def build_parser() -> argparse.ArgumentParser:
                    help="align, invert and sum; report the residual")
     c.add_argument("--profile", choices=("quick", "full"), default="full")
     c.set_defaults(func=cmd_compare)
+
+    pr = sub.add_parser("predict", help="score a filled-in prediction sheet")
+    pr.add_argument("--check", dest="predictions", required=True,
+                    metavar="PREDICTIONS",
+                    help="the filled-in predict.md (or any file of "
+                         "`field = value +/- range conf N%%` lines)")
+    pr.add_argument("measured", help="the digest.md or analysis.json to score against")
+    pr.set_defaults(func=cmd_predict)
+
+    v = sub.add_parser("validate-dr",
+                       help="record this implementation's DR14 against a "
+                            "published rating for a track you own")
+    v.add_argument("file", nargs="?")
+    v.add_argument("--published", type=float,
+                   help="the published DR rating for this track")
+    v.add_argument("--source", help="where the published rating came from")
+    v.add_argument("--store", help="validation record path "
+                                   "(default: platform config dir; "
+                                   "MTX_DR14_VALIDATION overrides)")
+    v.add_argument("--show", action="store_true", help="print the record and exit")
+    v.set_defaults(func=cmd_validate_dr)
 
     s = sub.add_parser("selftest", help="synthetic signals with known answers")
     s.add_argument("--quiet", action="store_true")

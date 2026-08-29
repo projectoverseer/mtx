@@ -1,8 +1,15 @@
 """digest.md: the compact, paste-able view of analysis.json.
 
-Hard budget of 12 KB.  Blocks are assembled in a fixed order and dropped from
-the lowest priority upward until the budget is met; whatever was dropped is
-named in the output, so the digest never silently omits a section.
+Default budget of 12 KB.  Blocks are assembled in a fixed order and dropped
+from the lowest priority upward until the budget is met; whatever was dropped
+is named in the output, so the digest never silently omits a section.  The
+budget is a default and not a law: `--digest-budget` raises it and `--sections`
+selects what is worth spending it on, because a fixed cap with a fixed drop
+order otherwise loses the block a given session actually needed.
+
+`--stems` adds a whole section of measurements that exist nowhere else in the
+paste-able output, so the budget grows by `STEMS_BUDGET_BONUS` when it renders
+rather than pushing the stems out of their own run.
 """
 
 from __future__ import annotations
@@ -13,6 +20,10 @@ from typing import Any, Iterable, Sequence
 import numpy as np
 
 SIZE_BUDGET_BYTES = 12 * 1024
+STEMS_BUDGET_BONUS = 4 * 1024
+
+# Redaction marker used by the prediction sheet.  Wide enough to write in.
+BLANK = "____"
 
 
 # ------------------------------------------------------------------ formatting
@@ -136,6 +147,35 @@ def _grid_mean_db(series: Sequence[float] | None, times: Sequence[float] | None,
     return out
 
 
+# The headline fields a prediction can be committed against, with the unit and
+# the rounding the digest prints.  One table, so the prediction sheet, the
+# `--check` arithmetic and the HEADLINE block can never drift apart; the labels
+# are asserted against the rendered HEADLINE in the tests.
+PREDICT_FIELDS: tuple[tuple[str, str, str, int], ...] = (
+    # (label, headline key, unit, decimals)
+    ("LUFS-I", "lufs_i", "LUFS", 2),
+    ("LRA", "lra_lu", "LU", 1),
+    ("True peak (16x)", "true_peak_dbtp_16x", "dBTP", 2),
+    ("Sample peak", "sample_peak_dbfs", "dBFS", 2),
+    ("PLR", "plr_db", "dB", 1),
+    ("PSR min", "psr_min_db", "dB", 1),
+    ("PSR median", "psr_median_db", "dB", 1),
+    ("DR14", "dr14", "", 0),
+    ("Crest (whole)", "crest_whole_db", "dB", 1),
+    ("Crest (loudest 10 s)", "crest_loudest_10s_db", "dB", 1),
+    ("Spectral tilt", "spectral_tilt_db_per_oct", "dB/oct", 2),
+    ("Air 12-20k", "air_band_pct", "%", 2),
+    ("Sub 20-60", "sub_band_pct", "%", 2),
+    ("Side/mid overall", "side_minus_mid_db", "dB", 1),
+    ("Side/mid <120 Hz", "side_minus_mid_below_120hz_db", "dB", 1),
+    ("Mono crossover", "mono_crossover_hz", "Hz", 0),
+    ("Correlation mean", "correlation_mean", "", 2),
+    ("Correlation min", "correlation_min", "", 2),
+    ("HF cutoff", "hf_cutoff_hz", "Hz", 0),
+    ("Tempo", "tempo_bpm", "BPM", 2),
+)
+
+
 # ---------------------------------------------------------------- the sections
 def _headline(res: dict[str, Any]) -> str:
     h = res["headline"]
@@ -182,9 +222,21 @@ def _flags(res: dict[str, Any]) -> str:
     for note in res.get("confidence_notes", []):
         lines.append(f"- [{note['confidence']}] {note['metric']}: {note['reason'][:160]}")
     dr = res.get("loudness", {}).get("dr14", {}).get("validation", {})
-    if dr and not dr.get("validated_against_published_reference"):
+    rec = (dr or {}).get("record", {})
+    if dr and dr.get("validated_against_published_reference"):
+        lines.append(f"- [validated against {rec.get('tracks_checked')} track(s)] "
+                     f"DR14: worst disagreement with a published rating "
+                     f"{n(rec.get('max_abs_delta_dr'), 1)} DR "
+                     f"(mtx validate-dr record)")
+    elif dr and rec.get("tracks_checked"):
+        lines.append(f"- [disputed] DR14: {rec['tracks_checked'] - rec.get('tracks_within_tolerance', 0)} "
+                     f"of {rec['tracks_checked']} recorded published rating(s) "
+                     f"disagree by more than {n(rec.get('tolerance_dr'), 1)} DR; "
+                     f"worst {n(rec.get('max_abs_delta_dr'), 1)} DR")
+    elif dr:
         lines.append("- [unverified] DR14: not validated against a published DR "
-                     "rating; synthetic checks only (see METHOD)")
+                     "rating; synthetic checks only (run mtx validate-dr once, "
+                     "see METHOD)")
     shown = lines[:22]
     extra = len(lines) - len(shown)
     body = "\n".join(shown) if shown else "- none"
@@ -555,6 +607,100 @@ def _block_band_timeline(res: dict[str, Any]) -> str:
             + "\n".join(rows) + "\n```\n")
 
 
+def _block_band_envelope(res: dict[str, Any]) -> str:
+    """Broadband vs multiband compression, in three lines.
+
+    The full 8x8 matrix is in analysis.json; the off-diagonal spread and the
+    two least-correlated pairs carry nearly all of what it says.  Correlated
+    envelopes mean one gain reduction moving everything together; decorrelated
+    envelopes mean the bands are being controlled independently.
+    """
+    B = (res.get("processing", {}).get("multiband_timeline", {})
+         .get("band_envelope_correlation", {}))
+    od = B.get("offdiagonal") or {}
+    if not od or od.get("median") is None:
+        return ""
+    least = B.get("least_correlated_pairs") or []
+    most = B.get("most_correlated_pair") or {}
+    pairs = [
+        ("Off-diagonal r", f"min {n(od.get('min'), 2)}  median {n(od.get('median'), 2)}  "
+                           f"max {n(od.get('max'), 2)}  mean {n(od.get('mean'), 2)}  "
+                           f"over {od.get('pairs', 0)} band pairs"),
+        ("Least correlated", "; ".join(
+            f"{'/'.join(x['bands'])} {n(x['r'], 2)}" for x in least) or "n/a"),
+        ("Most correlated", (f"{'/'.join(most['bands'])} {n(most['r'], 2)}"
+                             if most.get("bands") else "n/a")),
+    ]
+    return ("### Band-envelope correlation (10 ms envelopes, dB domain)\n\n```\n"
+            + kv_rows(pairs) + "\n```\n")
+
+
+# --------------------------------------------------------------------- stems
+STEM_ORDER = ("drums", "bass", "other", "vocals")
+
+
+def _stem_row(name: str, e: dict[str, Any]) -> list[str]:
+    L = e.get("loudness", {}) or {}
+    D = e.get("dynamics", {}) or {}
+    S = e.get("spectrum", {}) or {}
+    ST = e.get("stereo", {}) or {}
+    lv = e.get("level_vs_mix", {}) or {}
+    crest = D.get("crest", {}) or {}
+    tilt = (S.get("tilt", {}) if S.get("available") else {}) or {}
+    corr = (ST.get("correlation", {}) if ST.get("available") else {}) or {}
+    return [
+        name,
+        n(lv.get("rms_db"), 1),
+        n(lv.get("lufs_delta"), 1),
+        n(L.get("integrated_lufs"), 1),
+        n(crest.get("whole_file_db"), 1),
+        n((crest.get("loudest_window") or {}).get("crest_db"), 1),
+        f"{n(tilt.get('slope_db_per_oct'), 1)}({n(tilt.get('r2'), 2)})",
+        db(ST.get("side_minus_mid_db")) if ST.get("available") else "mono",
+        n(corr.get("overall"), 2),
+        n(S.get("sub_band_pct") if S.get("available") else None, 1),
+        n(S.get("air_band_pct") if S.get("available") else None, 1),
+    ]
+
+
+def _stems(res: dict[str, Any]) -> str:
+    """The `--stems` section.
+
+    Without it the most expensive flag in the tool writes only to
+    analysis.json, which by design never leaves the machine: the mix-versus-
+    master attribution these numbers exist to settle would be unreachable from
+    the paste-able output.  The model is named in the block because stems
+    separated by different models are not comparable.
+    """
+    S = res.get("stems", {}) or {}
+    if not S.get("requested"):
+        return ""
+    if not S.get("available"):
+        return ("## STEMS\n\nrequested but unavailable: "
+                f"{S.get('reason', 'see FLAGS')}\n")
+    entries = S.get("stems", {}) or {}
+    order = ([k for k in STEM_ORDER if k in entries]
+             + [k for k in entries if k not in STEM_ORDER])
+    rows = [_stem_row(k, entries[k]) for k in order]
+    if not rows:
+        return ""
+    warn = []
+    for k in order:
+        for w in (entries[k].get("warnings") or [])[:2]:
+            warn.append(f"{k}: {w}")
+    head = (f"model: {S.get('model') or 'unknown'}   source: {S.get('source')}\n"
+            "lvl_vs_mix and lufs_delta are this stem against the whole mix; "
+            "every other column is measured on the stem alone.\n")
+    flags = "FLAGS  " + (S.get("caveat") or "")
+    if warn:
+        flags += "\n       " + "\n       ".join(warn[:4])
+    return ("## STEMS\n\n```\n" + head + "\n"
+            + table(["stem", "lvl_vs_mix", "lufs_delta", "LUFS-I", "crest",
+                     "crest10s", "tilt(R2)", "side/mid", "corr", "sub%", "air%"],
+                    rows)
+            + "\n\n" + flags + "\n```\n")
+
+
 def _corpus_row(res: dict[str, Any]) -> str:
     t = res.get("tags", {}).get("named", {})
     h = res["headline"]
@@ -583,19 +729,104 @@ def _corpus_row(res: dict[str, Any]) -> str:
         ("True peak", n(h["true_peak_dbtp_16x"], 2) + " dBTP"),
         ("LRA", n(h["lra_lu"], 1) + " LU"),
         ("PLR", n(h["plr_db"], 1) + " dB"),
+        ("PSR min", n(h["psr_min_db"], 1) + " dB"),
+        ("PSR median", n(h["psr_median_db"], 1) + " dB"),
+        ("DR14", n(h["dr14"], 0)),
+        ("Crest (loudest 10s)", n(h["crest_loudest_10s_db"], 1) + " dB"),
         ("Tonal tilt notes", tonal),
         ("Width/mono notes", width),
+        ("mtx run", run_provenance(res)),
     ]
     body = "\n".join(f"{k}: {v}" for k, v in pairs)
     return ("## CORPUS ROW\n\nEmpty fields are left empty on purpose: nothing here is "
             "guessed.\n\n```\n" + body + "\n```\n")
 
 
+def run_provenance(res: dict[str, Any]) -> str:
+    """version / schema / profile / sha256 prefix, as one storable string.
+
+    A method change in a later version makes rows measured under an earlier one
+    subtly incomparable, and nothing else in a stored corpus would catch it.
+    The header already carries all four values; this is them reaching the row
+    that actually gets archived.
+    """
+    run = res.get("run", {})
+    sha = (res.get("file", {}).get("sha256") or "")[:16]
+    stems = res.get("stems", {}) or {}
+    model = f" / stems {stems.get('model')}" if stems.get("available") else ""
+    return (f"mtx {run.get('tool_version')} / schema {run.get('schema_version')} "
+            f"/ profile {run.get('profile')} / sha256 {sha or 'n/a'}{model}")
+
+
+def corpus_row_dict(res: dict[str, Any]) -> dict[str, Any]:
+    """The corpus row as JSON, keyed by the corpus property names.
+
+    Numbers stay numbers, so the row imports as typed properties instead of
+    text, and `_units` says what each one is in.  Anything mtx cannot measure
+    is null rather than guessed, exactly as in the pasted block.
+    """
+    t = res.get("tags", {}).get("named", {})
+    h = res["headline"]
+    ST = res.get("stereo", {})
+    S = res.get("spectrum", {})
+    tilt = S.get("tilt", {}) if S.get("available") else {}
+    pw = tilt.get("piecewise", [])
+    piece = "; ".join(
+        f"{hz(p['low_hz'])}-{hz(p['high_hz'])} {n(p['slope_db_per_oct'], 2)} dB/oct"
+        for p in pw)
+    tonal = (f"tilt {n(tilt.get('slope_db_per_oct'), 2)} dB/oct "
+             f"(R2 {n(tilt.get('r2'), 2)}); {piece}; "
+             f"air {n(h['air_band_pct'], 2)}%, sub {n(h['sub_band_pct'], 2)}%")
+    width = (f"side/mid {db(h['side_minus_mid_db'])} dB overall, "
+             f"{db(h['side_minus_mid_below_120hz_db'])} dB below 120 Hz; "
+             f"mono crossover {hz(h['mono_crossover_hz'])} Hz; "
+             f"correlation mean {n(h['correlation_mean'], 2)}, "
+             f"min {n(h['correlation_min'], 2)}"
+             if ST.get("available") else "mono file")
+
+    def num(v: Any, nd: int) -> float | None:
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return round(f, nd) if math.isfinite(f) else None
+
+    return {
+        "Title": t.get("title") or None,
+        "Artist": t.get("artist") or None,
+        "Year": (t.get("date") or "")[:10] or None,
+        "Genre": t.get("genre") or None,
+        "Engineers": None,
+        "LUFS-I": num(h["lufs_i"], 2),
+        "True peak": num(h["true_peak_dbtp_16x"], 2),
+        "LRA": num(h["lra_lu"], 1),
+        "PLR": num(h["plr_db"], 1),
+        "PSR min": num(h["psr_min_db"], 1),
+        "PSR median": num(h["psr_median_db"], 1),
+        "DR14": num(h["dr14"], 1),
+        "Crest (loudest 10s)": num(h["crest_loudest_10s_db"], 1),
+        "Tonal tilt notes": tonal,
+        "Width/mono notes": width,
+        "mtx run": run_provenance(res),
+        "_units": {
+            "LUFS-I": "LUFS", "True peak": "dBTP", "LRA": "LU", "PLR": "dB",
+            "PSR min": "dB", "PSR median": "dB", "DR14": "DR",
+            "Crest (loudest 10s)": "dB",
+        },
+        "_note": ("Fields mtx cannot measure are null, never guessed. Engineers, "
+                  "and every session field (calibration, lessons, applied-to, "
+                  "verdict), are filled in by the session and not by the tool."),
+        "_source": {"file": res.get("file", {}).get("filename"),
+                    "sha256": res.get("file", {}).get("sha256"),
+                    "psr_min_time": h.get("psr_min_time")},
+    }
+
+
 METHOD_LINES = [
     "LUFS-I/LRA: ITU-R BS.1770-4 K-weighting, 400 ms blocks 75% overlap, gates -70 LUFS / -10 LU; LRA on 3 s blocks, gates -70 / -20 LU, P95-P10. Cross-checked against ffmpeg ebur128 (tolerance 0.2 LU).",
     "True peak: scipy.signal.resample_poly (Kaiser beta 5.0) at 4x and 16x, both reported; overs counted as contiguous excursions at 16x.",
     "PSR: 3 s windows, 1 s hop; short-term true peak (4x) minus short-term LUFS over the same window.",
-    "DR14: TT offline DR. 3 s blocks, block RMS sqrt(2*mean(x^2)), loudest 20%, second-highest per-block sample peak. NOT validated against a published DR rating (see loudness.dr14.validation).",
+    "DR14: TT offline DR. 3 s blocks, block RMS sqrt(2*mean(x^2)), loudest 20%, second-highest per-block sample peak. {dr14_validation}",
     "Flat-top: threshold derived per channel as max(|x|)*0.99999, never a fixed -0.1 dBFS. Run lengths, ms, and the ten longest runs reported.",
     "Ceiling density: fraction of samples within N dB of that channel's own ceiling; threshold-free.",
     "Limiter vs clipper: mean dB slope of |x| over the 2 ms before entry and after exit of each flat-top run. Inferred, not measured.",
@@ -615,34 +846,101 @@ METHOD_LINES = [
 
 
 def _method(res: dict[str, Any]) -> str:
-    return "## METHOD\n\n" + "\n".join(f"- {ln}" for ln in METHOD_LINES) + "\n"
+    """METHOD, with the DR14 line reporting the machine's validation record.
+
+    A static "NOT validated" line would keep saying so after the check had been
+    done, which is the same failure the record exists to prevent.
+    """
+    val = res.get("loudness", {}).get("dr14", {}).get("validation", {}) or {}
+    rec = val.get("record", {}) or {}
+    if val.get("validated_against_published_reference"):
+        note = (f"Validated against {rec.get('tracks_checked')} published DR "
+                f"rating(s), worst disagreement {n(rec.get('max_abs_delta_dr'), 1)} "
+                "DR (loudness.dr14.validation.record).")
+    elif rec.get("tracks_checked"):
+        note = (f"{rec['tracks_checked'] - rec.get('tracks_within_tolerance', 0)} of "
+                f"{rec['tracks_checked']} recorded published rating(s) disagree by "
+                f"more than {n(rec.get('tolerance_dr'), 1)} DR "
+                "(loudness.dr14.validation.record).")
+    else:
+        note = ("NOT validated against a published DR rating "
+                "(see loudness.dr14.validation).")
+    lines = [ln.replace("{dr14_validation}", note) for ln in METHOD_LINES]
+    return "## METHOD\n\n" + "\n".join(f"- {ln}" for ln in lines) + "\n"
 
 
 # ------------------------------------------------------------------- assembly
-# (priority, title, builder).  Higher priority is dropped first when over budget.
+# (priority, name, group, builder).  Higher priority is dropped first when the
+# assembled digest is over budget.  The group is what `--sections` selects on.
 DETAIL_BLOCKS = [
-    (1, "band energy", _block_bands),
-    (1, "per-band crest", _block_band_crest),
-    (2, "flat-top forensics", _block_flat_top),
-    (2, "source forensics", _block_forensics),
-    (3, "sections", _block_sections),
-    (3, "short-term loudness", _block_loudness_timeline),
-    (4, "PSR timeline", _block_psr),
-    (4, "stereo detail", _block_stereo_extra),
-    (5, "side/mid per third-octave", _block_sidemid),
-    (5, "processing forensics", _block_processing),
-    (6, "per-band level over time", _block_band_timeline),
-    (6, "streaming preview", _block_streaming),
-    (6, "bass fundamentals", _block_bass),
-    (7, "ceiling density", _block_ceiling),
-    (7, "spectral descriptors", _block_descriptors),
-    (8, "resonances", _block_resonances),
-    (8, "arrangement gaps", _block_gaps),
+    (1, "band energy", "spectrum", _block_bands),
+    (1, "per-band crest", "dynamics", _block_band_crest),
+    (2, "flat-top forensics", "dynamics", _block_flat_top),
+    (2, "source forensics", "forensics", _block_forensics),
+    (3, "sections", "structure", _block_sections),
+    (3, "short-term loudness", "loudness", _block_loudness_timeline),
+    (4, "PSR timeline", "loudness", _block_psr),
+    (4, "stereo detail", "stereo", _block_stereo_extra),
+    (5, "side/mid per third-octave", "stereo", _block_sidemid),
+    # Three lines and ~230 bytes for the clearest broadband-vs-multiband tell
+    # in the tool: at priority 5 it died alongside the 700-byte processing
+    # block on any track long enough to go over budget.
+    (3, "band-envelope correlation", "processing", _block_band_envelope),
+    (5, "processing forensics", "processing", _block_processing),
+    (6, "per-band level over time", "spectrum", _block_band_timeline),
+    (6, "streaming preview", "loudness", _block_streaming),
+    (6, "bass fundamentals", "spectrum", _block_bass),
+    (7, "ceiling density", "dynamics", _block_ceiling),
+    (7, "spectral descriptors", "spectrum", _block_descriptors),
+    (8, "resonances", "spectrum", _block_resonances),
+    (8, "arrangement gaps", "structure", _block_gaps),
 ]
 
+SECTION_GROUPS = tuple(sorted({g for _, _, g, _ in DETAIL_BLOCKS}))
+SECTION_NAMES = tuple(sorted({nm for _, nm, _, _ in DETAIL_BLOCKS}))
 
-def render_digest(res: dict[str, Any], budget: int = SIZE_BUDGET_BYTES) -> str:
+
+def _norm(name: str) -> str:
+    return " ".join(name.strip().lower().replace("_", " ").replace("-", " ").split())
+
+
+def resolve_sections(names: Sequence[str]) -> set[str]:
+    """Turn `--sections` arguments into the set of block names to keep.
+
+    An unrecognised name is an error rather than a silent no-op: a digest that
+    quietly dropped the one block the session asked for would be worse than no
+    selection at all.
+    """
+    keep: set[str] = set()
+    unknown: list[str] = []
+    for raw in names:
+        want = _norm(raw)
+        hits = {nm for _, nm, g, _ in DETAIL_BLOCKS
+                if _norm(g) == want or _norm(nm) == want}
+        if not hits:
+            unknown.append(raw)
+        keep |= hits
+    if unknown:
+        raise ValueError(
+            "unknown --sections name(s): " + ", ".join(unknown)
+            + "\ngroups: " + ", ".join(SECTION_GROUPS)
+            + "\nblocks: " + ", ".join(SECTION_NAMES))
+    return keep
+
+
+def render_digest(res: dict[str, Any], budget: int | None = None,
+                  sections: Sequence[str] | None = None) -> str:
+    """Assemble digest.md.
+
+    `budget` overrides the default cap; `sections` restricts DETAIL to the
+    named groups or blocks.  A `--stems` run raises the cap by
+    `STEMS_BUDGET_BONUS`, because the stem table exists nowhere else in the
+    paste-able output and dropping it to protect a byte count would defeat the
+    run that produced it.
+    """
     tags = res.get("tags", {}).get("named", {})
+    stems_block = _stems(res)
+    stem_model = (res.get("stems", {}) or {}).get("model")
     header = (f"# mtx digest\n\n"
               f"file: {res.get('file', {}).get('filename')}\n"
               f"title: {tags.get('title') or '(no title tag)'}\n"
@@ -650,13 +948,25 @@ def render_digest(res: dict[str, Any], budget: int = SIZE_BUDGET_BYTES) -> str:
               f"sha256: {(res.get('file', {}).get('sha256') or '')[:16]}...\n"
               f"tool: mtx {res['run']['tool_version']} / schema "
               f"{res['run']['schema_version']} / profile {res['run']['profile']}\n"
-              f"audio: {res['audio']['sample_rate_hz']} Hz, {res['audio']['channels']} ch, "
+              + (f"stems: {stem_model} (separated; see STEMS)\n"
+                 if stems_block and stem_model else "")
+              + f"audio: {res['audio']['sample_rate_hz']} Hz, "
+              f"{res['audio']['channels']} ch, "
               f"{res['audio']['subtype']}, {res['audio']['duration_s']} s\n\n")
 
-    fixed = header + _headline(res) + "\n" + _flags(res) + "\n"
-    corpus = "\n" + _corpus_row(res) + "\n" + _method(res)
+    if budget is None:
+        # The bonus pays for the stem table, not for the one-line note that
+        # says separation was unavailable.
+        has_table = bool(stems_block) and (res.get("stems", {}) or {}).get("available")
+        budget = SIZE_BUDGET_BYTES + (STEMS_BUDGET_BONUS if has_table else 0)
 
-    built = [(prio, name, fn(res)) for prio, name, fn in DETAIL_BLOCKS]
+    fixed = header + _headline(res) + "\n" + _flags(res) + "\n"
+    after = (("\n" + stems_block) if stems_block else "")
+    after += "\n" + _corpus_row(res) + "\n" + _method(res)
+
+    keep = resolve_sections(sections) if sections else None
+    built = [(prio, name, fn(res)) for prio, name, group, fn in DETAIL_BLOCKS
+             if keep is None or name in keep]
     built = [(p, name, txt) for p, name, txt in built if txt]
     dropped: list[str] = []
 
@@ -664,14 +974,26 @@ def render_digest(res: dict[str, Any], budget: int = SIZE_BUDGET_BYTES) -> str:
         detail = "## DETAIL\n\n" + "\n".join(txt for _, _, txt in blocks)
         if note:
             detail += "\n" + note + "\n"
-        return fixed + detail + corpus
+        return fixed + detail + after
 
-    out = assemble(built, "")
+    selected = ("_DETAIL restricted by --sections to: "
+                + ", ".join(nm for _, nm, _ in built) + "._\n") if sections else ""
+    out = assemble(built, selected)
     while len(out.encode("utf-8")) > budget and built:
         worst = max(range(len(built)), key=lambda i: (built[i][0], i))
         dropped.append(built[worst][1])
         built.pop(worst)
-        note = ("_Dropped to stay under the 12 KB digest budget (full detail is in "
-                "analysis.json): " + ", ".join(dropped) + "._") if dropped else ""
+        note = selected + ("_Dropped to stay under the "
+                           f"{budget / 1024:.0f} KB digest budget (full detail is in "
+                           "analysis.json; --sections or --digest-budget keeps a "
+                           "block that a session needs): " + ", ".join(dropped) + "._")
         out = assemble(built, note)
+    if len(out.encode("utf-8")) > budget:
+        # HEADLINE, FLAGS, CORPUS ROW and METHOD are never dropped: a digest
+        # missing its own provenance would be smaller and useless.  Say that
+        # the budget was not met rather than meeting it by lying.
+        out += (f"\n_Budget note: the header, HEADLINE, FLAGS, CORPUS ROW and "
+                f"METHOD sections are {len(out.encode('utf-8'))} bytes on their "
+                f"own and are never dropped, so the {budget}-byte budget could "
+                f"not be met. Every DETAIL block was removed._\n")
     return out
