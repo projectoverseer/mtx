@@ -20,6 +20,7 @@ ci_blind/
 ci_sec/
 ci_big/
 ci_batch/
+ci_cache/
 ci_masters.csv
 ci_pred.txt
 ci_signal.flac

@@ -57,6 +57,7 @@ mtx analyze <file> [--out DIR] [--profile quick|full] [--plots] [--stems]
 mtx batch <dir> [--out DIR] [--recursive] [--csv summary.csv]
                 [--csv-schema internal|corpus]
 mtx compare <fileA> <fileB> [--out DIR] [--null-test]
+mtx enrich <DIR> [--providers A,B,C] [--cache DIR] [--offline] [--refresh]
 mtx join <analysis.json|DIR> [--out FILE]
 mtx predict --check <predictions> <digest.md|analysis.json>
 mtx validate-dr <file> --published <DR> [--source TEXT] [--show]
@@ -75,6 +76,9 @@ mtx --version
   unrounded number stays in `analysis.json`. Bootstrap a corpus with the full
   profile: `quick` skips the 16x true peak, which leaves the `True peak` column
   empty in every row, and `batch` says so before it starts.
+- `enrich` — the one command that uses the network, and it is off unless you
+  run it. Looks each analysed folder up in the public music databases and
+  writes `online.json` beside `analysis.json`. See *Enrichment* below.
 - `compare` — two files, **level-matched first**, with an optional null test.
 - `join` — puts a split `analysis.json` back together (see *Uploading the
   analysis* below). Reads the index or the directory holding it.
@@ -135,6 +139,7 @@ output.
 | `corpus_row.json` | The corpus row as typed JSON, keyed by property name, for import rather than retyping. |
 | `predict.md` | Only with `--blind`. The headline as a form to fill in before reading the digest. |
 | `plots/*.png` | Only with `--plots`. For your own eyes; never referenced by the digest. |
+| `online.json` | Only after `mtx enrich`. Genre vote, credits, identifiers and cross-checks from the public databases. Never merged into `analysis.json`. |
 
 `FLAGS` comes **before** the detail: warnings, method disagreements and every
 low-confidence metric are the first thing you read.
@@ -172,6 +177,66 @@ alike; `comparison.json` is split by the same rule. `mtx predict --check` reads
 a split `analysis.json` directly — the headline stays in the index.
 
 ---
+
+### Enrichment: what the file does not know about itself
+
+`mtx analyze` never touches the network. `mtx enrich` does, deliberately and
+separately, because a purchased download keeps the ISRC and throws away almost
+everything else: who mixed it, who wrote it, what a listener would call it.
+
+```
+mtx enrich ./mtx_out                      # a whole corpus
+mtx enrich ./mtx_out/"Artist - Title"     # one track, --print to see it
+mtx enrich ./mtx_out --providers all      # add the two that need credentials
+mtx enrich ./mtx_out --offline            # answer only from the cache
+```
+
+Keyless by default: **MusicBrainz** (community-voted genres at recording,
+release-group and artist level, plus engineer and songwriter credits),
+**Deezer** (exact ISRC addressing, a published BPM, popularity), **Apple /
+iTunes** (a third, independent genre taxonomy). Two more switch on when their
+credentials are present: **Last.fm** (`LASTFM_API_KEY`) for listener tags and
+real play counts, **Discogs** (`DISCOGS_TOKEN`) for sleeve credits and a
+genre/style split.
+
+Three things make the result trustworthy rather than merely present:
+
+**A database row is not accepted just because the ISRC matched.** Labels reuse
+an ISRC across a radio edit and the album cut. `bad guy`'s returns three
+MusicBrainz recordings and lists the 175 s radio edit first; the file is 194 s.
+Every candidate is scored against what mtx already measured — duration
+loudest, since that is the one field the analysis knows exactly — and the
+losing candidates stay in the output with their scores, so a wrong match is
+auditable instead of invisible.
+
+**The genre vote does not reward coarseness.** Each source is scaled against
+its own top vote, not against the sum of its votes. Sharing the total would
+punish exactly the sources worth having: MusicBrainz spreads nine genres over a
+record, so each would land near a ninth, while a shop returning the single word
+`Alternative` would collect its full weight and win. Every genre carries the
+sources that voted for it, and a coarse `umbrella` is offered *alongside* the
+ranked list, never instead of it — so a query can filter on `pop` and still
+read `avant-garde pop`.
+
+**Disagreement is the output, not an error to be smoothed away.** Where an
+outside number can be compared with one mtx derived, both are kept:
+
+| Check | What it settles |
+| --- | --- |
+| `cross_checks.tempo` | mtx estimates tempo from an onset envelope and marks it low-confidence on most of a pop corpus. A published BPM that agrees promotes it to `high`; one that is exactly double is reported as `octave` — the beat tracker locked to a different metrical level, not a different tempo — and a real disagreement leaves the local value alone at `low`. |
+| `cross_checks.duration` | `exact` / `close` / `differs` against every provider, which is what makes the match itself verifiable. |
+| `cross_checks.release_date` | The tag, the release, the release group and two shops, plus the earliest of them and whether they agree. |
+
+Nothing measured is ever overwritten. `online.json` is a **sidecar**, not a
+section of `analysis.json`, because `mtx analyze` promises byte-identical
+output for the same input and a section built from whatever MusicBrainz looked
+like this morning cannot live inside that promise.
+
+Responses are cached under `.mtx_cache/`, so a second pass over an enriched
+corpus makes no requests and `--offline` works with the network unplugged.
+Per-host rate limits are honoured — MusicBrainz's one-request-per-second above
+all — and the whole subpackage is stdlib-only, so enrichment adds no dependency
+to a tool whose point is reproducible local measurement.
 
 ## The five properties this tool is built around
 

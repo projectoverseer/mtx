@@ -172,6 +172,94 @@ def cmd_join(args: argparse.Namespace) -> int:
     return 0
 
 
+def _enrich_targets(path: str) -> list[str]:
+    """The analysed folders under `path`: itself, or its immediate children."""
+    if os.path.isfile(path):
+        return [os.path.dirname(os.path.abspath(path)) or "."]
+    if os.path.isfile(os.path.join(path, "analysis.json")):
+        return [path]
+    out = []
+    for name in sorted(os.listdir(path)):
+        sub = os.path.join(path, name)
+        if os.path.isdir(sub) and os.path.isfile(os.path.join(sub, "analysis.json")):
+            out.append(sub)
+    return out
+
+
+def cmd_enrich(args: argparse.Namespace) -> int:
+    """Attach public-database metadata to folders `mtx analyze` already wrote.
+
+    The result is a sidecar `online.json`, never a rewrite of `analysis.json`:
+    `mtx analyze` promises byte-identical output for the same input, and a
+    section whose content depends on what MusicBrainz looked like this morning
+    cannot live inside that promise.
+    """
+    from .online import ALL_PROVIDERS, DEFAULT_PROVIDERS, KEYED_PROVIDERS, enrich
+    from .split import load_analysis
+
+    if not os.path.exists(args.path):
+        _log(f"error: no such file or directory: {args.path}")
+        return 1
+    targets = _enrich_targets(args.path)
+    if not targets:
+        _log(f"error: no analysis.json under {args.path}")
+        return 1
+
+    if args.providers.strip().lower() == "all":
+        providers = list(ALL_PROVIDERS)
+    else:
+        providers = [p for p in (x.strip() for x in args.providers.split(",")) if p]
+        unknown = [p for p in providers if p not in ALL_PROVIDERS]
+        if unknown:
+            _log(f"error: unknown provider(s): {', '.join(unknown)}; "
+                 f"choose from {', '.join(ALL_PROVIDERS)}")
+            return 1
+    for name in providers:
+        if name in KEYED_PROVIDERS:
+            env = "LASTFM_API_KEY" if name == "lastfm" else "DISCOGS_TOKEN"
+            if not os.environ.get(env):
+                _log(f"warning: {name} needs {env}; it will report no match")
+
+    cache = args.cache if args.cache is not None else os.path.join(
+        args.path if os.path.isdir(args.path) else ".", ".mtx_cache")
+    _log(f"{len(targets)} folder(s), providers: {', '.join(providers)}")
+    _log(f"cache: {cache}{' (offline)' if args.offline else ''}")
+
+    ok = matched = 0
+    for i, folder in enumerate(targets, 1):
+        name = os.path.basename(os.path.abspath(folder))
+        try:
+            res = load_analysis(os.path.join(folder, "analysis.json"))
+        except (OSError, ValueError) as exc:
+            _log(f"[{i}/{len(targets)}] {name}: cannot read analysis: {exc}")
+            continue
+        _log(f"[{i}/{len(targets)}] {name}")
+        section = enrich(res, cache_dir=cache, providers=providers,
+                         offline=args.offline, refresh=args.refresh,
+                         log=lambda s: _log(f"    {s}"), version=__version__)
+        out_path = args.out if (args.out and len(targets) == 1) else \
+            os.path.join(folder, "online.json")
+        with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(section, fh, indent=1, sort_keys=True, ensure_ascii=False)
+            fh.write("\n")
+        ok += 1
+        g = section.get("genres") or {}
+        if section.get("providers_available"):
+            matched += 1
+        _log(f"    genre: {g.get('primary') or '-'} "
+             f"({g.get('umbrella') or '-'}), "
+             f"match {section.get('match_confidence', 0):.2f} -> {out_path}")
+        tempo = (section.get("cross_checks") or {}).get("tempo") or {}
+        if tempo.get("verdict") in ("octave", "triplet", "disagree"):
+            _log(f"    tempo {tempo['verdict']}: local {tempo.get('local_bpm')} "
+                 f"vs published {tempo.get('published_bpm')}")
+
+    _log(f"enriched {ok} folder(s); {matched} matched at least one provider")
+    if args.print_json and ok == 1:
+        print(json.dumps(section, indent=1, ensure_ascii=False))
+    return 0
+
+
 def _split_sections(text: str | None) -> list[str] | None:
     if not text:
         return None
@@ -434,6 +522,8 @@ def cmd_selftest(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from .online import DEFAULT_PROVIDERS as DEFAULT_PROVIDER_NAMES
+
     p = argparse.ArgumentParser(
         prog="mtx",
         description="master extractor: an exhaustive, reproducible measurement "
@@ -490,6 +580,28 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--profile", choices=("quick", "full"), default="full")
     _add_part_size_args(c)
     c.set_defaults(func=cmd_compare)
+
+    e = sub.add_parser("enrich",
+                       help="look analysed folders up in the public music "
+                            "databases and write online.json beside each")
+    e.add_argument("path", help="an analysed folder, or a folder of them")
+    e.add_argument("--providers", default=",".join(DEFAULT_PROVIDER_NAMES),
+                   metavar="A,B,C",
+                   help="comma-separated, or 'all'; keyless: musicbrainz, "
+                        "deezer, itunes; keyed: lastfm (LASTFM_API_KEY), "
+                        "discogs (DISCOGS_TOKEN)")
+    e.add_argument("--cache", metavar="DIR",
+                   help="response cache (default <path>/.mtx_cache); a second "
+                        "run over the same folder makes no requests")
+    e.add_argument("--offline", action="store_true",
+                   help="answer only from the cache, never the network")
+    e.add_argument("--refresh", action="store_true",
+                   help="ignore cached responses and re-fetch")
+    e.add_argument("--out", metavar="FILE",
+                   help="write here instead of online.json (single folder only)")
+    e.add_argument("--print", dest="print_json", action="store_true",
+                   help="also print the section to stdout (single folder only)")
+    e.set_defaults(func=cmd_enrich)
 
     j = sub.add_parser("join", help="rebuild a split analysis.json from its "
                                     "index and part files")

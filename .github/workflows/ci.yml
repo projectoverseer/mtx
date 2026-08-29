@@ -61,3 +61,9 @@ jobs:
           mtx batch . --out ci_batch --profile quick --csv ci_masters.csv --csv-schema corpus
           python -c "import csv; h=next(csv.reader(open('ci_masters.csv',encoding='utf-8'))); assert 'LUFS-I' in h and 'PSR min' in h and 'mtx run' in h, h"
           mtx validate-dr --show
+
+      - name: Enrichment stays offline unless it is asked to go online
+        run: |
+          mtx enrich ci_out --offline --cache ci_cache
+          python -c "import json,sys; d=json.load(open('ci_out/online.json',encoding='utf-8')); sys.exit(0 if d['providers_available']==[] and d['genres']['available'] is False and d['cross_checks']['tempo']['verdict']=='unavailable' and d['errors'] else 'offline enrich did not degrade cleanly')"
+          python -c "import json,sys,os; sys.exit(0 if os.path.getsize('ci_out/analysis.json') and 'online' not in json.load(open('ci_out/analysis.json',encoding='utf-8')) else 'enrich must not write into analysis.json')"

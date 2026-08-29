@@ -313,6 +313,88 @@ the PSR minimum. Anything mtx cannot measure is `null`, never guessed --
 `Engineers` always is, and no session field (calibration, lessons, verdict)
 appears at all.
 
+## `online.json` (`mtx enrich`)
+
+`online.schema_version` **1.0.0**. A **sidecar**, written beside
+`analysis.json` and never merged into it: `mtx analyze` guarantees
+byte-identical output for the same input, and a section whose content depends
+on what MusicBrainz looked like this morning cannot live inside that
+guarantee. Absent unless `mtx enrich` has been run.
+
+| Field | Description |
+| --- | --- |
+| `schema_version` | Version of this section. |
+| `queried_utc` | ISO 8601 timestamp of the lookup. |
+| `query` | What the file claimed about itself: `isrc`, `title`, `artist`, `album`, `barcode`, `date`, `genre_tag`, `duration_s`. These are the inputs every provider was matched against. |
+| `providers_requested[]` | Providers asked, in order. |
+| `providers_available[]` | Providers that returned a match above the score floor. |
+| `match_confidence` | Mean match score across the providers that matched. `0.0` when none did. |
+| `errors[]` | Every failure, prefixed by provider. A provider that raised is caught here rather than losing the run. |
+| `cache` | `hit` / `miss` / `error` / `skipped` request counts for this track. |
+| `elapsed_seconds` | Wall-clock time of the lookup. |
+
+### `genres`
+
+| Field | Description |
+| --- | --- |
+| `available` | `false` when no source returned a usable label; `primary` is then `null` rather than guessed. |
+| `primary` | Highest-scoring genre. |
+| `umbrella` | Its coarse bucket (`pop`, `hip hop`, `r&b/soul`, `electronic`, `rock`, `jazz`, `latin`, …), decided head-final: `ambient pop` is pop, `pop rock` is rock. |
+| `ranked[]` | `{name, score, confidence, umbrella, sources[]}`, descending. `confidence` is the score relative to the winner, so "how much weaker is the second guess" reads off directly. `sources[]` names every provider level that voted for it. |
+| `umbrella_ranked[]` | `{name, score}` — the ranked list collapsed into buckets, for filtering. |
+| `agreement` | Fraction of contributing sources that backed the winner. |
+| `source_count` | Number of sources that returned any genre. |
+| `by_source` | The raw normalised votes per source, before weighting. |
+
+Scoring: within a source each vote is scaled against **that source's own top
+vote**, then multiplied by the source's trust weight (a genre attached to this
+recording outranks one attached to the artist's whole career), and the products
+are summed. Scaling against the source's sum instead would hand the win to a
+shop returning one coarse word over a database returning nine precise ones.
+Normalisation repairs spelling only — `Hip-Hop/Rap` becomes `hip hop` — and
+never merges two genres a listener can tell apart.
+
+### `descriptive_tags[]`
+
+`{name, score, sources[]}`. Mood and context words that are *not* genres —
+`dark`, `nocturnal`, `party`. Kept separate so they cannot pollute a genre
+filter; years, chart names, review-site handles and personal shelf labels are
+dropped.
+
+### `cross_checks`
+
+| Field | Description |
+| --- | --- |
+| `tempo` | `local_bpm` and `local_confidence` from `structure.tempo`, against `published_bpm` from `published_source`. `verdict` is `agree` (within 2 %), `octave` (half or double — a metrical-level disagreement, not a tempo one), `triplet` (3:2), `disagree`, or `unavailable`. `resolved_bpm` and `resolved_confidence` are the conclusion: agreement promotes a low-confidence estimate to `high`; an `octave` verdict resolves to the published value at `medium` and keeps the other reading in `alternate_bpm`, because the relationship is certain while which level to call "the tempo" is not; a real disagreement keeps the local value at `low`. |
+| `duration` | `local_s`, `providers_s`, `deltas_s`, `max_abs_delta_s`, and `verdict` (`exact` ≤ 2 s, `close` ≤ 5 s, `differs`). This is what makes a match verifiable rather than assumed. |
+| `release_date` | `sources` (tag, MusicBrainz release and release group, Deezer, Apple), `earliest`, and `agree`. |
+
+### `credits`
+
+`{role: [{name, sources[]}]}`, merged across MusicBrainz relations, Discogs
+sleeve credits, Deezer contributors and the file's own tags. A name backed by
+more than one source is a confirmed credit; the `sources[]` list is what makes
+that visible. Songwriting comes from the MusicBrainz *work* behind the
+recording, which is the one place composer and lyricist are reliably recorded.
+
+### `identity` and `popularity`
+
+`identity` carries the stable handles: `isrc`, `recording_mbid`,
+`release_mbid`, `release_group_mbid`, `work_mbid`, `iswcs[]`, `deezer_id`,
+`itunes_id`, `discogs_release_id`, `label`. `popularity` carries
+`deezer_rank`, `deezer_album_fans`, and — with a Last.fm key —
+`lastfm_listeners`, `lastfm_playcount`, `lastfm_artist_listeners`.
+
+### Per-provider blocks
+
+`musicbrainz`, `deezer`, `itunes`, `lastfm`, `discogs` each keep their own raw
+result: `available`, `errors[]`, `requests`, the `match` breakdown
+(`score`, `duration_delta_s`, `title_score`, `artist_score`, `matched_by`), and
+`candidates[]` — the rows that were considered and rejected, with their scores.
+A wrong match is therefore auditable rather than invisible.
+
+---
+
 ## `comparison.json` (`mtx compare`)
 
 | Field | Description |
