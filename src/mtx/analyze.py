@@ -21,6 +21,7 @@ from .metrics import (dynamics as m_dynamics, fileinfo as m_fileinfo,
                       processing as m_processing, spectrum as m_spectrum,
                       stereo as m_stereo, structure as m_structure)
 from .params import PARAMS, profile_params
+from .split import DEFAULT_PART_BYTES
 from .util import Collector, jsonable
 
 SEED = 0
@@ -196,24 +197,28 @@ def write_outputs(res: dict[str, Any], out_dir: str, *, json_only: bool = False,
                   plots: bool = False, src_path: str | None = None,
                   digest_budget: int | None = None,
                   sections: list[str] | None = None,
+                  max_part_bytes: int | None = DEFAULT_PART_BYTES,
                   blind: bool = False, log=None) -> dict[str, str]:
     """Write analysis.json, digest.md, corpus_row.json and optionally plots/.
+
+    `analysis.json` is written whole when it fits under `max_part_bytes`, and
+    as an index plus `analysis.partNN.json` files when it does not: the
+    exhaustive dump of a four-minute track runs past the 5 MB per-file cap most
+    places put on an upload, and a file that cannot be uploaded stays on one
+    machine.  `max_part_bytes=None` always writes the single file.
 
     With `blind`, a prediction sheet is written as well: the digest is still
     produced, but the caller is expected to hand over only `predict.md` until
     the prediction has been committed.  Returns the paths written.
     """
     from .digest import corpus_row_dict, render_digest
+    from .split import write_analysis
 
     os.makedirs(out_dir, exist_ok=True)
     written: dict[str, str] = {}
     t0 = time.time()
-    json_path = os.path.join(out_dir, "analysis.json")
-    with open(json_path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(jsonable(res), f, indent=1, sort_keys=True, ensure_ascii=False,
-                  allow_nan=False)
-        f.write("\n")
-    written["analysis.json"] = json_path
+    written.update(write_analysis(jsonable(res), out_dir, "analysis",
+                                  max_bytes=max_part_bytes, log=log))
     if log:
         log(f"  writing outputs: {time.time() - t0:.1f} s")
 

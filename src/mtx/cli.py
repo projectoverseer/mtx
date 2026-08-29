@@ -87,10 +87,8 @@ def _check_readable(path: str) -> None:
         raise SystemExit(1)
 
 
-def parse_budget(text: str | None) -> int | None:
-    """`20k`, `20kb`, `20480` -> bytes."""
-    if text is None:
-        return None
+def _parse_bytes(text: str, flag: str, example: str) -> int:
+    """`20k`, `20kb`, `4.5m`, `20480` -> bytes."""
     t = text.strip().lower().replace("_", "")
     mult = 1
     for suffix, m in (("kb", 1024), ("k", 1024), ("mb", 1024 * 1024), ("m", 1024 * 1024)):
@@ -98,10 +96,17 @@ def parse_budget(text: str | None) -> int | None:
             t, mult = t[: -len(suffix)], m
             break
     try:
-        value = int(round(float(t) * mult))
+        return int(round(float(t) * mult))
     except ValueError:
-        _log(f"error: cannot read --digest-budget {text!r}; try 20k or 20480")
+        _log(f"error: cannot read {flag} {text!r}; try {example}")
         raise SystemExit(1)
+
+
+def parse_budget(text: str | None) -> int | None:
+    """The digest size cap."""
+    if text is None:
+        return None
+    value = _parse_bytes(text, "--digest-budget", "20k or 20480")
     if value < 6144:
         # The never-dropped sections (header, HEADLINE, FLAGS, CORPUS ROW,
         # METHOD) are around 5 KB on their own; a lower cap could only be met
@@ -110,6 +115,61 @@ def parse_budget(text: str | None) -> int | None:
              "sections that are never dropped do not fit under it")
         raise SystemExit(1)
     return value
+
+
+def parse_part_size(args: argparse.Namespace) -> int | None:
+    """The per-file cap the JSON output is split to fit under.
+
+    `None` means "never split".  The default exists because the exhaustive dump
+    of a normal track is past the 5 MB per-file limit an upload usually has,
+    and a measurement that cannot leave the machine is half a measurement.
+    """
+    from .split import DEFAULT_PART_BYTES, MIN_PART_BYTES, NOTION_UPLOAD_LIMIT
+
+    if getattr(args, "no_split", False):
+        return None
+    text = getattr(args, "max_part_size", None)
+    if text is None:
+        return DEFAULT_PART_BYTES
+    value = _parse_bytes(text, "--max-part-size", "4.5m or 4500000")
+    if value < MIN_PART_BYTES:
+        _log(f"error: --max-part-size {text!r} is below the "
+             f"{MIN_PART_BYTES // 1024} KB floor; below that the index and its "
+             "manifest do not fit in a part of their own")
+        raise SystemExit(1)
+    if value > NOTION_UPLOAD_LIMIT:
+        _log(f"note: --max-part-size {value / 1e6:.1f} MB is above the 5 MB "
+             "limit Notion enforces per upload; the parts will be too big for it")
+    return value
+
+
+def _add_part_size_args(p: argparse.ArgumentParser) -> None:
+    from .split import DEFAULT_PART_BYTES
+
+    p.add_argument("--max-part-size", metavar="BYTES",
+                   help="size a single JSON output file may reach before it is "
+                        f"written as an index plus parts (default "
+                        f"{DEFAULT_PART_BYTES / 1e6:.1f}m, under the 5 MB "
+                        "per-file upload limit); e.g. 4.5m or 2m")
+    p.add_argument("--no-split", action="store_true",
+                   help="always write one JSON file, however large")
+
+
+def cmd_join(args: argparse.Namespace) -> int:
+    """Put a split analysis back together."""
+    from .split import join
+
+    if not os.path.exists(args.path):
+        _log(f"error: no such file or directory: {args.path}")
+        return 1
+    try:
+        out = join(args.path, args.out)
+    except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+        _log(f"error: {exc}")
+        return 1
+    _log(f"rejoined -> {out} ({os.path.getsize(out) / 1e6:.1f} MB)")
+    print(out)
+    return 0
 
 
 def _split_sections(text: str | None) -> list[str] | None:
@@ -124,6 +184,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     _check_readable(args.file)
     sections = _split_sections(getattr(args, "sections", None))
     budget = parse_budget(getattr(args, "digest_budget", None))
+    part_size = parse_part_size(args)
     if sections:
         from .digest import resolve_sections
         try:
@@ -143,7 +204,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     written = write_outputs(res, out_dir, json_only=args.json_only,
                             plots=args.plots, src_path=args.file,
                             digest_budget=budget, sections=sections,
-                            blind=blind, log=_log)
+                            max_part_bytes=part_size, blind=blind, log=_log)
     _log(f"done in {time.time() - t0:.1f} s -> {out_dir}")
     for k, v in written.items():
         _log(f"  {k}: {v}")
@@ -225,6 +286,7 @@ def cmd_batch(args: argparse.Namespace) -> int:
              "'True peak' column will be empty in every row; use the full "
              "profile for a corpus the rows are meant to be kept in")
 
+    part_size = parse_part_size(args)
     base_out = args.out or "mtx_out"
     rows: list[dict[str, Any]] = []
     failures = 0
@@ -239,7 +301,7 @@ def cmd_batch(args: argparse.Namespace) -> int:
             continue
         out_dir = _default_out(base_out, path, res)
         write_outputs(res, out_dir, json_only=args.json_only, plots=args.plots,
-                      src_path=path, log=_log)
+                      src_path=path, max_part_bytes=part_size, log=_log)
         h = res["headline"]
         t = res.get("tags", {}).get("named", {})
         row = {k: h.get(k) for k in CSV_FIELDS if k in h}
@@ -287,7 +349,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
         os.path.splitext(os.path.basename(args.file_b))[0])
     paths = compare_files(args.file_a, args.file_b, out_dir,
                           null_test=args.null_test, profile=args.profile,
-                          log=_log)
+                          max_part_bytes=parse_part_size(args), log=_log)
     for k, v in paths.items():
         _log(f"  {k}: {v}")
     print(out_dir)
@@ -400,6 +462,7 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--digest-budget", metavar="BYTES",
                    help="raise or lower the digest size cap, e.g. 20k "
                         "(default 12k, plus 4k when --stems renders)")
+    _add_part_size_args(a)
     a.set_defaults(func=cmd_analyze)
 
     b = sub.add_parser("batch", help="measure every audio file in a folder")
@@ -415,6 +478,7 @@ def build_parser() -> argparse.ArgumentParser:
                    default="internal",
                    help="'corpus' names the columns after the corpus database's "
                         "properties so the CSV imports as a populated table")
+    _add_part_size_args(b)
     b.set_defaults(func=cmd_batch)
 
     c = sub.add_parser("compare", help="level-matched comparison of two files")
@@ -424,7 +488,16 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--null-test", action="store_true",
                    help="align, invert and sum; report the residual")
     c.add_argument("--profile", choices=("quick", "full"), default="full")
+    _add_part_size_args(c)
     c.set_defaults(func=cmd_compare)
+
+    j = sub.add_parser("join", help="rebuild a split analysis.json from its "
+                                    "index and part files")
+    j.add_argument("path", help="the index file (analysis.json) or the "
+                                "directory holding it")
+    j.add_argument("--out", help="output path (default <name>.full.json "
+                                 "next to the index)")
+    j.set_defaults(func=cmd_join)
 
     pr = sub.add_parser("predict", help="score a filled-in prediction sheet")
     pr.add_argument("--check", dest="predictions", required=True,

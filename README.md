@@ -53,9 +53,11 @@ with the measured value for each. It exits non-zero if anything fails.
 ```
 mtx analyze <file> [--out DIR] [--profile quick|full] [--plots] [--stems]
                    [--blind] [--sections A,B,C] [--digest-budget 20k] [--json-only]
+                   [--max-part-size 4.5m] [--no-split]
 mtx batch <dir> [--out DIR] [--recursive] [--csv summary.csv]
                 [--csv-schema internal|corpus]
 mtx compare <fileA> <fileB> [--out DIR] [--null-test]
+mtx join <analysis.json|DIR> [--out FILE]
 mtx predict --check <predictions> <digest.md|analysis.json>
 mtx validate-dr <file> --published <DR> [--source TEXT] [--show]
 mtx selftest
@@ -74,6 +76,8 @@ mtx --version
   profile: `quick` skips the 16x true peak, which leaves the `True peak` column
   empty in every row, and `batch` says so before it starts.
 - `compare` — two files, **level-matched first**, with an optional null test.
+- `join` — puts a split `analysis.json` back together (see *Uploading the
+  analysis* below). Reads the index or the directory holding it.
 - `predict` — scores a filled-in prediction sheet against the measurements.
   Arithmetic only: signed error, absolute error, and whether the stated
   interval held. It never says whether a prediction was a good one.
@@ -125,7 +129,8 @@ output.
 
 | File | What it is |
 | --- | --- |
-| `analysis.json` | Everything, with the full parameter block. Large; stays on your machine. |
+| `analysis.json` | Everything, with the full parameter block. Large. Past the part size limit it becomes an index plus `analysis.partNN.json`. |
+| `analysis.partNN.json` | Only when the analysis is over the limit. One fragment each, listed in the index's `split` block. |
 | `digest.md` | `HEADLINE` / `FLAGS` / `DETAIL` / `STEMS` (with `--stems`) / `CORPUS ROW` / `METHOD`. ~12 KB by default. |
 | `corpus_row.json` | The corpus row as typed JSON, keyed by property name, for import rather than retyping. |
 | `predict.md` | Only with `--blind`. The headline as a form to fill in before reading the digest. |
@@ -135,6 +140,36 @@ output.
 low-confidence metric are the first thing you read.
 
 A worked example is in [`samples/digest.md`](samples/digest.md).
+
+### Uploading the analysis
+
+A full-profile analysis of a four-minute track is comfortably past 5 MB, which
+is the per-file cap on an upload to Notion and to most other places a
+measurement archive ends up. So `analysis.json` is written whole while it fits
+under the limit, and as an index plus numbered parts when it does not:
+
+```
+analysis.json            the index: the headline, run, params, warnings and
+                         every other section small enough to stay inline,
+                         plus `split` -- the manifest naming the parts
+analysis.part01.json     one fragment each, with the path it belongs at
+analysis.part02.json
+```
+
+Every file in the set is valid JSON on its own and every one is under the
+limit, so the whole set uploads. Nothing is dropped, rounded or summarised:
+the split is a transport detail.
+
+```
+mtx analyze track.flac --max-part-size 2m    # smaller parts
+mtx analyze track.flac --no-split            # one file, however large
+mtx join mtx_out/track/                      # -> analysis.full.json
+```
+
+The default is 4.5 MB, under the 5 MB limit with room for the part header.
+`--max-part-size` and `--no-split` apply to `analyze`, `batch` and `compare`
+alike; `comparison.json` is split by the same rule. `mtx predict --check` reads
+a split `analysis.json` directly — the headline stays in the index.
 
 ---
 

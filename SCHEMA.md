@@ -267,6 +267,39 @@ Both are rendered into the digest's `FLAGS` section, before the detail.
 
 ---
 
+## `split` and the part files
+
+Present only when the document was too large for one file. `analysis.json` is
+then an index: every section small enough stays inline, the rest are replaced
+by `{mtx_moved: true, parts: [...], note}` and live in `analysis.partNN.json`.
+`mtx join` (or `mtx.split.load_analysis`) rebuilds the whole document; nothing
+is dropped, rounded or summarised by the split.
+
+| Field | Description |
+| --- | --- |
+| `split.whole_bytes` | Size the single file would have been. |
+| `split.part_max_bytes` | The per-file cap the split was made to fit under (`--max-part-size`, default 4.5 MB). |
+| `split.part_count` | Number of part files. |
+| `split.sections_in_parts[]` | Top-level keys that were moved out. |
+| `split.parts[]` | `file`, `path`, `slice`, `bytes` — one row per part, in the order they merge. |
+| `split.rejoin` | The command that puts it back together. |
+| `split.oversize_parts` | Only when a single indivisible value is still over the cap. Nothing was truncated. |
+
+Each part file holds `mtx_part` (`stem`, `index`, `of`, `path`, `slice`,
+`index_file`, `note`) and `data`. `path` is the key sequence the fragment
+belongs at; `slice` is `[start, stop]`, absolute, when the fragment is a chunk
+of a list at that path, and `null` when it is a (possibly partial) object.
+Merging in part order restores the document: object fragments set their keys,
+list chunks concatenate.
+
+`comparison.json` is split by the same rule and carries the same block.
+
+`schema_version` does not move for this: no measured field changed, and a
+rejoined document is identical to the one a `--no-split` run writes. The split
+describes how the document was carried, not what was measured.
+
+---
+
 ## `corpus_row.json` (written next to `digest.md`)
 
 The `CORPUS ROW` block as typed JSON, so a measurement reaches an archive
