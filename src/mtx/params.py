@@ -242,8 +242,10 @@ QUICK_SKIPS: tuple[str, ...] = (
     "processing.transient_density",
     "spectrum.ltas_lowfreq",
     "forensics.wow_flutter",
-    "stems",
 )
+# `stems` is deliberately absent: separation is opt-in through --stems at
+# either profile, never a profile switch.  The per-stem measurements inherit
+# whichever profile the run used.
 
 
 def profile_params(profile: str) -> dict[str, Any]:

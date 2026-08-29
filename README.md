@@ -2,8 +2,9 @@
 
 `mtx` reads a lossless audio file on your machine and writes an exhaustive,
 reproducible measurement dump: a large `analysis.json` that stays local, and a
-compact `digest.md` (hard cap ~12 KB) you can paste into an analysis workflow
-somewhere else.
+compact `digest.md` (~12 KB by default, `--digest-budget` to change it) you can
+paste into an analysis workflow somewhere else, plus a `corpus_row.json` for the
+archive.
 
 **This tool measures. It does not interpret, score, grade or recommend.** There
 is no "good", "bad" or "too loud" anywhere in its output. Where a number is an
@@ -50,9 +51,13 @@ with the measured value for each. It exits non-zero if anything fails.
 ## Usage
 
 ```
-mtx analyze <file> [--out DIR] [--profile quick|full] [--plots] [--stems] [--json-only]
+mtx analyze <file> [--out DIR] [--profile quick|full] [--plots] [--stems]
+                   [--blind] [--sections A,B,C] [--digest-budget 20k] [--json-only]
 mtx batch <dir> [--out DIR] [--recursive] [--csv summary.csv]
+                [--csv-schema internal|corpus]
 mtx compare <fileA> <fileB> [--out DIR] [--null-test]
+mtx predict --check <predictions> <digest.md|analysis.json>
+mtx validate-dr <file> --published <DR> [--source TEXT] [--show]
 mtx selftest
 mtx --version
 ```
@@ -61,17 +66,68 @@ mtx --version
   expensive DSP (see the profile table below).
 - `batch` — one JSON per file plus a single CSV of headline metrics, one row per
   track. This is how you bootstrap a reference library from records you own.
+  `--csv-schema corpus` names the columns after the properties a corpus
+  database is likely to already have (`LUFS-I`, `True peak`, `PSR min`, `DR14`,
+  `Crest (loudest 10s)`, `mtx run`, …) so the CSV imports as a populated table
+  instead of a mapping exercise. CSV values are rounded to 3 decimals — the
+  unrounded number stays in `analysis.json`. Bootstrap a corpus with the full
+  profile: `quick` skips the 16x true peak, which leaves the `True peak` column
+  empty in every row, and `batch` says so before it starts.
 - `compare` — two files, **level-matched first**, with an optional null test.
+- `predict` — scores a filled-in prediction sheet against the measurements.
+  Arithmetic only: signed error, absolute error, and whether the stated
+  interval held. It never says whether a prediction was a good one.
+- `validate-dr` — records this implementation's DR14 against a published rating
+  for a track you own. See *DR14 and the validation record* below.
 - Default output directory: `./mtx_out/<basename>/`.
 - Progress goes to stderr; stdout carries only the output path.
 - Exit codes: `0` success, `1` unreadable input, `2` a self-test assertion failed.
+
+### Predicting before measuring
+
+`--blind` writes the digest without printing it, and prints the path of a
+prediction sheet instead:
+
+```
+$ mtx analyze track.flac --blind
+[mtx] blind mode: digest.md was written and is NOT printed; commit the prediction first, then read it
+mtx_out/track/predict.md
+
+$ $EDITOR mtx_out/track/predict.md          # fill in value, +/- range, confidence
+$ mtx predict --check mtx_out/track/predict.md mtx_out/track/digest.md
+```
+
+The sheet carries the field list, the units, `FLAGS` and `METHOD` — knowing
+*how* a number is derived is fair information for a prediction — and none of
+the values, including the ones `DETAIL` and `CORPUS ROW` would otherwise
+restate. Score against `analysis.json` instead of `digest.md` if you want the
+unrounded values.
+
+### Choosing what the digest spends its budget on
+
+The digest has a size cap and a fixed drop order, which means a
+stereo-focused session can lose the stereo detail it needed while carrying a
+reverb block it did not. Two ways out, neither of them the default:
+
+```
+mtx analyze track.flac --sections stereo,forensics,structure
+mtx analyze track.flac --digest-budget 20k
+```
+
+`--sections` takes groups (`loudness`, `dynamics`, `spectrum`, `stereo`,
+`forensics`, `structure`, `processing`) or exact block names; an unrecognised
+name is an error rather than a silent no-op. A `--stems` run raises the cap by
+4 KB on its own, because the stem table exists nowhere else in the paste-able
+output.
 
 ### Output
 
 | File | What it is |
 | --- | --- |
 | `analysis.json` | Everything, with the full parameter block. Large; stays on your machine. |
-| `digest.md` | `HEADLINE` / `FLAGS` / `DETAIL` / `CORPUS ROW` / `METHOD`. Hard cap ~12 KB. |
+| `digest.md` | `HEADLINE` / `FLAGS` / `DETAIL` / `STEMS` (with `--stems`) / `CORPUS ROW` / `METHOD`. ~12 KB by default. |
+| `corpus_row.json` | The corpus row as typed JSON, keyed by property name, for import rather than retyping. |
+| `predict.md` | Only with `--blind`. The headline as a form to fill in before reading the digest. |
 | `plots/*.png` | Only with `--plots`. For your own eyes; never referenced by the digest. |
 
 `FLAGS` comes **before** the detail: warnings, method disagreements and every
@@ -135,11 +191,25 @@ the threshold can be second-guessed later.
 
 ### Two things the tool tells you it has *not* verified
 
-- **DR14 is not validated against a published DR rating.** `mtx` ships no
-  copyrighted reference track, so the implementation is only checked against
-  analytically known synthetic cases (a continuous sine must give DR 0.0).
-  Every run says so in `loudness.dr14.validation` and in `FLAGS`. Compare one
-  track whose rating you already know before trusting the number.
+- **DR14 starts out unvalidated against a published DR rating.** `mtx` ships no
+  copyrighted reference track, so out of the box the implementation is only
+  checked against analytically known synthetic cases (a continuous sine must
+  give DR 0.0). Every run says so in `loudness.dr14.validation` and in `FLAGS`.
+
+  This is fixable once, permanently, on your own machine. Measure a track whose
+  published DR rating you already know:
+
+  ```
+  mtx validate-dr "Some Track.flac" --published 12 --source "dr.loudness-war.info"
+  mtx validate-dr --show      # the record, at any time
+  ```
+
+  The pair is stored (default: the platform config directory, override with
+  `MTX_DR14_VALIDATION`), and from then on `FLAGS` and `METHOD` report what the
+  record says — `[validated against N track(s)]` with the worst disagreement,
+  or `[disputed]` if a recorded rating is more than 1 DR out. The record holds
+  measured value, published value and the difference; it draws no conclusion
+  beyond that.
 - **The specification's own sine test is self-contradictory** — it asks for
   LUFS-I ≈ -20.0 *and* a sample peak of -20.0 dBFS from the same 1 kHz sine,
   which differ by the 3.01 dB crest of a sine. The self-test asserts both
@@ -274,7 +344,7 @@ Convention, stated in the output as well: `mid = (L+R)/2`, `side = (L-R)/2`.
 | `reverb` | s, dB | Schroeder reverse integration after strong onsets, per octave band: T20, T30, early-to-late, tail L/R correlation | `reverb` |
 | `transient_density` | per s | per-band envelope rises of 6 dB within 20 ms | — |
 
-### Stems (`stems`, only with `--stems`)
+### Stems (`stems`, only with `--stems`, rendered as `## STEMS` in the digest)
 
 `demucs` (htdemucs, 4 stems) runs locally and the loudness, dynamics, spectrum
 and stereo metric sets are computed on each stem, plus its level relative to the
@@ -310,7 +380,10 @@ measurement.
 `stereo.goniometer` · `spectrum.resonances` · `spectrum.descriptor_timeline` ·
 `forensics.cutoff_stability` · `structure.sections` · `structure.tempo` ·
 `structure.key` · `processing.*` (reverb, modulation, HPSS, multiband,
-transients) · `spectrum.ltas_lowfreq` · `forensics.wow_flutter` · `stems`
+transients) · `spectrum.ltas_lowfreq` · `forensics.wow_flutter`
+
+`--stems` is not a profile switch: it is opt-in at either profile, and the
+per-stem measurements inherit whichever profile the run used.
 
 In quick mode PLR and the streaming preview fall back to the 4x true peak, and
 `loudness.plr_true_peak_source` says so.

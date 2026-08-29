@@ -1,0 +1,34 @@
+{
+ "Artist": null,
+ "Crest (loudest 10s)": 9.5,
+ "DR14": 6.0,
+ "Engineers": null,
+ "Genre": null,
+ "LRA": 2.5,
+ "LUFS-I": -10.6,
+ "PLR": 10.4,
+ "PSR median": 10.3,
+ "PSR min": 8.0,
+ "Title": null,
+ "Tonal tilt notes": "tilt -3.30 dB/oct (R2 0.54); 30.0-120.0 -1.83 dB/oct; 120.0-1000 -10.51 dB/oct; 1000-6000 -0.40 dB/oct; 6000-20000 -0.73 dB/oct; air 0.08%, sub 11.38%",
+ "True peak": -0.24,
+ "Width/mono notes": "side/mid -8.3 dB overall, -39.8 dB below 120 Hz; mono crossover 125.0 Hz; correlation mean 0.74, min 0.53",
+ "Year": null,
+ "_note": "Fields mtx cannot measure are null, never guessed. Engineers, and every session field (calibration, lessons, applied-to, verdict), are filled in by the session and not by the tool.",
+ "_source": {
+  "file": "sample.flac",
+  "psr_min_time": "0:49.000",
+  "sha256": "0227c4847d647f684cd93e8f24b5c6d55ed1c423edf8eded62c786b7feca285a"
+ },
+ "_units": {
+  "Crest (loudest 10s)": "dB",
+  "DR14": "DR",
+  "LRA": "LU",
+  "LUFS-I": "LUFS",
+  "PLR": "dB",
+  "PSR median": "dB",
+  "PSR min": "dB",
+  "True peak": "dBTP"
+ },
+ "mtx run": "mtx 0.2.0 / schema 1.1.0 / profile full / sha256 0227c4847d647f68"
+}
