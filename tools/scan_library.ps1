@@ -87,13 +87,15 @@ Write-Log ("log       : {0}" -f $log)
 $n = 0
 $started = Get-Date
 foreach ($artist in $artists) {
-    $n++
+    # Counted only once the artist is actually going to be scanned, so the
+    # closing tally reports work done rather than artists looked at.
     $free = Get-FreeGB $LibraryRoot
     if ($free -lt $MinFreeGB) {
         Write-Log ("STOPPING: {0} GB free is under the {1} GB floor" -f $free, $MinFreeGB)
         Write-Log "re-run this script after making room; measured tracks are skipped"
         break
     }
+    $n++
 
     Write-Log ("=== [{0}/{1}] {2}  ({3} GB free)" -f $n, $artists.Count, $artist.Name, $free)
     try {
