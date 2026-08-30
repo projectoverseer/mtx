@@ -74,18 +74,35 @@ def _section_features(src: AudioSource, sections: list[dict[str, Any]],
     return (X - mu) / np.where(sd > 0, sd, 1.0)
 
 
-def _cluster(X: np.ndarray, threshold: float) -> list[int]:
-    """Average-linkage agglomerative clustering under a cosine cut-off."""
+def _cluster(X: np.ndarray, threshold: float,
+             vocal: list[bool | None] | None = None) -> list[int]:
+    """Average-linkage agglomerative clustering under a cosine cut-off.
+
+    Where a vocals stem exists, a section that sings and a section that does
+    not are never merged, however close their timbre reads.  The two are not
+    the same part of a song, and the letters are what every function label is
+    then built on: an instrumental hook and the last chorus over it can sit a
+    short cosine distance apart, and merging them costs a chorus.  Vocal
+    presence is measured and the distance is a guess, so the measurement wins.
+
+    Without stems there is nothing to constrain and the clustering is exactly
+    what it was.
+    """
     n = X.shape[0]
     norms = np.maximum(np.linalg.norm(X, axis=1, keepdims=True), 1e-12)
     U = X / norms
     D = 1.0 - U @ U.T
     np.fill_diagonal(D, np.inf)
     groups: list[list[int]] = [[i] for i in range(n)]
+    sings: list[set[bool]] = [
+        {vocal[i]} - {None} if vocal else set() for i in range(n)]
+
     while len(groups) > 1:
         best = None
         for a in range(len(groups)):
             for b in range(a + 1, len(groups)):
+                if sings[a] and sings[b] and sings[a] != sings[b]:
+                    continue          # one sings and the other does not
                 d = float(np.mean(D[np.ix_(groups[a], groups[b])]))
                 if best is None or d < best[0]:
                     best = (d, a, b)
@@ -93,7 +110,9 @@ def _cluster(X: np.ndarray, threshold: float) -> list[int]:
             break
         _, a, b = best
         groups[a] = groups[a] + groups[b]
+        sings[a] = sings[a] | sings[b]
         groups.pop(b)
+        sings.pop(b)
     label = [0] * n
     order = sorted(range(len(groups)), key=lambda g: min(groups[g]))
     for rank, g in enumerate(order):
@@ -239,12 +258,30 @@ def _label(sections: list[dict[str, Any]], parts: list[dict[str, Any]],
     chorus_idx = set(by_letter.get(chorus_letter, [])) if chorus_letter is not None else set()
     verse_idx = set(by_letter.get(verse_letter, [])) if verse_letter is not None else set()
 
+    def louder_than_chorus(i: int) -> bool:
+        """Is this part louder than the parts already called chorus?
+
+        A bridge is the one part of a song that characteristically is not, so
+        this is what stops the last rung of the ladder from putting the name
+        on the biggest moment in the track.  A part that repeats nowhere and
+        is louder than the chorus is something the rules here cannot name, and
+        saying so is worth more than a confident guess.
+        """
+        if not chorus_idx or lufs[i] is None:
+            return False
+        peers = [lufs[j] for j in chorus_idx if lufs[j] is not None]
+        return bool(peers) and lufs[i] > float(np.mean(peers))
+
     for i, p in enumerate(parts):
         ev: list[str] = [f"letter {p['letter']}",
                          f"repeats {len(by_letter[p['letter_id']])}"]
         if vocal[i] is not None:
             ev.append("vocal present" if vocal[i] else "no vocal")
-        label = "unlabelled"
+        # `section` is the floor, not a branch: every part is named, and one
+        # that reached the floor says so rather than reading as a gap in the
+        # measurement.  The rules below are an ordered ladder and the earlier
+        # ones are the confident ones.
+        label = "section"
         conf = "low"
         if i == 0 and (median_lufs is None or
                        (lufs[i] is not None and lufs[i] < median_lufs)):
@@ -273,9 +310,15 @@ def _label(sections: list[dict[str, Any]], parts: list[dict[str, Any]],
             label, conf = ("drop" if hot else "instrumental"), "low"
             ev.append("no vocal, above the track median loudness" if hot
                       else "no vocal")
-        elif len(by_letter[p["letter_id"]]) == 1 and i > n // 2:
+        elif (len(by_letter[p["letter_id"]]) == 1 and i > n // 2
+                and not louder_than_chorus(i)):
             label, conf = "bridge", "low"
-            ev.append("unrepeated part in the second half")
+            ev.append("unrepeated part in the second half, no louder than the "
+                      "chorus")
+        else:
+            ev.append("no rule in params.form matched: it neither repeats as "
+                      "the chorus or verse letter, sits beside a chorus, nor "
+                      "wants for a vocal")
         p["label"] = label
         p["label_confidence"] = conf
         p["label_evidence"] = ev
@@ -291,6 +334,28 @@ def _label(sections: list[dict[str, Any]], parts: list[dict[str, Any]],
                                  "no part letter repeats, so no chorus could be "
                                  "identified and every measurement downstream "
                                  "of it is unavailable")
+
+    # What the ladder could not name is the honest measure of how far the
+    # letters are to be trusted: a part it cannot place is one the clustering
+    # put somewhere the rules do not recognise, and `chorus_count` and
+    # `chorus_share_pct` are computed over the same letters.
+    floor = [i for i, p in enumerate(parts) if p["label"] == "section"]
+    if floor:
+        loudest = max(range(n), key=lambda i: (lufs[i] if lufs[i] is not None
+                                               else -np.inf))
+        worst = (" including the loudest part of the track, which a chorus "
+                 "usually is" if loudest in floor else "")
+        collector.low_confidence(
+            "form.labels", "low",
+            f"{len(floor)} of {n} parts matched no labelling rule{worst}; the "
+            "letters they were given are a similarity guess, and chorus_count "
+            "counts only what the rules could name")
+    if n > PARAMS["form"]["implausible_part_count"]:
+        collector.low_confidence(
+            "form.letters", "low",
+            f"{n} parts is more than a song form usually has, so the section "
+            "boundaries or the clustering threshold have split repeats that "
+            "belong together; read `letters` as texture changes, not as form")
 
 
 def _loopability(src: AudioSource, X: np.ndarray | None,
@@ -386,12 +451,14 @@ def analyse(src: AudioSource, structure: dict[str, Any],
     X = _section_features(src, sections, collector)
     if X is None:
         return {"available": False, "reason": "section features unavailable"}
-    letters = _cluster(X, float(P["cluster"]["merge_threshold"]))
+    # Vocal presence is measured, where the letters are a similarity guess, so
+    # it is settled first and the clustering is not allowed to contradict it.
     vocal_block = _vocal_presence(stems, sections)
     vocal = (list(vocal_block.get("present")) if vocal_block.get("available")
              else [None] * len(sections))
     for i, s in enumerate(sections):
         s["vocal_present"] = vocal[i]
+    letters = _cluster(X, float(P["cluster"]["merge_threshold"]), vocal)
     parts = _parts(sections, letters, vocal)
     _label(sections, parts, collector)
 
@@ -440,6 +507,11 @@ def analyse(src: AudioSource, structure: dict[str, Any],
                      "can arrive as three sections",
         "labels": labels,
         "label_method": P["rule_note"],
+        "unnamed_part_count": sum(1 for p in parts if p["label"] == "section"),
+        "unnamed_part_note": "parts no labelling rule could name. They are "
+                             "still measured; what is uncertain is what to "
+                             "call them, and chorus_count counts only the "
+                             "parts the rules did name",
         "parts": [{k: p.get(k) for k in
                    ("letter", "label", "label_confidence", "label_evidence",
                     "start_s", "end_s", "duration_s", "lufs_i",

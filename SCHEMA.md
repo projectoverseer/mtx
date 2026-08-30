@@ -1,6 +1,8 @@
 # `analysis.json` schema
 
-`schema_version` **1.2.0**.
+`schema_version` **1.3.0**.
+
+Changes since 1.2.0, all additive. `form` gains `unnamed_part_count` and `unnamed_part_note`: the label rules are a ladder whose floor is now the name `section` rather than `unlabelled`, so a part no rule could place is named and counted instead of reading as a gap, and `chorus_count` is known to count only the parts the rules did name. `headline` gains `form_part_count` and `form_unnamed_parts`, which is what the digest prints beside `Form` and `Chorus`. `params.form` gains `implausible_part_count` and `cluster.cannot_link`; `params.stems` gains `device` and `segment`. Nothing was renamed and nothing was removed, so a 1.2.0 consumer reads a 1.3.0 document unchanged -- but the letters themselves can differ from a 1.2.0 run of the same file, because a section that sings is no longer merged with one that does not.
 
 Changes since 1.1.0, all additive. Nine new top-level blocks -- `harmony`,
 `rhythm`, `form`, `delivery`, `lyrics`, `declared`, `version`, `embedding` and

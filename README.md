@@ -56,6 +56,8 @@ mtx analyze <file> [--out DIR] [--profile quick|full] [--plots] [--stems]
                    [--max-part-size 4.5m] [--no-split]
 mtx scan [PATH] [--out DIR] [--library-root DIR] [-j N] [--force] [--recheck]
                 [--dry-run] [--profile quick|full] [--json-only] [--no-summary]
+                [--no-dedup] [--stems] [--stems-model NAME]
+                [--stems-device auto|cuda|cpu] [--stems-segment SECONDS]
 mtx batch <dir> [--out DIR] [--recursive] [--csv summary.csv]
                 [--csv-schema internal|corpus]
 mtx compare <fileA> <fileB> [--out DIR] [--null-test]
@@ -133,8 +135,8 @@ resolves to the same tree with no flags at all. Until a root is registered,
 tree the next one will not look in.
 
 **Nothing is measured twice.** Each output folder carries `mtx_source.json`, a
-receipt naming the file it came from — size, modification time, profile, schema
-version. A scan reads those, not the audio, so a library that is already
+receipt naming the file it came from — size, modification time, sha256, profile,
+schema version. A scan reads those, not the audio, so a library that is already
 measured is re-checked in under a second. A track is measured again only when
 its source changed, the profile changed, or the schema version moved:
 
@@ -146,7 +148,28 @@ Because the receipt is written per track, an interrupted scan is resumable:
 stop it with Ctrl-C, run it again, and it picks up where it left off. There is
 no progress file to lose.
 
+**And not twice under two names.** Every number mtx reports is a function of the
+audio bytes, so a single sitting next to the album it was lifted from has one
+measurement between the two files — the second copy adopts it instead of
+spending the minutes again, which with `--stems` is most of a scan:
+
+```text
+[mtx] 37 file(s) found: 0 already measured, 34 to do, 3 identical to another file
+[mtx] copied Watermelon Sugar.flac: same bytes as 02. Watermelon Sugar.flac
+```
+
+Copies are found by sha256, and the twin may have been measured a month ago
+under a different album — the receipts already in the mirror tree are what is
+searched. Only files that share a size with something are ever hashed, so a
+library with no duplicates in it is never read to discover that. A duplicate's
+folder is an ordinary result, digest and corpus row and all; `run.duplicate_of`
+in its `analysis.json` names the file the numbers were measured on. The one
+input that does not travel with the bytes is a `declared.json` sidecar, since it
+sits next to the audio: two copies that disagree about what was declared are
+measured separately.
+
 - `--force` re-measures everything.
+- `--no-dedup` measures every copy separately.
 - `--recheck` decides staleness by hashing each source rather than trusting its
   modification time. Slower, and the right choice after copying a library
   between drives, which rewrites every mtime.
@@ -567,6 +590,31 @@ merged into **parts** — that is the measurement. Function names (verse, chorus
 bridge) are an **inference** over it by the rules in `params.form`, and every
 label carries the evidence that produced it and a confidence.
 
+Two guards keep the inference from overreaching, because it is the one part of
+the tool where a wrong answer looks exactly like a right one:
+
+- **A section that sings is never merged with one that does not**, whatever the
+  cosine distance says, whenever a vocals stem exists to say which is which.
+  Vocal presence is measured; the distance is a guess. Without this an
+  instrumental hook and the final chorus sung over it merge into one letter —
+  measurably, on real records, because the hook dominates the timbre of both —
+  and the track loses a chorus.
+- **`section` is the floor of the label ladder.** A part no rule can name is
+  named that, counted in `form.unnamed_part_count`, and raised as a
+  low-confidence note; `bridge` is withheld from an unrepeated part louder than
+  the chorus, which is the one thing a bridge characteristically is not.
+
+So `chorus_count` counts only the parts the rules could name, and the digest
+says so on the row itself:
+
+```text
+Form                  ABCDCDCEA (inferred; 1 of 9 parts unnamed)
+Chorus                2 x, 39.6 % of the track (inferred; 1 of 9 parts unnamed)
+```
+
+That is a real limit, not a formality. Where the letters are wrong the form is
+wrong, and the honest signal is the unnamed count next to it.
+
 Gives what people actually ask a record: time to the first chorus in seconds
 and as a fraction, intro length, time to vocal entry, chorus count and share,
 whether the second chorus is arranged up from the first, ending type, and
@@ -613,11 +661,33 @@ walking the document itself.
 
 `demucs` (htdemucs, 4 stems) runs locally and the loudness, dynamics, spectrum
 and stereo metric sets are computed on each stem, plus its level relative to the
-mix in dB and LUFS. Separated stems are cached under `~/.cache/mtx/stems` so
-re-runs are cheap. Every stem-derived number carries `source: "separated"`,
-because separation artefacts are real and a stem measurement is not a mix
-measurement. `--stems-model htdemucs_6s` splits guitar and piano out of `other`
-at no new dependency.
+mix in dB and LUFS. Separated stems are cached under `~/.cache/mtx/stems`,
+**keyed on the file's contents**, so re-runs are free and the same master
+separates once however many copies of it your library holds. Every stem-derived
+number carries `source: "separated"`, because separation artefacts are real and
+a stem measurement is not a mix measurement. `--stems-model htdemucs_6s` splits
+guitar and piano out of `other` at no new dependency.
+
+**Separation is the expensive half of a stems run, and it goes on the GPU if
+there is one.** `--stems-device` defaults to `auto`: the card when torch can see
+one, the CPU otherwise. The two are scheduled differently, because the
+constraint is different:
+
+- On the **CPU**, separations run inside the scan's worker processes, several
+  files at a time, one core each. Give the scan as many workers as you have
+  physical cores (`-j 6` on a six-core machine) — this is the one phase that
+  will use them all.
+- On a **GPU**, a card holds one separation, not four, so they are taken out of
+  the pool and run up front, back to back, each with the whole card and every
+  core for the decode and write around it. The pool that follows finds them all
+  cached and spends its processes on the DSP.
+
+Card memory is what limits separation, not card speed, and the knob is
+`--stems-segment` — the seconds of audio held on the device at once. You should
+not need it: mtx starts at 7.8 s and steps down only when the card actually
+reports out of memory, remembers what fitted, and starts there for every later
+track rather than rediscovering it per file. If nothing fits it falls back to
+the CPU, because slow beats absent.
 
 Separation is also the gate on four measurements that only exist once there is
 more than one signal, all computed from a single load of the stems:

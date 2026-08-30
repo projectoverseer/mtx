@@ -161,6 +161,11 @@ PARAMS: dict[str, Any] = {
         "goniometer_bins_deg": 15,
     },
     "structure": {
+        "tuning_report_cents": 15.0,
+        "tuning_report_cents_note": "a deviation from A440 at least this large "
+                                    "is reported as a note. Below it, the "
+                                    "figure is still in structure.key and is "
+                                    "mostly the estimator's own scatter",
         "features": "MFCC(20) + chroma_cqt(12) + RMS + spectral_contrast(7), z-scored, stacked",
         "ssm": "cosine self-similarity, median-filtered",
         "ssm_downsample_frames": 4,
@@ -346,9 +351,22 @@ PARAMS: dict[str, Any] = {
                                     "eight reference tracks of "
                                     "16-31 sections this yields "
                                     "3-7 letters, where 0.22 "
-                                    "yielded 11-25",
+                                    "yielded 11-25. It was tuned "
+                                    "for how many letters come "
+                                    "out, not for whether they "
+                                    "are the right ones",
+            "cannot_link": "with a vocals stem, a section that sings and "
+                           "a section that does not are never merged, "
+                           "whatever the distance between them says. "
+                           "Vocal presence is measured where the distance "
+                           "is a guess, and merging an instrumental hook "
+                           "with the last chorus over it costs a chorus",
         },
         "vocal_presence_db_below_p95": 12.0,
+        "implausible_part_count": 14,
+        "implausible_part_count_note": "above this many parts the letter "
+                                       "sequence is reporting texture changes "
+                                       "rather than song form, and says so",
         "use_allin1": False,
         "use_allin1_note": "when true and the optional allin1 model is "
                            "installed, its segmentation is reported alongside "
@@ -457,6 +475,8 @@ PARAMS: dict[str, Any] = {
     "stems": {
         "model": "htdemucs",
         "stems": ["drums", "bass", "other", "vocals"],
+        "device": "auto",
+        "segment": None,
         "note": "every stem-derived number carries source=separated",
     },
 }

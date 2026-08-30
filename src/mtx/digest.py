@@ -181,6 +181,22 @@ PREDICT_FIELDS: tuple[tuple[str, str, str, int], ...] = (
 )
 
 
+def _form_caveat(h: dict[str, Any]) -> str:
+    """How far the form rows are to be trusted, said on the row itself.
+
+    The letters are a clustering of measured section vectors and the function
+    names are rules over that clustering, so neither is a measurement in the
+    sense the rows above them are.  Where the rules could not name a part, the
+    count says so: those parts are missing from `Chorus` as much as from
+    `Form`, and a reader comparing two tracks needs to know which.
+    """
+    unnamed = h.get("form_unnamed_parts") or 0
+    total = h.get("form_part_count")
+    if unnamed and total:
+        return f"inferred; {unnamed} of {total} parts unnamed"
+    return "inferred"
+
+
 # ---------------------------------------------------------------- the sections
 def _headline(res: dict[str, Any]) -> str:
     h = res["headline"]
@@ -233,9 +249,14 @@ def _headline(res: dict[str, Any]) -> str:
         ("Diatonic", (n(h.get("diatonic_time_pct"), 1) + " % of chord time"
                       if h.get("diatonic_time_pct") is not None else None)),
         ("Key from chords", h.get("key_from_chords")),
-        ("Form", h.get("form_letters")),
+        # The form rows are the one place in HEADLINE where the number is an
+        # inference over a clustering rather than a measurement, so they carry
+        # that on their face instead of sitting unmarked beside LUFS-I.
+        ("Form", (f"{h['form_letters']} ({_form_caveat(h)})"
+                  if h.get("form_letters") else None)),
         ("Chorus", (f"{h.get('chorus_count')} x, "
-                    f"{n(h.get('chorus_share_pct'), 1)} % of the track"
+                    f"{n(h.get('chorus_share_pct'), 1)} % of the track "
+                    f"({_form_caveat(h)})"
                     if h.get("chorus_count") else None)),
         ("To first chorus", (n(h.get("time_to_first_chorus_s"), 1) + " s"
                              if h.get("time_to_first_chorus_s") is not None else None)),
@@ -868,7 +889,7 @@ MUSIC_METHOD_LINES = [
     "Key cross-check: the chord track implies its own key by a duration-weighted chord-tone histogram against Krumhansl-Schmuckler. Where it disagrees with structure.key (the mean-chroma estimate) the disagreement is in FLAGS.",
     "Downbeats and meter: beats per bar and phase are the pair that maximises the mean downbeat accent, where accent is the z-scored sum of onset strength, 20-120 Hz energy and chroma change at each beat. The margin over the next meter is reported; it is what the confidence is derived from.",
     "Microtiming: onsets are re-detected at hop 128 (5.8 ms) and measured against the subdivided beat grid. The beat tracker and the onset detector each carry a constant lag, so read median_minus_common_mode_ms -- the differences between stems, where that offset cancels.",
-    "Form: sections are clustered into letters by cosine distance over their measured vectors, then runs of the same letter are merged into parts. That is the measurement. Function names (verse, chorus, bridge) are an inference over that measurement by the rules in params.form, and every label carries its evidence and a confidence.",
+    "Form: sections are clustered into letters by cosine distance over their measured vectors, then runs of the same letter are merged into parts. With a vocals stem, a section that sings is never merged with one that does not, whatever the distance says: vocal presence is measured where the distance is a guess, and an instrumental hook and the last chorus over it can read as one part. That is the measurement. Function names (verse, chorus, bridge) are an inference over it by the rules in params.form, and every label carries its evidence and a confidence. The rules are a ladder and `section` is its floor: a part no rule could name is named that rather than left blank, is counted in form.unnamed_part_count, and raises a low-confidence note -- chorus_count counts only the parts the rules did name, so a track with unnamed parts may have more choruses than it says. `bridge` is withheld from an unrepeated part louder than the chorus, which is the one thing a bridge characteristically is not.",
     "Melody: librosa.pyin on the separated vocal stem, segmented into notes with hysteresis. Pitch-quantisation is forensics, not a judgement about a singer: it reports the deviation from the semitone grid and the note-to-note transition time, and the inference is labelled as one.",
     "Inter-stem masking: per third-octave band energies per stem, and for each ordered pair the masker's level inside the target's own energy distribution, in dB. Nothing here is a verdict; a positive number means the masker carries more energy where the target lives.",
     "Delivery conditions: the file is encoded by ffmpeg to AAC 256 and Opus 128, decoded back and re-measured, so a true-peak over introduced by the encode is visible before release. The band-pass, mono fold and excerpts are the same measurement over a filtered or sliced signal.",

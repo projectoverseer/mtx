@@ -11,10 +11,18 @@ finds the first one's work.
 
 **Already-measured tracks are not measured again.**  Each output folder carries
 a small `mtx_source.json` naming the file it came from -- size, modification
-time, profile, schema version.  A scan reads those, not the audio, and a track
-whose record still matches is skipped in microseconds instead of a minute.
-That is what makes an interrupted scan resumable: every finished track wrote
-its own receipt, so there is no separate progress file to lose.
+time, sha256, profile, schema version.  A scan reads those, not the audio, and
+a track whose record still matches is skipped in microseconds instead of a
+minute.  That is what makes an interrupted scan resumable: every finished
+track wrote its own receipt, so there is no separate progress file to lose.
+
+That extends past the file itself.  Every number mtx reports is a function of
+the audio bytes, so a second copy of one master -- the single sitting next to
+the album it was lifted from, the same rip under a tidier name -- has one
+measurement between it and the first, and the second copy adopts it rather
+than spending the minutes again.  Copies are found by sha256, but only among
+files that share a size with something, so no library is hashed to discover
+that it holds no duplicates.  `--no-dedup` measures every copy separately.
 
 **Files are measured in parallel processes.**  Measured on this codebase, a
 full-profile run is a serial chain of numpy and scipy calls that keeps roughly
@@ -40,6 +48,7 @@ import csv
 import json
 import os
 import time
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -373,6 +382,243 @@ def write_ledger(out_dir: str, source: str, profile: str, stems: bool,
         f.write("\n")
 
 
+# ------------------------------------------------------------- the duplicates
+
+@dataclass(frozen=True)
+class Duplicate:
+    """A file whose bytes have already been measured somewhere else."""
+    source: str
+    out_dir: str
+    twin_dir: str
+    within_run: bool
+
+
+def _declared_body(declared: dict[str, Any] | None) -> Any:
+    """A declared sidecar's content, without where it was looked for.
+
+    `path` and `searched` record which folder was searched, so they differ
+    between two copies of one master by construction.  What was declared is
+    the rest, and that is what has to agree for one measurement to stand in
+    for the other.
+    """
+    if not isinstance(declared, dict):
+        return None
+    return {k: v for k, v in declared.items() if k not in ("path", "searched")}
+
+
+def _reusable(led: dict[str, Any], profile: str, stems: bool,
+              stems_model: str | None) -> bool:
+    """Whether a receipt describes a run whose result this one could adopt."""
+    run = led.get("run") or {}
+    if run.get("schema_version") != SCHEMA_VERSION:
+        return False
+    if run.get("profile") != profile or bool(run.get("stems")) != bool(stems):
+        return False
+    return not (stems and run.get("stems_model") and stems_model
+                and run["stems_model"] != stems_model)
+
+
+def content_index(out_root: str, sizes: set[int], profile: str, stems: bool,
+                  stems_model: str | None,
+                  exclude: set[str]) -> tuple[dict[str, str], set[int]]:
+    """sha256 -> the folder that already holds a result for those bytes.
+
+    Built from the receipts in the mirror tree rather than from this scan's
+    scope, so a copy measured last month, under another album, by a scan of a
+    different corner of the library, still counts as measured.  Only receipts
+    whose size one of the candidates shares are read past; the sizes that were
+    found come back too, so the caller knows which candidates are worth
+    hashing at all.
+    """
+    index: dict[str, str] = {}
+    seen_sizes: set[int] = set()
+    if not sizes or not os.path.isdir(out_root):
+        return index, seen_sizes
+    for root, dirs, names in os.walk(out_root):
+        dirs[:] = sorted(dirs)
+        if LEDGER_NAME not in names or _norm(root) in exclude:
+            continue
+        led = read_ledger(root)
+        src = (led or {}).get("source") or {}
+        digest = src.get("sha256")
+        if not led or not digest or int(src.get("size", -1)) not in sizes:
+            continue
+        if not _reusable(led, profile, stems, stems_model):
+            continue
+        if not os.path.isfile(os.path.join(root, "analysis.json")):
+            continue
+        seen_sizes.add(int(src["size"]))
+        index.setdefault(digest, root)
+    return index, seen_sizes
+
+
+def partition_duplicates(scope: Scope, todo: list[tuple[str, str, str]],
+                         profile: str, stems: bool, stems_model: str | None,
+                         ) -> tuple[list[tuple[str, str, str]], list[Duplicate]]:
+    """Split the work into files to measure and copies of files being measured.
+
+    Everything mtx reports is a function of the audio bytes, so two files with
+    the same sha256 have one measurement between them: the second is a copy,
+    not a scan.  A single sitting next to the album it was lifted from is the
+    ordinary case, and paying twice for it is minutes of demucs per track.
+
+    Hashing a whole library to discover that would cost more than it saves, so
+    size goes first.  A file whose size matches nothing -- no other candidate,
+    no finished result -- cannot be a duplicate of anything and is never read.
+    """
+    from . import declared as declared_mod
+
+    sized: list[tuple[int, str, str, str]] = []
+    for src, odir, reason in todo:
+        try:
+            sized.append((os.path.getsize(src), src, odir, reason))
+        except OSError:
+            sized.append((-1, src, odir, reason))
+    counts = Counter(size for size, _, _, _ in sized)
+    index, known_sizes = content_index(
+        scope.out_dir, {s for s, _, _, _ in sized if s >= 0}, profile, stems,
+        stems_model, exclude={_norm(o) for _, _, o, _ in sized})
+
+    keep: list[tuple[str, str, str]] = []
+    dupes: list[Duplicate] = []
+    primaries: dict[str, tuple[str, str]] = {}
+    for size, src, odir, reason in sized:
+        if size < 0 or (counts[size] == 1 and size not in known_sizes):
+            keep.append((src, odir, reason))
+            continue
+        try:
+            digest = _sha256(src)
+        except OSError:
+            keep.append((src, odir, reason))
+            continue
+        if digest in primaries:
+            twin_src, twin_dir = primaries[digest]
+            # Both files are here, so the one input that does not travel with
+            # the bytes can be compared directly rather than guessed at.
+            if _declared_body(declared_mod.load(src)) == \
+                    _declared_body(declared_mod.load(twin_src)):
+                dupes.append(Duplicate(src, odir, twin_dir, True))
+                continue
+        elif digest in index and _norm(index[digest]) != _norm(odir):
+            dupes.append(Duplicate(src, odir, index[digest], False))
+            continue
+        primaries.setdefault(digest, (src, odir))
+        keep.append((src, odir, reason))
+    return keep, dupes
+
+
+def materialize_duplicate(dup: Duplicate, *, profile: str, stems: bool,
+                          json_only: bool, plots: bool,
+                          max_part_bytes: int | None) -> dict[str, Any]:
+    """Write a duplicate's folder from its twin's, decoding no audio.
+
+    The result is adopted whole and then corrected everywhere it names the
+    file it came from, so the mirror tree stays uniform: a duplicate's folder
+    holds the same analysis, digest and corpus row every other track's does,
+    and every tool downstream reads it without knowing the difference.  What
+    it also holds is the provenance -- `run.duplicate_of` names the file the
+    numbers were measured on.
+
+    A `declared.json` sidecar is the one input that does not travel with the
+    bytes, since it sits next to the audio; a disagreement means this file has
+    to be measured itself, and says so.
+    """
+    from . import declared as declared_mod
+    from .analyze import write_outputs
+    from .split import load_analysis
+
+    t0 = time.time()
+    try:
+        res = load_analysis(os.path.join(dup.twin_dir, "analysis.json"))
+        twin_led = read_ledger(dup.twin_dir) or {}
+        twin_source = (twin_led.get("source") or {}).get("path") \
+            or (res.get("file") or {}).get("path_absolute")
+        mine = declared_mod.load(dup.source)
+        if _declared_body(mine) != _declared_body(res.get("declared")):
+            return {"source": dup.source, "out_dir": dup.out_dir, "ok": False,
+                    "requeue": True, "elapsed": time.time() - t0,
+                    "error": "declared sidecar differs from the copy already "
+                             "measured"}
+        res.setdefault("file", {})
+        res["file"]["path_absolute"] = os.path.abspath(dup.source)
+        res["file"]["filename"] = os.path.basename(dup.source)
+        res["declared"] = mine
+        run = res.setdefault("run", {})
+        run["declared_sidecar"] = mine.get("path")
+        run["duplicate_of"] = twin_source
+        run["duplicate_copied_utc"] = datetime.now(timezone.utc).isoformat(
+            timespec="seconds")
+        run["duplicate_note"] = (
+            "every measurement here was made on a byte-identical copy of this "
+            "file -- same sha256, so the same audio -- and is reproduced "
+            "unchanged. Only the file's own path and its declared sidecar "
+            "were read again. run.elapsed_seconds is that measurement's, not "
+            "the cost of this copy.")
+        # Same reasoning as a fresh measurement: once the folder starts being
+        # overwritten its receipt has stopped being true.
+        try:
+            os.remove(ledger_path(dup.out_dir))
+        except OSError:
+            pass
+        written = write_outputs(res, dup.out_dir, json_only=json_only,
+                                plots=plots, src_path=dup.source,
+                                max_part_bytes=max_part_bytes)
+        elapsed = time.time() - t0
+        write_ledger(dup.out_dir, dup.source, profile, stems, res, written,
+                     elapsed)
+        return {"source": dup.source, "out_dir": dup.out_dir, "ok": True,
+                "duplicate_of": twin_source, "elapsed": elapsed,
+                "duration_s": (res.get("audio") or {}).get("duration_s")}
+    except Exception as exc:
+        return {"source": dup.source, "out_dir": dup.out_dir, "ok": False,
+                "requeue": True, "elapsed": time.time() - t0,
+                "error": f"{type(exc).__name__}: {exc}"}
+
+
+# -------------------------------------------------------- separation up front
+
+def separate_first(sources: list[str], stems_model: str | None,
+                   log=print) -> int:
+    """Separate every track on the GPU, one at a time, before measuring starts.
+
+    A card is fast but small.  The pool runs several files at once, and several
+    separations on one consumer GPU is an out-of-memory error rather than
+    several times the speed -- so on a GPU the separations come out of the pool
+    and are done here, back to back, each with the whole card and every core
+    for the decode and write around it.
+
+    Nothing else changes: each result lands in the same content-addressed cache
+    the workers read, so the pool that follows finds every one of them already
+    there and spends its processes on the DSP, which is what processes are good
+    for here.  Stopping partway through costs only the separation in flight --
+    the rest stay cached, and the next run starts from them.
+    """
+    from .metrics import stems as m_stems
+    from .util import Collector
+
+    t0 = time.time()
+    done = 0
+    for n, src in enumerate(sources, 1):
+        collector = Collector()
+        s0 = time.time()
+        paths = m_stems.separate(src, collector, stems_model)
+        spent = time.time() - s0
+        name = os.path.basename(src)
+        for w in collector.warnings:
+            log(f"  {name}: {w}")
+        if paths is None:
+            log(f"[stems {n}/{len(sources)}] {name}: not separated; the file "
+                "will be measured without stems")
+            continue
+        done += 1
+        rate = (time.time() - t0) / n
+        tail = "" if n == len(sources) else \
+            f"  eta {_fmt_hms(rate * (len(sources) - n))}"
+        cached = " (cached)" if spent < 1.0 else ""
+        log(f"[stems {n}/{len(sources)}] {name}: {spent:.0f} s{cached}{tail}")
+    return done
+
+
 # ------------------------------------------------------------------- workers
 
 def analyse_one(job: dict[str, Any]) -> dict[str, Any]:
@@ -515,8 +761,15 @@ def run_scan(scan_path: str, *, out: str | None = None,
              transcribe: bool = False, embed: bool = False,
              max_part_bytes: int | None = DEFAULT_PART_BYTES,
              dry_run: bool = False, no_summary: bool = False,
+             dedup: bool = True,
              registry: str | None = None, log=print) -> dict[str, Any]:
-    """Measure everything under `scan_path` that has not been measured already."""
+    """Measure everything under `scan_path` that has not been measured already.
+
+    "Already" covers two things: this exact file, measured on an earlier run
+    and still matching its receipt, and any *other* file with the same bytes,
+    whose measurement this one can adopt instead of repeating.  `dedup=False`
+    turns the second off and measures every copy on its own.
+    """
     scope, should_register = resolve_scope(scan_path, out, library_root, registry)
     log(f"scope:   {scope.scan_path}")
     log(f"library: {scope.library_root}  ({scope.source})")
@@ -553,28 +806,91 @@ def run_scan(scan_path: str, *, out: str | None = None,
         else:
             todo.append((src, odir, reason))
 
-    log(f"{len(pairs)} file(s) found: {skipped} already measured, {len(todo)} to do")
-    if not todo:
+    dupes: list[Duplicate] = []
+    if todo and dedup:
+        todo, dupes = partition_duplicates(scope, todo, profile, stems,
+                                           stems_model)
+
+    log(f"{len(pairs)} file(s) found: {skipped} already measured, "
+        f"{len(todo)} to do"
+        + (f", {len(dupes)} identical to another file" if dupes else ""))
+    if not todo and not dupes:
         base = scope.mirror_base
         if not no_summary and os.path.isdir(base):
             path, n = write_summary(base)
             log(f"summary: {path} ({n} row(s))")
         log("nothing to do")
         return {"found": len(pairs), "done": 0, "skipped": skipped, "failed": 0,
-                "out_dir": scope.out_dir}
-
-    budget = jobs if (jobs and jobs > 0) else default_workers()
-    procs, threads = split_budget(budget, len(todo))
-    log(f"jobs: {procs} process(es) x {threads} thread(s) "
-        f"of {cpu_count()} core(s)")
+                "duplicates": 0, "out_dir": scope.out_dir}
 
     if dry_run:
         for src, odir, reason in todo[:200]:
             log(f"  would measure {os.path.basename(src)}  ({reason})")
         if len(todo) > 200:
             log(f"  ... and {len(todo) - 200} more")
+        for dup in dupes[:200]:
+            log(f"  would copy {os.path.basename(dup.source)}  "
+                f"(same bytes as {os.path.basename(dup.twin_dir)})")
+        if len(dupes) > 200:
+            log(f"  ... and {len(dupes) - 200} more")
         return {"found": len(pairs), "done": 0, "skipped": skipped, "failed": 0,
-                "todo": len(todo), "out_dir": scope.out_dir}
+                "todo": len(todo), "duplicates": len(dupes),
+                "out_dir": scope.out_dir}
+
+    t_run = time.time()
+    copied = 0
+    results: list[dict[str, Any]] = []
+
+    def copy_from_twin(dup: Duplicate) -> bool:
+        """Write one duplicate, or hand it back to be measured properly."""
+        nonlocal copied
+        r = materialize_duplicate(dup, profile=profile, stems=stems,
+                                  json_only=json_only, plots=plots,
+                                  max_part_bytes=max_part_bytes)
+        results.append(r)
+        name = os.path.basename(dup.source)
+        if r["ok"]:
+            copied += 1
+            log(f"copied {name}: same bytes as "
+                f"{os.path.basename(r['duplicate_of'] or dup.twin_dir)}")
+            return True
+        log(f"copying {name} did not stand: {r.get('error')}")
+        return False
+
+    # Copies of work finished on an earlier run are resolved before the pool
+    # starts: one that does not stand still has to be measured, and this is
+    # the last moment it can join the run that would measure it.
+    for dup in [d for d in dupes if not d.within_run]:
+        os.makedirs(dup.out_dir, exist_ok=True)
+        if not copy_from_twin(dup):
+            todo.append((dup.source, dup.out_dir, "copy did not stand"))
+
+    budget = jobs if (jobs and jobs > 0) else default_workers()
+    procs, threads = split_budget(budget, len(todo))
+    if todo:
+        log(f"jobs: {procs} process(es) x {threads} thread(s) "
+            f"of {cpu_count()} core(s)")
+
+    # A GPU changes where the expensive half of a stems run belongs.  Asking
+    # for it here rather than in each worker is also what keeps torch out of
+    # the workers entirely: they find the cache warm and never import it.
+    if stems and todo:
+        from .metrics import stems as m_stems
+        device = m_stems.resolve_device()
+        if device.startswith("cuda"):
+            log(f"stems: separating {len(todo)} file(s) on {device} before "
+                "measuring, one at a time")
+            try:
+                separate_first([src for src, _, _ in todo], stems_model, log)
+            except KeyboardInterrupt:
+                log("interrupted; separations that finished stay cached and "
+                    "the next run picks up from there")
+                return {"found": len(pairs), "done": 0, "skipped": skipped,
+                        "failed": 0, "duplicates": copied,
+                        "elapsed": time.time() - t_run,
+                        "out_dir": scope.out_dir, "results": results}
+        else:
+            log(f"stems: separating on {device}, inside the worker processes")
 
     jobs_list = [{"source": src, "out_dir": odir, "profile": profile,
                   "stems": stems, "plots": plots, "json_only": json_only,
@@ -588,20 +904,57 @@ def run_scan(scan_path: str, *, out: str | None = None,
     t0 = time.time()
     done = failed = 0
     audio_seconds = 0.0
-    results: list[dict[str, Any]] = []
+    served = 0.0          # per-file service time, summed over finished tracks
+    served_n = 0
+    capacity = 0.0        # worker-seconds the pool has burned, busy lanes only
+    last_event = t0
+
+    def eta_seconds(n: int) -> float | None:
+        """Wall clock left after `n` of the tracks have been reported.
+
+        Estimated from mean *service* time rather than wall clock per file.
+        Wall clock per file is what a pool makes meaningless: the first
+        completion of a `procs`-wide run has `procs` tracks' worth of wall
+        clock behind it, and charging all of it to the one track that finished
+        overstates the early estimates by exactly the worker count.
+
+        Two corrections keep the end of a run honest.  The tail drains
+        narrower than the pool once fewer tracks are left than there are
+        workers (`lanes`), and those last tracks are already part-separated
+        when they become "remaining" -- the pool has burned `capacity`
+        worker-seconds, of which only `served` is accounted for by finished
+        tracks, so the difference is work the remaining tracks need not redo.
+        """
+        remaining = len(jobs_list) - n
+        if not remaining:
+            return None
+        if not served_n:
+            return (time.time() - t0) / max(n, 1) * remaining
+        lanes = min(procs, remaining)
+        in_flight = max(0.0, capacity - served)
+        return max(0.0, served / served_n * remaining - in_flight) / lanes
 
     def report(r: dict[str, Any]) -> None:
-        nonlocal done, failed, audio_seconds
+        nonlocal done, failed, audio_seconds, served, served_n
+        nonlocal capacity, last_event
         n = done + failed + 1
+        now = time.time()
+        # Lanes that were actually turning over the interval that just ended:
+        # once fewer tracks are left than there are workers, the idle ones
+        # must not be billed as capacity.
+        capacity += min(procs, len(jobs_list) - (n - 1)) * (now - last_event)
+        last_event = now
         name = os.path.basename(r["source"])
         if r["ok"]:
             done += 1
             audio_seconds += float(r.get("duration_s") or 0.0)
+            spent = float(r.get("elapsed") or 0.0)
+            if spent > 0:
+                served += spent
+                served_n += 1
             warn = f", {r['warnings']} warning(s)" if r.get("warnings") else ""
-            tail = ""
-            if n < len(jobs_list):
-                rate = (time.time() - t0) / n
-                tail = f"  eta {_fmt_hms(rate * (len(jobs_list) - n))}"
+            eta = eta_seconds(n)
+            tail = "" if eta is None else f"  eta {_fmt_hms(eta)}"
             log(f"[{n}/{len(jobs_list)}] {name}: {r['elapsed']:.0f} s{warn}{tail}")
         else:
             failed += 1
@@ -642,8 +995,24 @@ def run_scan(scan_path: str, *, out: str | None = None,
         log("interrupted; finished tracks keep their results and will be "
             "skipped on the next run")
 
-    elapsed = time.time() - t0
+    # The rest of the copies: their twin was measured by the run that just
+    # ended, so they could not be written until now.  One whose twin failed or
+    # never started is simply left stale, and the next run measures or copies
+    # it -- there is nothing to lose by waiting.
+    pending = [d for d in dupes if d.within_run]
+    if pending and not interrupted:
+        measured = {_norm(r["out_dir"]) for r in results if r.get("ok")}
+        for dup in pending:
+            if _norm(dup.twin_dir) not in measured:
+                log(f"{os.path.basename(dup.source)}: left for the next run "
+                    "(the file it copies was not measured)")
+                continue
+            os.makedirs(dup.out_dir, exist_ok=True)
+            copy_from_twin(dup)
+
+    elapsed = time.time() - t_run
     log(f"measured {done} file(s) in {_fmt_hms(elapsed)}"
+        + (f", copied {copied} from an identical file" if copied else "")
         + (f", {failed} failure(s)" if failed else ""))
     if done and audio_seconds:
         log(f"throughput: {audio_seconds / max(elapsed, 1e-9):.1f} s of audio "
@@ -654,5 +1023,5 @@ def run_scan(scan_path: str, *, out: str | None = None,
         log(f"summary: {path} ({n} row(s))")
 
     return {"found": len(pairs), "done": done, "skipped": skipped,
-            "failed": failed, "elapsed": elapsed, "out_dir": scope.out_dir,
-            "results": results}
+            "failed": failed, "duplicates": copied, "elapsed": elapsed,
+            "out_dir": scope.out_dir, "results": results}

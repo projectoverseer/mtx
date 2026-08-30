@@ -337,3 +337,88 @@ def test_masking_needs_at_least_two_stems():
 
     out = m_masking.analyse(None, {}, [], {}, Collector())
     assert out["available"] is False and "two stems" in out["reason"]
+
+
+# ----------------------------------------------------------------- the tuning
+
+def _detuned_progression(a4: float, sr: int = SR) -> np.ndarray:
+    """The same I-vi-IV-V, built on a chosen reference pitch."""
+    prog = [(0, [0, 4, 7]), (9, [0, 3, 7]), (5, [0, 4, 7]), (7, [0, 4, 7])] * 2
+    out = []
+    for root, tones in prog:
+        seg = np.zeros(int(2.0 * sr))
+        for off in tones:
+            midi = 60 + root + off
+            freq = a4 * (2.0 ** ((midi - 69.0) / 12.0))
+            seg += tone(freq, 2.0, sr, partials=4)
+        seg /= max(np.max(np.abs(seg)), 1e-9)
+        n = int(0.02 * sr)
+        seg[:n] *= np.linspace(0, 1, n)
+        seg[-n:] *= np.linspace(1, 0, n)
+        out.append(seg)
+    y = np.concatenate(out) * 0.7
+    return np.stack([y, y], axis=1)
+
+
+@pytest.mark.parametrize("a4", [432.0, 444.0])
+def test_the_implied_reference_pitch_is_the_one_the_track_was_built_on(tmp_path, a4):
+    """Regression: A=432 was reported as A=350.
+
+    `librosa.estimate_tuning` returns fractions of a chroma bin, and a bin is
+    a semitone.  Reading that as octaves put the implied reference a factor of
+    twelve out in the exponent -- reported beside a `tuning_cents` computed
+    from the very same number, which was right.
+    """
+    import librosa
+
+    from mtx.metrics import structure as m_structure
+
+    path = tmp_path / f"a{a4:.0f}.flac"
+    sf.write(path, _detuned_progression(a4), SR, subtype="PCM_24")
+    src = AudioSource(str(path), Collector())
+    key = m_structure._key(src, librosa, Collector())
+
+    assert key["implied_a4_hz"] == pytest.approx(a4, abs=2.0)
+    # The two figures come from one estimate and must not disagree.
+    assert key["implied_a4_hz"] == pytest.approx(
+        440.0 * 2.0 ** (key["tuning_cents"] / 1200.0), rel=1e-9)
+    expected_cents = 1200.0 * math.log2(a4 / 440.0)
+    assert key["tuning_cents"] == pytest.approx(expected_cents, abs=6.0)
+
+
+def test_a_detuned_master_still_lands_the_right_key(tmp_path):
+    """chroma-CQT estimates the reference from the track, so the key holds."""
+    import librosa
+
+    from mtx.metrics import structure as m_structure
+
+    keys = {}
+    for a4 in (440.0, 432.0):
+        path = tmp_path / f"k{a4:.0f}.flac"
+        sf.write(path, _detuned_progression(a4), SR, subtype="PCM_24")
+        src = AudioSource(str(path), Collector())
+        keys[a4] = m_structure._key(src, librosa, Collector())["key"]
+    assert keys[432.0] == keys[440.0], \
+        "a 32-cent detune must not transpose the reported key"
+
+
+def test_a_detuned_master_says_so(tmp_path):
+    """A master off A440 is worth telling the reader about, once it is real."""
+    import librosa
+
+    from mtx.metrics import structure as m_structure
+
+    collector = Collector()
+    path = tmp_path / "flat.flac"
+    sf.write(path, _detuned_progression(432.0), SR, subtype="PCM_24")
+    m_structure._key(AudioSource(str(path), Collector()), librosa, collector)
+    notes = [n for n in collector.notes if n["metric"] == "structure.tuning"]
+    assert notes, "a 32-cent offset is past params.structure.tuning_report_cents"
+    assert "cents from A440" in notes[0]["reason"]
+
+    quiet = Collector()
+    path = tmp_path / "ref.flac"
+    sf.write(path, _detuned_progression(440.0), SR, subtype="PCM_24")
+    m_structure._key(AudioSource(str(path), Collector()), librosa, quiet)
+    assert not [n for n in quiet.notes if n["metric"] == "structure.tuning"], \
+        "a track at A440 has nothing to report"

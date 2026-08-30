@@ -168,6 +168,9 @@ def _headline_musical(res: dict[str, Any]) -> dict[str, Any]:
         "time_to_first_chorus_s": F.get("time_to_first_chorus_s") if F.get("available") else None,
         "time_to_vocal_entry_s": F.get("time_to_vocal_entry_s") if F.get("available") else None,
         "form_letters": F.get("letters") if F.get("available") else None,
+        "form_part_count": F.get("part_count") if F.get("available") else None,
+        "form_unnamed_parts": (F.get("unnamed_part_count")
+                               if F.get("available") else None),
         "vocal_range_p5_p95_semitones": (voc.get("range") or {}).get("p5_p95_semitones"),
         "vocal_p5_note": (voc.get("range") or {}).get("p5_note"),
         "vocal_p95_note": (voc.get("range") or {}).get("p95_note"),

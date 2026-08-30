@@ -6,7 +6,7 @@ recommend.
 """
 
 __version__ = "0.4.0"
-SCHEMA_VERSION = "1.2.0"
+SCHEMA_VERSION = "1.3.0"
 
 # The only fields of analysis.json that are allowed to differ between two runs
 # over the same input file.  Everything else must be byte-identical.

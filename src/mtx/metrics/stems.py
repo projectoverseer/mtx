@@ -47,7 +47,112 @@ def stem_names(model: str) -> tuple[str, ...]:
     return STEM_SETS.get(model, STEM_SETS["htdemucs"])
 
 
-def _cache_key(path: str) -> str:
+# ------------------------------------------------------------------ the device
+
+# demucs is a torch model, and on a GPU it runs roughly an order of magnitude
+# faster than on the CPU cores a scan can spare it.  What limits a consumer
+# card is its memory rather than its speed, and the knob for that is the
+# segment: demucs holds one segment of audio on the device at a time, so a
+# shorter one fits a smaller card at a little cost in throughput.  These are
+# tried in order, longest first, and only after an out-of-memory failure --
+# nothing is given up until the card says it has to be.  demucs takes whole
+# seconds here, and 7 is the ceiling: htdemucs was trained at 7.8 s and refuses
+# to be asked for more than it has seen.
+GPU_SEGMENTS: tuple[int, ...] = (7, 5, 3, 2)
+
+ENV_DEVICE = "MTX_STEMS_DEVICE"
+ENV_SEGMENT = "MTX_STEMS_SEGMENT"
+
+_CUDA: bool | None = None
+
+
+def cuda_available() -> bool:
+    """Whether torch can see a usable GPU.  Answered once per process.
+
+    Importing torch costs seconds, so this is only ever called when stems were
+    actually asked for, and the answer is kept.
+    """
+    global _CUDA
+    if _CUDA is None:
+        try:
+            import torch
+            _CUDA = bool(torch.cuda.is_available())
+        except Exception:
+            _CUDA = False
+    return _CUDA
+
+
+def resolve_device(requested: str | None = None) -> str:
+    """Where separation should run: what was asked for, or what is there.
+
+    The environment carries the answer because a scan's workers are separate
+    processes: they inherit it, where a parsed flag would have to be threaded
+    through every layer between the command line and this call.
+    """
+    choice = (requested or os.environ.get(ENV_DEVICE) or
+              PARAMS["stems"].get("device") or "auto")
+    if choice != "auto":
+        return choice
+    return "cuda" if cuda_available() else "cpu"
+
+
+def resolve_segment(requested: int | None = None) -> int | None:
+    """Seconds of audio held on the device at once; whole seconds only."""
+    if requested is not None:
+        return int(requested)
+    env = os.environ.get(ENV_SEGMENT) or PARAMS["stems"].get("segment")
+    try:
+        return int(float(env)) if env else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _out_of_memory(stderr: str) -> bool:
+    low = (stderr or "").lower()
+    return "out of memory" in low or "cuda error" in low or "cublas" in low
+
+
+def _child_env(device: str) -> dict[str, str]:
+    """Environment for the demucs child process.
+
+    A scan pins each of its workers to one thread and demucs inherits that,
+    which is right while several separations share the CPU and wrong on a GPU,
+    where they run one at a time and the CPU-side work -- decode, STFT, write
+    -- is all that is left to spread over the cores.
+    """
+    env = dict(os.environ)
+    if device.startswith("cuda"):
+        for key in ("MTX_THREADS", "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                    "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+                    "VECLIB_MAXIMUM_THREADS"):
+            env.pop(key, None)
+    return env
+
+
+# What demucs produced for one file is named after that file, both in the
+# cache key and in the folder underneath it.  Neither may be true: separation
+# depends on the audio bytes and the model and on nothing else, so a second
+# copy of one master -- the single next to the album track, the same rip under
+# a tidier name -- has to land on the work already done rather than spend
+# another few minutes of CPU reproducing it.
+STEM_DIR = "stems"
+
+
+def _content_key(path: str) -> str:
+    """Cache identity of a file's contents, independent of where it lives."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()[:24]
+
+
+def _legacy_key(path: str) -> str:
+    """The key caches written before separation became content-addressed used.
+
+    Kept only to read them: an existing cache is hours of CPU, and there is no
+    reason to make a user re-separate a library to pick up the fix.
+    """
     st = os.stat(path)
     h = hashlib.sha256()
     h.update(os.path.abspath(path).encode("utf-8"))
@@ -57,34 +162,109 @@ def _cache_key(path: str) -> str:
     return h.hexdigest()[:24]
 
 
-def separate(path: str, collector: Collector,
-             model: str | None = None) -> dict[str, str] | None:
-    """Run demucs and return {stem_name: wav_path}.  Cached across runs."""
-    key = _cache_key(path)
-    out_root = os.path.join(CACHE_DIR, key)
+def _stem_paths(root: str, model: str, name: str) -> dict[str, str]:
+    return {s: os.path.join(root, model, name, f"{s}.wav")
+            for s in stem_names(model)}
+
+
+def _complete(paths: dict[str, str]) -> bool:
+    return bool(paths) and all(os.path.isfile(p) for p in paths.values())
+
+
+# What this card turned out to hold, once a file has found out.  A scan puts
+# every separation through this one process, so the second file need not
+# rediscover the first one's out-of-memory failures: each of those costs a
+# model load before it fails, and paying that per track is most of what a
+# small card would otherwise cost.
+_LEARNED: dict[tuple[str, str], int | None] = {}
+
+
+def _attempts(device: str, segment: int | None,
+              model: str) -> list[tuple[str, int | None]]:
+    """The (device, segment) pairs to try, in order.
+
+    On a GPU the shorter segments are held in reserve for an out-of-memory
+    failure, and the CPU is the last resort: slow beats absent.  An explicitly
+    requested segment is taken as an instruction and not second-guessed.
+    """
+    if not device.startswith("cuda"):
+        return [(device, segment)]
+    if segment is not None:
+        return [(device, segment), ("cpu", None)]
+    key = (device, model)
+    if key not in _LEARNED:
+        ladder = list(GPU_SEGMENTS)                  # nothing known yet
+    elif _LEARNED[key] is None:
+        ladder = []                                  # the card never held it
+    else:
+        ladder = [s for s in GPU_SEGMENTS if s <= _LEARNED[key]]
+    return [(device, s) for s in ladder] + [("cpu", None)]
+
+
+def separate(path: str, collector: Collector, model: str | None = None, *,
+             device: str | None = None,
+             segment: int | None = None) -> dict[str, str] | None:
+    """Run demucs and return {stem_name: wav_path}.  Cached across runs.
+
+    The cache is keyed on the file's contents, so the same master separates
+    once however many copies of it the library holds.
+    """
     model = model or PARAMS["stems"]["model"]
-    stem_dir = os.path.join(out_root, model,
-                            os.path.splitext(os.path.basename(path))[0])
-    have = {s: os.path.join(stem_dir, f"{s}.wav") for s in stem_names(model)}
-    if all(os.path.isfile(p) for p in have.values()):
+    out_root = os.path.join(CACHE_DIR, _content_key(path))
+    stem_dir = os.path.join(out_root, model, STEM_DIR)
+    have = _stem_paths(out_root, model, STEM_DIR)
+    if _complete(have):
         return have
+    legacy = _stem_paths(os.path.join(CACHE_DIR, _legacy_key(path)), model,
+                         os.path.splitext(os.path.basename(path))[0])
+    if _complete(legacy):
+        return legacy
     if shutil.which("demucs") is None and importlib.util.find_spec("demucs") is None:
         collector.warn("stems", "demucs is not installed; install the 'stems' "
                                 "extra (pip install 'mtx[stems]') to use --stems")
         return None
     os.makedirs(out_root, exist_ok=True)
-    cmd = [sys.executable, "-m", "demucs", "-n", model, "-o", out_root, path]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              encoding="utf-8", errors="replace", timeout=7200)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        collector.warn("stems", f"demucs failed to run: {exc!r}")
-        return None
-    if proc.returncode != 0:
-        collector.warn("stems", f"demucs exited {proc.returncode}: "
-                                f"{(proc.stderr or '')[-400:]}")
-        return None
-    if not all(os.path.isfile(p) for p in have.values()):
+
+    asked = resolve_device(device)
+    attempts = _attempts(asked, resolve_segment(segment), model)
+    for i, (dev, seg) in enumerate(attempts):
+        cmd = [sys.executable, "-m", "demucs", "-n", model, "-d", dev,
+               "-o", out_root]
+        if seg is not None:
+            cmd += ["--segment", str(int(seg))]
+        cmd.append(path)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace",
+                                  timeout=7200, env=_child_env(dev))
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            collector.warn("stems", f"demucs failed to run: {exc!r}")
+            return None
+        if proc.returncode == 0:
+            if asked.startswith("cuda"):
+                _LEARNED[(asked, model)] = seg if dev == asked else None
+            break
+        if i == len(attempts) - 1 or not _out_of_memory(proc.stderr):
+            collector.warn("stems", f"demucs exited {proc.returncode} on {dev}: "
+                                    f"{(proc.stderr or '')[-400:]}")
+            return None
+        nxt = attempts[i + 1]
+        collector.warn("stems",
+                       f"{dev} ran out of memory at segment {seg}; retrying on "
+                       f"{nxt[0]}" + (f" at segment {nxt[1]}" if nxt[1] else ""))
+    # demucs names its output folder after the input file; give it the fixed
+    # name the content key expects, so the next copy of this master finds it.
+    produced = os.path.join(out_root, model,
+                            os.path.splitext(os.path.basename(path))[0])
+    if produced != stem_dir and os.path.isdir(produced):
+        shutil.rmtree(stem_dir, ignore_errors=True)
+        try:
+            os.replace(produced, stem_dir)
+        except OSError as exc:
+            collector.warn("stems", f"could not name the stem cache entry: {exc!r}")
+            have = _stem_paths(out_root, model,
+                               os.path.splitext(os.path.basename(path))[0])
+    if not _complete(have):
         collector.warn("stems", f"demucs produced no stems under {stem_dir}")
         return None
     return have

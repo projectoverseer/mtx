@@ -447,6 +447,17 @@ def cmd_scan(args: argparse.Namespace) -> int:
     if not os.path.exists(args.path):
         _log(f"error: no such file or directory: {args.path}")
         return 1
+    # A scan's workers are separate processes, and both of these have to reach
+    # the demucs call inside each of them; the environment is what a child
+    # inherits, where a parsed flag would have to be threaded through analyze.
+    device = getattr(args, "stems_device", "auto")
+    segment = getattr(args, "stems_segment", None)
+    if device not in ("auto", None) or segment:
+        from .metrics.stems import ENV_DEVICE, ENV_SEGMENT
+        if device not in ("auto", None):
+            os.environ[ENV_DEVICE] = device
+        if segment:
+            os.environ[ENV_SEGMENT] = str(segment)
     try:
         stats = run_scan(
             args.path, out=args.out, library_root=args.library_root,
@@ -456,7 +467,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
             stems_model=getattr(args, "stems_model", None),
             transcribe=bool(getattr(args, "transcribe", False)),
             embed=bool(getattr(args, "embed", False)),
-            dry_run=args.dry_run, no_summary=args.no_summary, log=_log)
+            dry_run=args.dry_run, no_summary=args.no_summary,
+            dedup=not getattr(args, "no_dedup", False), log=_log)
     except NoRootRegistered as exc:
         _log(f"error: {exc}")
         return 1
@@ -724,12 +736,24 @@ def build_parser() -> argparse.ArgumentParser:
                     help="list what would be measured, and why, then stop")
     sc.add_argument("--no-summary", action="store_true",
                     help="skip rewriting summary.csv over the scanned subtree")
+    sc.add_argument("--no-dedup", action="store_true",
+                    help="measure every copy of a file separately, instead of "
+                         "copying the result across files with identical bytes")
     sc.add_argument("--profile", choices=("quick", "full"), default="full")
     sc.add_argument("--plots", action="store_true")
     sc.add_argument("--stems", action="store_true")
     sc.add_argument("--stems-model", metavar="NAME",
                     help="demucs model (default htdemucs); htdemucs_6s splits "
                          "guitar and piano out of `other`")
+    sc.add_argument("--stems-device", choices=("auto", "cuda", "cpu"),
+                    default="auto",
+                    help="where to separate (default auto: the GPU if torch "
+                         "can see one). On a GPU the separations are done "
+                         "up front, one at a time, since a card holds one")
+    sc.add_argument("--stems-segment", type=int, metavar="SECONDS",
+                    help="seconds of audio demucs holds on the device at once. "
+                         "Lower it if a small card runs out of memory; the "
+                         "default tries 7.8 and steps down only on a failure")
     sc.add_argument("--transcribe", action="store_true",
                     help="transcribe the vocal stem for a time-aligned lyric "
                          "(optional backend, needs --stems)")
