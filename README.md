@@ -671,8 +671,10 @@ mtx selftest    # the synthetic-signal suite
 `GAPS.md` documents what the tool does **not** measure — an audit of the musical
 content that never reaches the dump (harmony, melody, groove, song form,
 instrument identity, inter-stem masking, lyric meaning), what each gap would
-cost, and which of them must stay outside `src/mtx/` to keep the tool's five
-properties intact. Read it before proposing a new metric module.
+cost, which of them must stay outside `src/mtx/` to keep the tool's five
+properties intact, and which need the song to have been *released* before their
+data exists at all. Ten of the twelve are available on an unreleased master.
+Read it before proposing a new metric module.
 
 ## Licence
 

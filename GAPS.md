@@ -57,12 +57,100 @@ The gaps are not in the signal chain. They are in **music**.
 
 ---
 
+## Offline and online
+
+Every gap below is tagged with where its data can come from. The distinction is
+not "does it need a network call" — it is **whether a song has to have been
+released for the data to exist at all**:
+
+- **Offline** — obtainable from the audio itself. A master bounced out of a DAW
+  an hour ago, never released, with no ISRC and no database entry anywhere,
+  yields exactly the same measurement as a thirty-year-old catalogue record.
+  This is `mtx analyze` territory: no network, no keys, no dependence on anyone
+  else having catalogued the work.
+- **Online** — exists only because the song was published. Someone else had to
+  create the record: a distributor issued the ISRC, an editor typed the credits
+  into MusicBrainz, listeners tagged it, a service counted plays. An unreleased
+  master has none of it and cannot be made to have it. This is `mtx enrich`
+  territory.
+
+**Ten of the twelve gaps are fully offline.** That is not a coincidence — the
+musical content of a record is in the record. Harmony, melody, groove, form,
+instrumentation, masking, lyric meaning, timbre and delivery behaviour are all
+recoverable from a file nobody has ever heard.
+
+| # | Gap | Offline / online |
+| --- | --- | --- |
+| 1 | Harmony (chords) | Offline |
+| 2 | Melody (F0 on the vocal stem) | Offline |
+| 3 | Rhythm beyond BPM | Offline |
+| 4 | Song form labels | Offline |
+| 5 | Instrument ID, arrangement density | Offline |
+| 6 | Inter-stem masking | Offline |
+| 7 | Lyrics | Offline (transcription); **declared** for the text itself |
+| 8 | Embeddings and trained taggers | Offline (local inference) |
+| 9 | Corpus-relative layer | Offline maths, **online cohort labels** |
+| 10 | Rights, credit graph, version identity | **Online** — or declared |
+| 11 | Delivery-condition renderings | Offline |
+| 12 | Export shape, corpus hygiene | Offline |
+
+### What an unreleased master does not get, today
+
+For context on the two mixed rows: a master that has never been published
+receives **none** of the current `online.json`. `mtx enrich` will match nothing,
+and every one of these is empty:
+
+ISRC, UPC, all MBIDs, ISWC, label, release type and date, album context, the
+voted genre with its umbrella and agreement score, the descriptive tags,
+database-confirmed credits, `Explicit`, popularity ranks, and — importantly —
+all three `cross_checks` (tempo against a published BPM, duration against the
+distributed runtime, release-date agreement). Those cross-checks are
+self-verification of the kind the tool is built around, and they are structurally
+unavailable before release. On an unreleased file, `structure.tempo.confidence`
+is the last word rather than the first.
+
+That is the correct behaviour, not a bug: the fields are `null` with a reason,
+nothing is guessed. But it means anything downstream that consumes `online.*`
+must degrade cleanly rather than assume it is there.
+
+### The design implication: declared metadata
+
+Rows 7, 9 and 10 are the interesting ones, because for your **own** unreleased
+work the data is not missing — you simply happen to be the source of it rather
+than a database.
+
+You know the lyric because you wrote it. You know the writer splits, the
+publisher, the producer credits and whether this is the radio edit, because you
+made those decisions. You know the intended genre and the target release year.
+For a published record all of that is *discoverable*; for an unreleased one it is
+*declarable*, and no amount of DSP will produce it.
+
+So the gap for unreleased work is not a measurement gap at all — it is an input
+gap. Closing it means an optional sidecar (`declared.json` beside
+`analysis.json`, say) that `analyze` reads and passes through **clearly labelled
+as declared**, never blended into measured or database-sourced fields. The
+`sources` arrays in `online.credits` are already the right pattern: a claim
+carries where it came from, and `"declared"` would be one more origin alongside
+`"file:tag"` and `"musicbrainz"`.
+
+This matters most for §9. Cohort comparison — where a track sits among
+comparable records — is the feature that makes an unreleased mix legible, and it
+is precisely the one that needs a genre and a year the unreleased track cannot
+look up. The reference corpus it is compared *against* is built from published
+records and gets its labels online; the candidate track declares its own.
+
+---
+
 ## The gaps
 
 Each entry states what is missing, who it is missing for, where it would live,
-and roughly what it costs.
+what it costs, and whether the data is offline or online in the sense defined
+above.
 
 ### 1. Harmony — completely absent
+
+**Offline.** Chord recognition runs on the waveform. An unreleased master is
+no harder than a catalogue record.
 
 **Missing.** Chords. There is no chord data anywhere in the schema. What exists
 is one global key from a mean chroma-CQT correlated against Krumhansl-Schmuckler
@@ -98,6 +186,8 @@ need to say so, like `processing/` does.
 
 ### 2. Melody — absent, and the hardest part is already done
 
+**Offline.** F0 comes off a stem the tool already separates locally.
+
 **Missing.** F0. The vocal stem is separated and then measured only for level,
 tilt, crest, centroid and onset rate — every number in `stems.stems.vocals` is a
 mix-engineering number. The pitch content of the melody is thrown away.
@@ -131,6 +221,11 @@ separation, which is the expensive part, has already run and is cached in
 
 ### 3. Rhythm beyond BPM
 
+**Offline.** Downbeats, meter and microtiming are all in the signal. Note the
+contrast with the existing `cross_checks.tempo`, which compares against a
+*published* BPM and is therefore online-only — on an unreleased file the beat
+tracker's own confidence is all there is.
+
 **Missing.** `structure.tempo` gives BPM, beat times, drift, per-window tempo
 and a grid-fit R². That is a tempo, not a groove.
 
@@ -156,6 +251,8 @@ separation already exists. A producer's "the drums are dragging" is
 **Cost.** Medium.
 
 ### 4. Song form — there are segments, but no structure
+
+**Offline.** Segmentation and labelling are both audio tasks.
 
 **Missing.** `structure.sections` is 22 novelty-derived boundaries with LUFS,
 tilt, width, crest, onset rate and band energy each. As raw material that is
@@ -189,6 +286,8 @@ them.
 
 ### 5. Instrument identification and arrangement density
 
+**Offline.** Separation and tagging are local inference.
+
 **Missing.** Four stems means guitars, keys, synths, strings, horns and pads all
 collapse into `other`. There is no answer to "what is playing", and therefore
 none to "when does it come in".
@@ -213,6 +312,11 @@ Beyond that, PANNs / MTG-Jamendo / AST tagging over time.
 
 ### 6. Inter-stem masking — the mixing metric that is missing
 
+**Offline**, and emphatically so — this is the item that most rewards being run
+on unreleased work, because it is diagnostic of a mix in progress rather than
+descriptive of a finished record. It is the one gap here that belongs in a
+revision loop.
+
 **Missing.** Every stem is measured in isolation and against the mix
 (`level_vs_mix.lufs_delta`). No stem is ever measured **against another stem**.
 
@@ -235,6 +339,14 @@ reverb send and pre-delay from the stem tail (the machinery is in
 §2.
 
 ### 7. Lyrics — counted, not read, and missing on more than half the corpus
+
+**Offline for alignment and analysis; declared for the text.** Transcription
+from the vocal stem is pure local inference and works on an unreleased master.
+But a transcript is not a lyric sheet — it is a guess at one, and mishears.
+For your own unreleased work you hold the authoritative text, so the right input
+is a declared lyric (or a tag you wrote) with the transcript supplying only the
+timings. Lyric *lookup* from a service, which this tool does not do, would be
+online and unavailable pre-release in any case.
 
 **Missing, in three separate ways.**
 
@@ -276,6 +388,9 @@ optional extra.
 
 ### 8. Learned embeddings and trained taggers
 
+**Offline.** Model weights are downloaded once; inference is local and the input
+is the audio. Nothing here needs the song to exist publicly.
+
 **Missing.** There is no embedding vector. 193 hand-engineered scalars are ideal
 for interpretability and poor at capturing timbre similarity — two records can
 agree on every column here and sound nothing alike.
@@ -302,6 +417,13 @@ document that puts a model's opinion into the output.
 
 ### 9. No corpus-relative layer
 
+**Offline maths over an online-labelled cohort.** The percentile arithmetic is
+local and needs no network. What it needs is a *cohort*, and cohorts are defined
+by genre and year — which for the published reference records come from `enrich`
+(online), and for the unreleased candidate must be declared. So an unreleased
+mix can be positioned against a corpus of released records you own, which is
+exactly the useful direction, provided you state what it should be compared to.
+
 **Missing.** `-7.77 LUFS` and `tilt -4.79 dB/oct` mean nothing on their own. A
 consumer has no way to ask where a value sits among comparable records.
 
@@ -319,6 +441,14 @@ file of relative positions. Keep the absolute numbers untouched.
 document, and it makes every existing column more legible without adding one.
 
 ### 10. Rights, credit graph and version identity
+
+**Online for anyone else's catalogue; declared for your own.** Splits,
+publisher, PRO, sample clearances, the collaborator graph and sibling-version
+counts exist in databases only after release. For a record you made, none of it
+is unknown — it is unentered. This is the row that most clearly needs the
+declared-metadata sidecar, and version identity is the piece worth doing first:
+it is what lets two bounces of the same song be recognised as two mixes rather
+than two songs.
 
 **Missing.** `online/` does well on credits and identity — ISRC, MBIDs, ISWC when
 MusicBrainz has it, roles reconciled across sources with `sources` arrays so a
@@ -340,6 +470,11 @@ populate from tags.
 of that data is not in any free source.
 
 ### 11. Delivery-condition renderings
+
+**Offline.** Encoding to AAC or Opus, band-passing, folding to mono and slicing
+an excerpt are all local operations on a local file. This is the other gap with
+real pre-release value: it answers what a master will do once it is distributed,
+before it is.
 
 **Missing.** `loudness.streaming_preview` covers the -14/-16 LUFS targets, which
 is the right instinct, applied once. The other conditions a record actually
@@ -364,6 +499,8 @@ measures reuse existing machinery over a filtered or sliced signal.
 optional dependency with a stated fallback.
 
 ### 12. Export shape and corpus hygiene
+
+**Offline.** Tooling over analyses already on disk.
 
 Not a measurement gap, but it will bite before any of the above does.
 
@@ -402,6 +539,15 @@ By value per unit of work, given that stem separation is already paid for:
 the only one that puts an opaque model's opinion into the output, and it earns
 its place only once a corpus is large enough for similarity search to return
 something other than the same artist.
+
+**If the priority is unreleased work rather than catalogue analysis**, the order
+changes at the top: **§6 masking** and **§11 delivery-condition renderings**
+first, then **§9** with declared cohort labels. Those three are what an
+unfinished mix can actually use — the first two say something about the record
+in front of you and are answerable while it is still changeable, and the third
+tells you where it sits relative to the released records you are competing with.
+Everything in §10 stays unavailable until you enter it yourself, and nothing in
+`online.json` arrives at all.
 
 ---
 
