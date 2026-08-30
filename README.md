@@ -54,6 +54,8 @@ with the measured value for each. It exits non-zero if anything fails.
 mtx analyze <file> [--out DIR] [--profile quick|full] [--plots] [--stems]
                    [--blind] [--sections A,B,C] [--digest-budget 20k] [--json-only]
                    [--max-part-size 4.5m] [--no-split]
+mtx scan [PATH] [--out DIR] [--library-root DIR] [-j N] [--force] [--recheck]
+                [--dry-run] [--profile quick|full] [--json-only] [--no-summary]
 mtx batch <dir> [--out DIR] [--recursive] [--csv summary.csv]
                 [--csv-schema internal|corpus]
 mtx compare <fileA> <fileB> [--out DIR] [--null-test]
@@ -67,6 +69,9 @@ mtx --version
 
 - `analyze` — the main path. `--profile full` is the default; `quick` skips the
   expensive DSP (see the profile table below).
+- `scan` — the way to measure more than one file. Takes an album, an artist or a
+  whole library, measures in parallel, skips what it has already measured, and
+  survives being interrupted. See *Scanning a library* below.
 - `batch` — one JSON per file plus a single CSV of headline metrics, one row per
   track. This is how you bootstrap a reference library from records you own.
   `--csv-schema corpus` names the columns after the properties a corpus
@@ -91,6 +96,66 @@ mtx --version
   embedded tags; the filename is used when the file carries no title tag.
 - Progress goes to stderr; stdout carries only the output path.
 - Exit codes: `0` success, `1` unreadable input, `2` a self-test assertion failed.
+
+### Scanning a library
+
+`mtx scan` measures whatever the path covers. The scope is the only thing that
+changes between these three:
+
+```text
+mtx scan "E:\Music"                        # the whole library
+mtx scan "E:\Music\Ed Sheeran"             # one artist
+mtx scan "E:\Music\Ed Sheeran\÷"           # one album
+mtx scan                                   # whatever the shell is sitting in
+```
+
+Results land in a mirror of the library tree, so a track measured as part of a
+library scan and the same track measured on its own are the same folder:
+
+```text
+E:\Music\Ed Sheeran\÷\04. Shape of You.flac
+E:\mtx_out\Ed Sheeran\÷\04. Shape of You\analysis.json
+                                          \digest.md
+                                          \corpus_row.json
+                                          \mtx_source.json
+```
+
+That mapping needs to know where the library starts, so say it once:
+
+```text
+mtx scan "E:\Music" --out "E:\mtx_out" --dry-run
+```
+
+The root is recorded (in the user config directory, not in the music folder,
+which is never written to) and every later `mtx scan` from any level underneath
+resolves to the same tree with no flags at all. Until a root is registered,
+`mtx scan` refuses to guess one rather than strand a first scan's results in a
+tree the next one will not look in.
+
+**Nothing is measured twice.** Each output folder carries `mtx_source.json`, a
+receipt naming the file it came from — size, modification time, profile, schema
+version. A scan reads those, not the audio, so a library that is already
+measured is re-checked in under a second. A track is measured again only when
+its source changed, the profile changed, or the schema version moved:
+
+```text
+[mtx] 597 file(s) found: 585 already measured, 12 to do
+```
+
+Because the receipt is written per track, an interrupted scan is resumable:
+stop it with Ctrl-C, run it again, and it picks up where it left off. There is
+no progress file to lose.
+
+- `--force` re-measures everything.
+- `--recheck` decides staleness by hashing each source rather than trusting its
+  modification time. Slower, and the right choice after copying a library
+  between drives, which rewrites every mtime.
+- `--dry-run` lists what would be measured and why, and stops.
+- `-j N` sets the parallelism budget (see *Profiles and performance*).
+
+`summary.csv` is rewritten over the scanned subtree at the end of every run,
+covering every track under it that has a result — including ones measured on an
+earlier run — with the same column names `--csv-schema corpus` uses.
 
 ### Predicting before measuring
 
@@ -514,6 +579,66 @@ Notes on how that is achieved, since the numbers are otherwise surprising:
 - The band split, the long-term spectra and the librosa features (onset
   envelope, chroma-CQT) are each computed once per run and shared.
 
+### Where a full run actually goes
+
+Profiled on a 3:54 track, 44.1 kHz / 24-bit stereo, full profile, no stems:
+
+| Stage | Time | Share |
+| --- | --- | --- |
+| loudness, true peak, DR | 16.6 s | 33% |
+| processing forensics | 9.0 s | 18% |
+| structure, tempo, key | 6.9 s | 14% |
+| spectrum | 5.8 s | 11% |
+| stereo field | 4.7 s | 9% |
+| source forensics | 4.6 s | 9% |
+| dynamics | 1.8 s | 4% |
+| file, container, decode | 1.2 s | 2% |
+
+Inside that, the four heaviest leaves are the true-peak oversampling
+(`resample_poly`: 12.9 s on one thread, 10.5 s of it the 16x pass), the HPSS
+median filters (5.4 s), the zero-phase band filters (`sosfiltfilt`, 5.5 s
+across 21 calls) and roughly twenty thousand short FFTs from the per-frame
+Welch loops.
+
+The 16x pass is also where the pruning described above stops helping. It is
+still exact, but on a master that runs into a limiter the bound it tests is
+cleared nearly everywhere: on the track above it scanned **98.5%** of the file.
+Pruning earns its keep on dynamic material and is close to free on modern pop,
+which is the material this tool is usually pointed at — so that pass is
+threaded rather than relied on to skip work.
+
+### Two layers of parallelism, which never multiply
+
+Between files there is no shared state, so `mtx scan` runs **one process per
+physical core**. Within one file only some of the work can be threaded, because
+only some of it lets go of the GIL — measured here, on scipy 1.18 / numpy 2.5:
+
+| Primitive | Used by | GIL | 4 threads |
+| --- | --- | --- | --- |
+| `resample_poly` / `upfirdn` | true peak | released | 3.8x |
+| `ndimage.median_filter` | HPSS | released | 3.1x |
+| `lfilter` | K-weighting | released | 2.7x |
+| `sosfilt` / `sosfiltfilt` | band split | **held** | 1.2x |
+| `welch`, `rfft` | every spectrum | **held** | 1.1x |
+
+So threads are spent on the true-peak scan and nowhere else; the GIL-bound
+majority of the work is why the between-files layer is the one that matters.
+`-j N` is a single budget covering both: processes are taken first, and threads
+only pick up the slack when fewer files remain than there is room to run. On a
+6-core machine `-j 5` means five processes with one thread each while there is a
+queue, and one process with five threads for the last file.
+
+Threading the true-peak scan changes no output. The oversampling of each chunk
+is pure, and the results are folded back into the running scan in chunk order,
+so an inter-sample over that straddles a chunk boundary is still counted once.
+`mtx selftest` asserts that a scan on one thread and on four are bit-identical,
+envelope included, and the whole 309,611-value `analysis.json` of a real track
+is unchanged at every thread count.
+
+Memory is the other limit: about 0.5 GB of resident memory per worker on a
+44.1 kHz track (measured), and proportionally more at higher rates, so the
+default stops at 8 workers however many cores are present.
+
 Memory is proportional to duration: the file is decoded once into float32 in
 chunked reads, and band-split work runs at `min(native_sr, 48000)` because every
 analysis band tops out at 20 kHz. Forensics deliberately run at the file's own
@@ -542,6 +667,12 @@ mtx selftest    # the synthetic-signal suite
 ```
 
 `SCHEMA.md` documents every field of `analysis.json`.
+
+`GAPS.md` documents what the tool does **not** measure — an audit of the musical
+content that never reaches the dump (harmony, melody, groove, song form,
+instrument identity, inter-stem masking, lyric meaning), what each gap would
+cost, and which of them must stay outside `src/mtx/` to keep the tool's five
+properties intact. Read it before proposing a new metric module.
 
 ## Licence
 

@@ -313,6 +313,28 @@ the PSR minimum. Anything mtx cannot measure is `null`, never guessed --
 `Engineers` always is, and no session field (calibration, lessons, verdict)
 appears at all.
 
+## `mtx_source.json` (`mtx scan`)
+
+The receipt that lets a later scan skip a track without decoding it. Written
+into the same folder as `analysis.json`, and read instead of the audio:
+
+- `source` -- `path`, `size`, `mtime_ns` and the `sha256` copied out of
+  `file.sha256`. Size and modification time are what the default staleness
+  check compares; the hash is what `--recheck` compares, for the case where a
+  library has been copied between drives and every modification time moved.
+- `run` -- `profile`, `stems`, `tool_version`, `schema_version`,
+  `elapsed_seconds`, `completed_utc`. A track is measured again when the
+  profile, the stems setting or `schema_version` no longer match the current
+  run. `tool_version` is recorded but does not by itself invalidate a result:
+  the schema version is what says whether the numbers still mean the same
+  thing.
+- `outputs` -- the file names written alongside, so a folder missing its
+  `analysis.json` is recognised as incomplete rather than trusted.
+
+Deleting this file (or passing `--force`) is what makes a track eligible to be
+measured again. Nothing else reads it, and `analysis.json` does not depend on
+it.
+
 ## `online.json` (`mtx enrich`)
 
 `online.schema_version` **1.0.0**. A **sidecar**, written beside

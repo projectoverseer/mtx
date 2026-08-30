@@ -36,9 +36,14 @@ def resample_to(x: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
 class AudioSource:
     """Decoded audio plus the derived representations the metrics need."""
 
-    def __init__(self, path: str, collector: Collector):
+    def __init__(self, path: str, collector: Collector, threads: int = 1):
         self.path = path
         self.collector = collector
+        # How many threads a metric may use inside this one file.  Carried on
+        # the source rather than threaded through every `analyse()` signature:
+        # every metric module already has the source in hand, and only the
+        # true-peak scan currently has a GIL-releasing hot loop to spend it on.
+        self.threads = max(1, int(threads))
         self.info = sf.info(path)
         self.sr: int = int(self.info.samplerate)
         self.n_ch: int = int(self.info.channels)

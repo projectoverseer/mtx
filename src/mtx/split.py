@@ -205,6 +205,32 @@ def _moved_marker(files: list[str]) -> dict[str, Any]:
     }
 
 
+def _prune_parts(out_dir: str, stem: str, keep: dict[str, str]) -> list[str]:
+    """Delete part files of `stem` that this run did not write.
+
+    Re-analysing into a folder that already holds a result can produce fewer
+    parts than last time -- a shorter track, a larger cap, a section that got
+    smaller.  The index names the parts it owns, so an orphan is never *read*,
+    but it sits in the folder looking exactly like current data.  Removing it
+    keeps the folder equal to the result rather than to the union of every
+    result ever written there.
+    """
+    removed: list[str] = []
+    try:
+        names = os.listdir(out_dir)
+    except OSError:
+        return removed
+    for name in names:
+        m = _PART_RE.match(name)
+        if m and m.group("stem") == stem and name not in keep:
+            try:
+                os.remove(os.path.join(out_dir, name))
+                removed.append(name)
+            except OSError:
+                pass
+    return removed
+
+
 def write_analysis(res: dict[str, Any], out_dir: str, stem: str = "analysis", *,
                    max_bytes: int | None = DEFAULT_PART_BYTES,
                    log=None) -> dict[str, str]:
@@ -221,6 +247,9 @@ def write_analysis(res: dict[str, Any], out_dir: str, stem: str = "analysis", *,
     if max_bytes is None or whole <= max_bytes:
         _write(index_path, doc)
         written[f"{stem}.json"] = index_path
+        stale = _prune_parts(out_dir, stem, written)
+        if stale and log:
+            log(f"  removed {len(stale)} part file(s) from an earlier run")
         return written
 
     # Move whole top-level sections out, largest first, until what is left fits
@@ -282,6 +311,9 @@ def write_analysis(res: dict[str, Any], out_dir: str, stem: str = "analysis", *,
 
     index_size = _write(index_path, doc)
     written = {f"{stem}.json": index_path, **written}
+    stale = _prune_parts(out_dir, stem, written)
+    if stale and log:
+        log(f"  removed {len(stale)} part file(s) from an earlier run")
     if log:
         log(f"  {stem}.json: {whole / 1e6:.1f} MB over the {max_bytes / 1e6:.1f} MB "
             f"part limit -> index ({index_size / 1e6:.2f} MB) + "

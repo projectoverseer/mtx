@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mtx"
-version = "0.2.0"
+version = "0.3.0"
 description = "Master extractor: an exhaustive, reproducible measurement dump for lossless audio files. Measures; never interprets."
 readme = "README.md"
 requires-python = ">=3.11"

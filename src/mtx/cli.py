@@ -17,13 +17,19 @@ import unicodedata
 from typing import Any
 
 from . import __version__
-
-AUDIO_EXTENSIONS = (".flac", ".wav", ".aif", ".aiff", ".w64", ".caf", ".ogg",
-                    ".opus", ".mp3", ".m4a", ".aac", ".wv", ".ape")
+from .parallel import cpu_count, default_workers
+from .scan import AUDIO_EXTENSIONS
 
 
 def _log(msg: str) -> None:
-    print(f"[mtx] {msg}", file=sys.stderr, flush=True)
+    try:
+        print(f"[mtx] {msg}", file=sys.stderr, flush=True)
+    except UnicodeEncodeError:
+        # A legacy console codepage must not be able to end a library scan
+        # halfway through because one album is called "÷".
+        enc = getattr(sys.stderr, "encoding", None) or "ascii"
+        safe = f"[mtx] {msg}".encode(enc, errors="replace").decode(enc, "replace")
+        print(safe, file=sys.stderr, flush=True)
 
 
 # Characters no Windows path component may contain (POSIX only bars "/").
@@ -287,7 +293,8 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         return 1
     t0 = time.time()
     res = analyze_file(args.file, profile=args.profile, want_stems=args.stems,
-                       log=lambda s: _log(f"  {s}"))
+                       log=lambda s: _log(f"  {s}"),
+                       threads=getattr(args, "jobs", None))
     out_dir = args.out if args.out and args.single_out else _default_out(args.out, args.file, res)
     written = write_outputs(res, out_dir, json_only=args.json_only,
                             plots=args.plots, src_path=args.file,
@@ -426,6 +433,32 @@ def cmd_batch(args: argparse.Namespace) -> int:
     return 1 if failures and not rows else 0
 
 
+def cmd_scan(args: argparse.Namespace) -> int:
+    """Measure a library, an artist or an album -- whatever the path covers."""
+    from .scan import NoRootRegistered, run_scan
+
+    if not os.path.exists(args.path):
+        _log(f"error: no such file or directory: {args.path}")
+        return 1
+    try:
+        stats = run_scan(
+            args.path, out=args.out, library_root=args.library_root,
+            profile=args.profile, jobs=args.jobs, force=args.force,
+            recheck=args.recheck, stems=args.stems, plots=args.plots,
+            json_only=args.json_only, max_part_bytes=parse_part_size(args),
+            dry_run=args.dry_run, no_summary=args.no_summary, log=_log)
+    except NoRootRegistered as exc:
+        _log(f"error: {exc}")
+        return 1
+    except ValueError as exc:
+        _log(f"error: {exc}")
+        return 1
+    print(stats["out_dir"])
+    if stats["failed"] and not stats["done"]:
+        return 1
+    return 0
+
+
 def cmd_compare(args: argparse.Namespace) -> int:
     from .compare import compare_files
 
@@ -541,6 +574,10 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--stems", action="store_true",
                    help="separate stems with demucs and measure each")
     a.add_argument("--json-only", action="store_true", help="skip digest.md")
+    a.add_argument("--jobs", "-j", type=int, metavar="N",
+                   help="threads to use inside this one file (default "
+                        f"{default_workers()} here); only the true-peak "
+                        "oversampling pass can spend them")
     a.add_argument("--blind", action="store_true",
                    help="also write predict.md (the headline redacted to a form) "
                         "and print only its path, so a prediction can be "
@@ -570,6 +607,41 @@ def build_parser() -> argparse.ArgumentParser:
                         "properties so the CSV imports as a populated table")
     _add_part_size_args(b)
     b.set_defaults(func=cmd_batch)
+
+    sc = sub.add_parser("scan",
+                        help="measure every unmeasured file under a path "
+                             "(album, artist or whole library), in parallel")
+    sc.add_argument("path", nargs="?", default=".",
+                    help="what to measure: an album, an artist, or the library "
+                         "root (default: the current directory)")
+    sc.add_argument("--out", metavar="DIR",
+                    help="root of the mirror tree results are written to; "
+                         "remembered per library root, so it only has to be "
+                         "given once (default ./mtx_out on a first scan)")
+    sc.add_argument("--library-root", metavar="DIR",
+                    help="what the mirror tree's paths are relative to "
+                         "(default: the path being scanned, on a first scan)")
+    sc.add_argument("--jobs", "-j", type=int, metavar="N",
+                    help=f"parallelism budget (default {default_workers()} here: "
+                         f"{cpu_count()} core(s) less headroom, capped at 8). "
+                         "Spent on worker processes first, then on threads "
+                         "within a file when fewer files than workers remain")
+    sc.add_argument("--force", action="store_true",
+                    help="re-measure everything, including files that already "
+                         "have a current result")
+    sc.add_argument("--recheck", action="store_true",
+                    help="decide staleness by hashing each source file instead "
+                         "of trusting its size and modification time")
+    sc.add_argument("--dry-run", action="store_true",
+                    help="list what would be measured, and why, then stop")
+    sc.add_argument("--no-summary", action="store_true",
+                    help="skip rewriting summary.csv over the scanned subtree")
+    sc.add_argument("--profile", choices=("quick", "full"), default="full")
+    sc.add_argument("--plots", action="store_true")
+    sc.add_argument("--stems", action="store_true")
+    sc.add_argument("--json-only", action="store_true", help="skip digest.md")
+    _add_part_size_args(sc)
+    sc.set_defaults(func=cmd_scan)
 
     c = sub.add_parser("compare", help="level-matched comparison of two files")
     c.add_argument("file_a")

@@ -16,6 +16,7 @@ import numpy as np
 
 from . import SCHEMA_VERSION, __version__
 from .audio import AudioSource
+from .parallel import resolve_threads
 from .metrics import (dynamics as m_dynamics, fileinfo as m_fileinfo,
                       forensics as m_forensics, loudness as m_loudness,
                       processing as m_processing, spectrum as m_spectrum,
@@ -27,7 +28,23 @@ from .util import Collector, jsonable
 SEED = 0
 
 
+_VERSIONS_CACHE: dict[str, Any] | None = None
+
+
 def _versions() -> dict[str, Any]:
+    """The library and tool versions this run was produced by.
+
+    Cached for the life of the process.  Nothing here can change while a run is
+    in progress, and the two subprocess spawns it costs are charged once per
+    file otherwise -- which a scan pays several hundred times for one answer.
+    """
+    global _VERSIONS_CACHE
+    if _VERSIONS_CACHE is None:
+        _VERSIONS_CACHE = _probe_versions()
+    return dict(_VERSIONS_CACHE)
+
+
+def _probe_versions() -> dict[str, Any]:
     out: dict[str, Any] = {
         "python": sys.version.split()[0],
         "python_implementation": platform.python_implementation(),
@@ -107,8 +124,14 @@ def _headline(res: dict[str, Any]) -> dict[str, Any]:
 
 
 def analyze_file(path: str, profile: str = "full", want_stems: bool = False,
-                 log=None) -> dict[str, Any]:
-    """Run the full metric set over one file and return the result dictionary."""
+                 log=None, threads: int | None = None) -> dict[str, Any]:
+    """Run the full metric set over one file and return the result dictionary.
+
+    `threads` is how many threads the metrics inside this one file may use.
+    `None` means "decide from the machine", which is what a single-file run
+    wants; `mtx scan` passes 1 because it is already running one process per
+    file and the two layers must not multiply.
+    """
     random.seed(SEED)
     np.random.seed(SEED)
     t_start = time.time()
@@ -129,7 +152,7 @@ def analyze_file(path: str, profile: str = "full", want_stems: bool = False,
             log(f"{name} ...")
 
     step("decoding")
-    src = AudioSource(path, collector)
+    src = AudioSource(path, collector, threads=resolve_threads(threads))
     if src.duration < 10.0:
         collector.warn("audio", f"file is {src.duration:.3f} s long; metrics that need "
                                 "3 s or 10 s windows degrade or return null")
