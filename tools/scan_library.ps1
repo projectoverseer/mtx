@@ -69,6 +69,35 @@ function Get-FreeGB([string] $Path) {
     return [math]::Round((Get-PSDrive $qualifier).Free / 1GB, 1)
 }
 
+function Invoke-Native {
+    <#
+        Run a console program, show its output and log it, and report only a
+        real failure.
+
+        `mtx` writes its progress to stderr. Under PowerShell 5.1 a native
+        program's stderr arrives as ErrorRecord objects, and with
+        $ErrorActionPreference = "Stop" the very first progress line becomes a
+        terminating NativeCommandError -- so a perfectly healthy scan looks
+        like an immediate crash. Preference is dropped to Continue for the
+        call, each record is flattened to a string so it logs and prints as
+        ordinary text, and the exit code is the only thing trusted to say
+        whether the program actually failed.
+    #>
+    param([string] $Exe, [string[]] $Arguments, [string] $LogFile)
+
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $Exe @Arguments 2>&1 |
+            ForEach-Object { "$_" } |
+            Tee-Object -FilePath $LogFile -Append |
+            Out-Host
+        return $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+}
+
 # -LiteralPath throughout: PowerShell reads [ and ] in a -Path as a wildcard
 # class, and album folders are full of them ("Play (Deluxe) [E]"). A -Path here
 # silently matches nothing and the artist is skipped with no error at all.
@@ -98,21 +127,18 @@ foreach ($artist in $artists) {
     $n++
 
     Write-Log ("=== [{0}/{1}] {2}  ({3} GB free)" -f $n, $artists.Count, $artist.Name, $free)
-    try {
-        & $mtx scan $artist.FullName --profile full --stems -j $Jobs 2>&1 |
-            Tee-Object -FilePath $log -Append | Out-Host
-        if ($LASTEXITCODE -ne 0) {
-            Write-Log ("mtx exited {0} on {1}; continuing" -f $LASTEXITCODE, $artist.Name)
-        }
-    } catch {
-        Write-Log ("FAILED on {0}: {1}" -f $artist.Name, $_.Exception.Message)
+    $code = Invoke-Native -Exe $mtx -LogFile $log -Arguments @(
+        "scan", $artist.FullName, "--profile", "full", "--stems", "-j", "$Jobs")
+    if ($code -ne 0) {
+        Write-Log ("mtx exited {0} on {1}; continuing to the next artist" -f `
+            $code, $artist.Name)
     }
 
     if (-not $KeepStems) {
         # Only entries whose track already has a corpus row are removed, so an
         # interrupted artist keeps the separations it has not yet measured.
-        & $python $pruner $outDir --apply 2>&1 |
-            Tee-Object -FilePath $log -Append | Out-Host
+        $null = Invoke-Native -Exe $python -LogFile $log -Arguments @(
+            $pruner, $outDir, "--apply")
     }
 }
 
