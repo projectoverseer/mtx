@@ -16,7 +16,7 @@ The short version, for anyone who only wants the conclusion:
 
 ## The bench
 
-| | |
+| component | |
 |---|---|
 | CPU | Intel i7-9750H, **6 physical / 12 logical**, base 2.6 GHz, 45 W mobile |
 | RAM | 31.7 GB |
@@ -229,12 +229,44 @@ Storage matters as much as time at that scale, and neither number is small:
 - **Output** ~17 MB a track → ~1.7 TB per 100 000.
 - **Stem cache** ~165 MB a track → **~15 TB** if nothing is ever evicted.
 
-The stem cache is never pruned after a track is measured. At library scale it
-is not a cache, it is an unbounded write. `separate_first()` also separates the
-*entire* todo list before a single measurement is taken, so a cold 100 000-track
-run would try to materialise all 15 TB up front. **Bounding and evicting the
-stem cache is a prerequisite for any run of this size**, and is a larger
-problem than any throughput tuning in this document.
+### The stem cache is the binding constraint, and it bites long before 100 000
+
+This is not a scale-out worry to be handled later. On the bench library:
+
+| quantity | |
+|---|---|
+| tracks | 1 274 |
+| stem cache if all are separated | **210.2 GB** |
+| output | 21.7 GB |
+| free disk | **63.7 GB** |
+
+**A single `mtx scan E:\Music --stems` cannot complete.** It would separate its
+way to a full disk somewhere around a third of the way in and die, having
+written measurements for none of the tracks it had already separated, because
+`separate_first()` completes the entire todo list before the pool measures
+anything.
+
+Two independent defects combine to produce that:
+
+1. **Separation is unbounded and up front.** The whole todo list is separated
+   before a single measurement, so peak cache is the size of the *run*, not of
+   any working set.
+2. **Nothing is ever evicted.** A track's stems are dead weight the moment its
+   `corpus_row.json` is written, and they stay on disk forever.
+
+The fix in the code is to overlap the phases (which caps in-flight separations
+at the stream count) and evict a track's stems once it is measured. Until then,
+`tools/scan_library.ps1` works around it from outside: it scans one artist at a
+time and runs `tools/prune_stems.py` between artists, so peak cache is the
+largest single artist — 137 tracks, ~22.6 GB on this library — rather than all
+1 274. Both are resumable, because `mtx scan` already skips tracks that have a
+receipt.
+
+`prune_stems.py` reads the sha256 in each `mtx_source.json` receipt, which is
+the same hash the cache key is the first 24 characters of, so it never has to
+touch the audio. It requires a `corpus_row.json` beside the receipt before it
+will delete anything — a run interrupted between writing the two must not lose
+stems for a track that still has to be measured.
 
 ---
 
