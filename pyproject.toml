@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mtx"
-version = "0.3.0"
+version = "0.4.0"
 description = "Master extractor: an exhaustive, reproducible measurement dump for lossless audio files. Measures; never interprets."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -29,6 +29,14 @@ dependencies = [
 [project.optional-dependencies]
 plots = ["matplotlib>=3.7"]
 stems = ["demucs>=4.0"]
+# Tabular export at track and track x section level; CSV always works without it.
+export = ["pyarrow>=14.0"]
+# A lyric valence arc needs a lexicon, and mtx ships none.
+sentiment = ["vaderSentiment>=3.3"]
+# A time-aligned lyric from the vocal stem. Heavy, and network-free once pulled.
+transcribe = ["whisper-timestamped>=1.14"]
+# One embedding vector per track, for nearest-neighbour search in `mtx cohort`.
+embedding = ["laion-clap>=1.1"]
 dev = ["pytest>=7.0", "matplotlib>=3.7"]
 
 [project.scripts]

@@ -310,7 +310,8 @@ def _sha256(path: str, chunk: int = 1 << 20) -> str:
 
 
 def why_stale(source: str, out_dir: str, profile: str, stems: bool,
-              recheck: bool = False) -> str | None:
+              recheck: bool = False,
+              stems_model: str | None = None) -> str | None:
     """None when the existing result still stands; otherwise the reason it does not."""
     led = read_ledger(out_dir)
     if led is None:
@@ -324,6 +325,9 @@ def why_stale(source: str, out_dir: str, profile: str, stems: bool,
         return f"profile {run.get('profile')} -> {profile}"
     if bool(run.get("stems")) != bool(stems):
         return "stems setting changed"
+    if stems and run.get("stems_model") and stems_model and \
+            run["stems_model"] != stems_model:
+        return f"stems model changed ({run['stems_model']} -> {stems_model})"
     old = led.get("source") or {}
     try:
         now = source_stat(source)
@@ -352,6 +356,8 @@ def write_ledger(out_dir: str, source: str, profile: str, stems: bool,
         "run": {
             "profile": profile,
             "stems": bool(stems),
+            "stems_model": (res.get("run") or {}).get("stems_model")
+            if isinstance(res, dict) else None,
             "tool_version": __version__,
             "schema_version": SCHEMA_VERSION,
             "elapsed_seconds": round(elapsed, 3),
@@ -383,7 +389,10 @@ def analyse_one(job: dict[str, Any]) -> dict[str, Any]:
         from .analyze import analyze_file, write_outputs
 
         res = analyze_file(source, profile=job["profile"],
-                           want_stems=job["stems"], threads=job["threads"])
+                           want_stems=job["stems"], threads=job["threads"],
+                           stems_model=job.get("stems_model"),
+                           want_transcript=bool(job.get("transcribe")),
+                           want_embedding=bool(job.get("embed")))
         # From here the folder's existing contents start being overwritten, so
         # the receipt for them stops being true.  Drop it first: a run that
         # dies midway through writing should leave the track looking stale,
@@ -502,7 +511,8 @@ def run_scan(scan_path: str, *, out: str | None = None,
              library_root: str | None = None, profile: str = "full",
              jobs: int | None = None, force: bool = False,
              recheck: bool = False, stems: bool = False, plots: bool = False,
-             json_only: bool = False,
+             json_only: bool = False, stems_model: str | None = None,
+             transcribe: bool = False, embed: bool = False,
              max_part_bytes: int | None = DEFAULT_PART_BYTES,
              dry_run: bool = False, no_summary: bool = False,
              registry: str | None = None, log=print) -> dict[str, Any]:
@@ -536,7 +546,8 @@ def run_scan(scan_path: str, *, out: str | None = None,
     todo: list[tuple[str, str, str]] = []
     skipped = 0
     for src, odir in pairs:
-        reason = "forced" if force else why_stale(src, odir, profile, stems, recheck)
+        reason = ("forced" if force
+                  else why_stale(src, odir, profile, stems, recheck, stems_model))
         if reason is None:
             skipped += 1
         else:
@@ -567,6 +578,8 @@ def run_scan(scan_path: str, *, out: str | None = None,
 
     jobs_list = [{"source": src, "out_dir": odir, "profile": profile,
                   "stems": stems, "plots": plots, "json_only": json_only,
+                  "stems_model": stems_model, "transcribe": transcribe,
+                  "embed": embed,
                   "max_part_bytes": max_part_bytes, "threads": threads}
                  for src, odir, _ in todo]
     for j in jobs_list:

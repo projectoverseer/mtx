@@ -510,6 +510,105 @@ Convention, stated in the output as well: `mid = (L+R)/2`, `side = (L-R)/2`.
 | `reverb` | s, dB | Schroeder reverse integration after strong onsets, per octave band: T20, T30, early-to-late, tail L/R correlation | `reverb` |
 | `transient_density` | per s | per-band envelope rises of 6 dB within 20 ms | — |
 
+### Harmony (`harmony`)
+
+The chord track. Not a learned model: binary chord-tone templates matched by
+Pearson correlation against beat-synchronous chroma, smoothed by a Viterbi pass
+with one self-transition probability, so every number is reproducible from
+`params.harmony` alone and adds no dependency.
+
+| Metric | Unit | Method | Parameter |
+| --- | --- | --- | --- |
+| `chords[]` | s | 13 qualities x 12 roots plus a no-chord state, merged into segments with a per-segment match score | `harmony` |
+| `chords[].inversion`, `slash_label` | — | the chord root against a low-register (C1, two-octave) chroma | — |
+| `harmonic_rhythm` | per bar, per s | chord changes, with the caveat that a bar comes from `structure.tempo` | — |
+| `degrees` | % | roman-numeral reduction against `structure.key`; diatonic vs borrowed chord time | — |
+| `loop` | bars | shortest period in 1/2/4/8/16 bars whose chord sets repeat above the threshold | `loop_candidate_bars` |
+| `cadences` | count | V-I, IV-I, V-vi, I-V degree transitions | `cadence_degrees` |
+| `pedal_points[]` | s | the bass note holds while the chord root moves | `pedal_min_chords` |
+| `modulation` | — | sliding-window Krumhansl-Schmuckler; always `confidence: low` | `modulation` |
+| `key_from_chords` | — | the key whose scale explains the most chord time, plus tonic evidence | `key_from_chords` |
+| `key_cross_check` | — | the chord-track key against `structure.key`; a disagreement is a FLAG | — |
+
+**Measured accuracy.** Against seven published, human-transcribed chord charts
+the recogniser spends **82% of chord time** on a chord whose root and triad
+quality appear in the chart (86% at root level). `key_from_chords` got **4 of 7**
+published keys; `structure.key` got 5 of 7 on the same tracks. So the chord
+track is a genuine second opinion on the key and not a better one, its failure
+mode is the relative major/minor, and the block says so with a confidence.
+
+### Rhythm (`rhythm`)
+
+A tempo is not a groove: without a downbeat there is no bar.
+
+| Metric | Unit | Method | Parameter |
+| --- | --- | --- | --- |
+| `downbeats` | — | meter and phase that maximise the mean downbeat accent, where accent is the z-scored sum of onset strength, 20–120 Hz energy and chroma change at each beat | `meters` |
+| `tempo_octave` | ratio | onset strength at the midpoints between beats, and the weaker of the two alternating beat phases | `octave_check` |
+| `swing` | ratio | median position of the off-beat onset nearest each beat midpoint; 0.5 is straight, 0.667 is a triplet shuffle | `swing` |
+| `grid.deviation` | ms | onset-to-nearest-grid distance at 5.8 ms onset resolution, with a programmed-grid inference | `grid_subdivision` |
+| `syncopation` | per bar | Longuet-Higgins & Lee weights over a 16-step bar | — |
+| `beat_position_profile` | dB | kick- and snare-band level per position in the bar; four-on-the-floor and backbeat are only claimed once a kick pattern exists | — |
+| `pulse_rate` | per beat | onsets per beat per section, and half/double-time switches | — |
+
+**A caveat the block reports on itself.** `structure.tempo` picks one metrical
+level, and on the seven reference tracks it reported half the published tempo
+once and double it once. `tempo_octave` measures the ambiguity but does not
+resolve it: on that set it raised no false alarm on the four correct tempos and
+detected none of the three wrong ones, because the classes overlap. Read the
+two ratios, and read `bar_count` and `changes_per_bar` knowing what they are
+divided by.
+
+### Song form (`form`)
+
+Two stages, kept apart. Sections are clustered into **letters** by cosine
+distance over their measured vectors and consecutive same-letter sections are
+merged into **parts** — that is the measurement. Function names (verse, chorus,
+bridge) are an **inference** over it by the rules in `params.form`, and every
+label carries the evidence that produced it and a confidence.
+
+Gives what people actually ask a record: time to the first chorus in seconds
+and as a fraction, intro length, time to vocal entry, chorus count and share,
+whether the second chorus is arranged up from the first, ending type, and
+loopability. An optional `allin1` model is reported beside the measurement,
+never merged into it.
+
+### Delivery conditions (`delivery`)
+
+What the master does once it is distributed — all local, all offline, and one
+of the two things an unfinished mix can actually use.
+
+| Metric | Unit | Method | Parameter |
+| --- | --- | --- | --- |
+| `encode` | LUFS, dBTP, dB | ffmpeg encode to AAC 256 and Opus 128, decoded back and re-measured; new true-peak overs and HF damage | `encodes` |
+| `small_speaker` | %, LU | what survives a 400 Hz – 8 kHz band-pass | `small_speaker_band_hz` |
+| `mono_fold` | LU, dB | the mono sum, loudness-weighted and per octave | — |
+| `excerpts` | LUFS, dBTP | the first 15 s, the first 30 s, and the chorus as a 15 s clip | `excerpt_s` |
+
+### Lyrics (`lyrics`)
+
+A **declared** lyric beats a **tag** beats a **transcript**, and the source
+travels with the text. Language is detected before anything English-specific
+runs: the syllable counter and the readability score decline rather than
+produce a meaningless number. Shape (counts, type-token ratio, repetition,
+compression ratio, longest and most repeated n-gram, pronouns, title
+occurrences) is measured; valence and concreteness need a lexicon that does not
+ship with mtx and report `available: false` with what to install.
+
+### Declared metadata (`declared`) and version identity (`version`)
+
+For your own unreleased work the splits, the publisher and the lyric are not
+missing — they are unentered. A `declared.json` sidecar supplies them, and every
+value is reported with `source: "declared"` and never merged into a measured
+field or into `online.*`. Version identity is derived from tags alone: two files
+that agree on `work_key` and differ on `markers` are two versions of one song.
+
+### Coverage (`coverage`)
+
+One uniform mask over the whole document: which of the N features are present,
+and how far each is trusted, so a consumer does not have to rediscover that by
+walking the document itself.
+
 ### Stems (`stems`, only with `--stems`, rendered as `## STEMS` in the digest)
 
 `demucs` (htdemucs, 4 stems) runs locally and the loudness, dynamics, spectrum
@@ -517,7 +616,70 @@ and stereo metric sets are computed on each stem, plus its level relative to the
 mix in dB and LUFS. Separated stems are cached under `~/.cache/mtx/stems` so
 re-runs are cheap. Every stem-derived number carries `source: "separated"`,
 because separation artefacts are real and a stem measurement is not a mix
-measurement.
+measurement. `--stems-model htdemucs_6s` splits guitar and piano out of `other`
+at no new dependency.
+
+Separation is also the gate on four measurements that only exist once there is
+more than one signal, all computed from a single load of the stems:
+
+- **`masking`** — every other stem number in this tool is measured in isolation
+  or against the mix. This measures each stem *against another stem*, which is
+  the whole of mix engineering: a per-band masking matrix, spectral overlap per
+  pair, masking release across sections, and the vocal-to-instrumental balance
+  per section. Plus, from the vocal stem alone: sibilance behaviour as a dB/dB
+  slope (de-esser evidence), the high-pass corner, reverb send and pre-delay,
+  and tempo-synced delay throws.
+- **`melody`** — `librosa.pyin` on the vocal and bass stems. Read
+  `range.p5_p95_semitones`: checked against two published vocal ranges the
+  duration-weighted percentiles landed within a semitone of both, while the raw
+  extremes came out 40–58 semitones wide, because a monophonic tracker on a
+  separated stem makes octave errors on 7–12% of note time and one of them sets
+  the maximum. Those outliers are counted and reported rather than hidden.
+  Also intervals, phrases, vibrato, chromaticism, contour per section,
+  sung-vs-rapped, and a **pitch-quantisation signature** — grid deviation and
+  note-to-note transition time, reported as forensics and never as a verdict
+  about a singer.
+- **`arrangement`** — entry and exit per stem in seconds and bars, concurrent
+  source count over time, drum-machine evidence, 808 behaviour and glide,
+  vocal stacking, lead-versus-backing balance and call-and-response.
+- **`microtiming`** — "the drums are dragging" as the median onset deviation
+  from the beat grid, per stem. Read `median_minus_common_mode_ms`: the beat
+  tracker and the onset detector each carry a constant lag which is identical
+  for every stem and cancels between them.
+
+---
+
+## `cohort` — where a track sits among comparable records
+
+`-7.77 LUFS` means nothing on its own. `mtx cohort <folder>` reads a folder of
+analysed folders and writes `cohort.json` and `cohort.md` **beside** them: per
+metric, the percentile and z-score within a `(genre, year)` cohort, within the
+whole corpus and within the same artist's other tracks, plus a distance to the
+cohort centroid and nearest neighbours.
+
+**It is deliberately not part of `analyze`.** A per-track measurement must not
+depend on what else happens to be in the folder — that would break
+reproducibility, which is property one. The absolute numbers are never touched.
+
+Cohort labels come from `enrich` for published records and from a declared
+sidecar for an unreleased one, which is the useful direction: a mix in progress
+can be positioned against the released records it is competing with, provided
+you state what it should be compared to. The most specific cohort with enough
+members wins, and the fallback is recorded.
+
+The **corpus hygiene** report is part of the output, not a footnote: it names a
+corpus too small or too dominated by one artist for its percentiles to mean
+anything. `typicality.mean_abs_z` is a distance from the cohort centre, not a
+rating.
+
+## `export` — flat tables at track and section level
+
+`mtx export <folder>` writes `mtx_tracks.csv` (one row per track, every scalar
+under its dotted path) and `mtx_sections.csv` (one row per track x section,
+joining the measured section vector to the form label, the per-section masking
+indices, pulse rate, melodic contour and arrangement density). Parquet too,
+when `pyarrow` is installed. The per-section vectors are the most valuable part
+of the dump and were previously the hardest to get at.
 
 ---
 

@@ -200,7 +200,7 @@ def cmd_enrich(args: argparse.Namespace) -> int:
     section whose content depends on what MusicBrainz looked like this morning
     cannot live inside that promise.
     """
-    from .online import ALL_PROVIDERS, DEFAULT_PROVIDERS, KEYED_PROVIDERS, enrich
+    from .online import ALL_PROVIDERS, KEYED_PROVIDERS, enrich
     from .split import load_analysis
 
     if not os.path.exists(args.path):
@@ -294,7 +294,11 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     t0 = time.time()
     res = analyze_file(args.file, profile=args.profile, want_stems=args.stems,
                        log=lambda s: _log(f"  {s}"),
-                       threads=getattr(args, "jobs", None))
+                       threads=getattr(args, "jobs", None),
+                       stems_model=getattr(args, "stems_model", None),
+                       declared_path=getattr(args, "declared", None),
+                       want_transcript=bool(getattr(args, "transcribe", False)),
+                       want_embedding=bool(getattr(args, "embed", False)))
     out_dir = args.out if args.out and args.single_out else _default_out(args.out, args.file, res)
     written = write_outputs(res, out_dir, json_only=args.json_only,
                             plots=args.plots, src_path=args.file,
@@ -389,7 +393,10 @@ def cmd_batch(args: argparse.Namespace) -> int:
         _log(f"[{i}/{len(files)}] {os.path.basename(path)}")
         try:
             res = analyze_file(path, profile=args.profile, want_stems=args.stems,
-                               log=lambda s: _log(f"  {s}"))
+                               log=lambda s: _log(f"  {s}"),
+                               stems_model=getattr(args, "stems_model", None),
+                               want_transcript=bool(getattr(args, "transcribe", False)),
+                               want_embedding=bool(getattr(args, "embed", False)))
         except Exception as exc:
             failures += 1
             _log(f"  failed: {exc!r}")
@@ -446,6 +453,9 @@ def cmd_scan(args: argparse.Namespace) -> int:
             profile=args.profile, jobs=args.jobs, force=args.force,
             recheck=args.recheck, stems=args.stems, plots=args.plots,
             json_only=args.json_only, max_part_bytes=parse_part_size(args),
+            stems_model=getattr(args, "stems_model", None),
+            transcribe=bool(getattr(args, "transcribe", False)),
+            embed=bool(getattr(args, "embed", False)),
             dry_run=args.dry_run, no_summary=args.no_summary, log=_log)
     except NoRootRegistered as exc:
         _log(f"error: {exc}")
@@ -549,6 +559,70 @@ def cmd_validate_dr(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_cohort(args: argparse.Namespace) -> int:
+    """Where each track sits among comparable records.
+
+    A separate command over a separate file, on purpose: a per-track
+    measurement must not change because of what else is in the folder.
+    """
+    from .cohort import build, render
+
+    if not os.path.exists(args.path):
+        _log(f"error: no such file or directory: {args.path}")
+        return 1
+    try:
+        doc = build(args.path, neighbours=args.neighbours, log=_log)
+    except ValueError as exc:
+        _log(f"error: {exc}")
+        return 1
+    out_dir = args.out or (args.path if os.path.isdir(args.path) else ".")
+    os.makedirs(out_dir, exist_ok=True)
+    from .util import jsonable
+    j = os.path.join(out_dir, "cohort.json")
+    with open(j, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(jsonable(doc), f, indent=1, sort_keys=True, ensure_ascii=False,
+                  allow_nan=False)
+        f.write("\n")
+    m = os.path.join(out_dir, "cohort.md")
+    with open(m, "w", encoding="utf-8", newline="\n") as f:
+        f.write(render(doc))
+    h = doc["hygiene"]
+    _log(f"{h['tracks']} track(s), {h['distinct_artists']} artist(s), "
+         f"{len(doc['cohorts'])} cohort(s)")
+    for problem in h["problems"]:
+        _log(f"  corpus hygiene: {problem}")
+    _log(f"  cohort.json: {j}")
+    _log(f"  cohort.md: {m}")
+    print(out_dir)
+    return 0
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    """Flat tables at track and track x section level."""
+    from .export import export
+
+    if not os.path.exists(args.path):
+        _log(f"error: no such file or directory: {args.path}")
+        return 1
+    out_dir = args.out or (args.path if os.path.isdir(args.path) else ".")
+    try:
+        stats = export(args.path, out_dir, level=args.level, fmt=args.format,
+                       log=_log)
+    except ValueError as exc:
+        _log(f"error: {exc}")
+        return 1
+    _log(f"{stats['analyses_found']} analysis file(s): "
+         f"{stats['tracks']} track row(s) x {stats['track_columns']} column(s), "
+         f"{stats['section_rows']} section row(s) x "
+         f"{stats['section_columns']} column(s)")
+    for name, path in stats["written"].items():
+        _log(f"  {name}: {path}")
+    for fail in stats["failed"]:
+        _log(f"  failed: {fail}")
+    print(out_dir)
+    return 0
+
+
 def cmd_selftest(args: argparse.Namespace) -> int:
     from .selftest import run_selftest
     return run_selftest(verbose=not args.quiet)
@@ -571,6 +645,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="write directly into --out instead of --out/<basename>/")
     a.add_argument("--profile", choices=("quick", "full"), default="full")
     a.add_argument("--plots", action="store_true", help="also write plots/*.png")
+    a.add_argument("--stems-model", metavar="NAME",
+                   help="demucs model to separate with (default htdemucs); "
+                        "htdemucs_6s splits guitar and piano out of `other`")
+    a.add_argument("--declared", metavar="FILE",
+                   help="a declared.json sidecar; its values are reported with "
+                        "source=declared and never merged into a measured field")
+    a.add_argument("--transcribe", action="store_true",
+                   help="transcribe the vocal stem for a time-aligned lyric "
+                        "(optional backend, needs --stems)")
+    a.add_argument("--embed", action="store_true",
+                   help="compute a learned embedding vector (optional backend)")
     a.add_argument("--stems", action="store_true",
                    help="separate stems with demucs and measure each")
     a.add_argument("--json-only", action="store_true", help="skip digest.md")
@@ -600,6 +685,9 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--profile", choices=("quick", "full"), default="full")
     b.add_argument("--plots", action="store_true")
     b.add_argument("--stems", action="store_true")
+    b.add_argument("--stems-model", metavar="NAME")
+    b.add_argument("--transcribe", action="store_true")
+    b.add_argument("--embed", action="store_true")
     b.add_argument("--json-only", action="store_true")
     b.add_argument("--csv-schema", choices=("internal", "corpus", "masters"),
                    default="internal",
@@ -639,6 +727,14 @@ def build_parser() -> argparse.ArgumentParser:
     sc.add_argument("--profile", choices=("quick", "full"), default="full")
     sc.add_argument("--plots", action="store_true")
     sc.add_argument("--stems", action="store_true")
+    sc.add_argument("--stems-model", metavar="NAME",
+                    help="demucs model (default htdemucs); htdemucs_6s splits "
+                         "guitar and piano out of `other`")
+    sc.add_argument("--transcribe", action="store_true",
+                    help="transcribe the vocal stem for a time-aligned lyric "
+                         "(optional backend, needs --stems)")
+    sc.add_argument("--embed", action="store_true",
+                    help="compute a learned embedding vector (optional backend)")
     sc.add_argument("--json-only", action="store_true", help="skip digest.md")
     _add_part_size_args(sc)
     sc.set_defaults(func=cmd_scan)
@@ -703,6 +799,25 @@ def build_parser() -> argparse.ArgumentParser:
                                    "MTX_DR14_VALIDATION overrides)")
     v.add_argument("--show", action="store_true", help="print the record and exit")
     v.set_defaults(func=cmd_validate_dr)
+
+    ch = sub.add_parser("cohort",
+                        help="where each track sits among comparable records")
+    ch.add_argument("path", help="a folder of analysed folders")
+    ch.add_argument("--out", metavar="DIR",
+                    help="where cohort.json and cohort.md go (default: PATH)")
+    ch.add_argument("--neighbours", type=int, default=5, metavar="N",
+                    help="nearest neighbours per track (0 to skip)")
+    ch.set_defaults(func=cmd_cohort)
+
+    ex = sub.add_parser("export",
+                        help="flat track and track x section tables over a "
+                             "folder of analyses")
+    ex.add_argument("path", help="a folder of analysed folders")
+    ex.add_argument("--out", metavar="DIR", help="output directory (default: PATH)")
+    ex.add_argument("--level", choices=("track", "section", "both"), default="both")
+    ex.add_argument("--format", choices=("csv", "parquet", "both"), default="csv",
+                    help="parquet needs pyarrow; CSV is always written")
+    ex.set_defaults(func=cmd_export)
 
     s = sub.add_parser("selftest", help="synthetic signals with known answers")
     s.add_argument("--quiet", action="store_true")

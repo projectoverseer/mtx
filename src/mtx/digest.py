@@ -21,6 +21,11 @@ import numpy as np
 
 SIZE_BUDGET_BYTES = 12 * 1024
 STEMS_BUDGET_BONUS = 4 * 1024
+# The musical half of the tool -- chords, groove, form -- exists nowhere else
+# in the paste-able output, for the same reason the stem table does not: a
+# block that is always dropped to protect a byte count may as well not have
+# been measured.  Granted only when there is something to spend it on.
+MUSIC_BUDGET_BONUS = 4 * 1024
 
 # Redaction marker used by the prediction sheet.  Wide enough to write in.
 BLANK = "____"
@@ -212,6 +217,42 @@ def _headline(res: dict[str, Any]) -> str:
         ("Sections", n(h["section_count"], 0)),
         ("Duration", n(h["duration_s"], 3) + " s"),
     ]
+    # The musical rows are appended only where they exist, so a quick profile
+    # or a file with no beat grid does not pay for a column of "n/a".
+    musical = [
+        ("Meter", (f"{h['beats_per_bar']}/4, {n(h.get('bar_count'), 0)} bars"
+                   if h.get("beats_per_bar") else None)),
+        ("Swing ratio", (n(h.get("swing_ratio"), 2) if h.get("swing_ratio") else None)),
+        ("Grid deviation", (n(h.get("grid_deviation_std_ms"), 1) + " ms sd"
+                            if h.get("grid_deviation_std_ms") is not None else None)),
+        ("Syncopation", (n(h.get("syncopation_per_bar"), 2) + " per bar"
+                         if h.get("syncopation_per_bar") is not None else None)),
+        ("Chords", (f"{h.get('chord_count')} ({h.get('distinct_chords')} distinct), "
+                    f"{n(h.get('chord_changes_per_bar'), 2)} per bar"
+                    if h.get("chord_count") else None)),
+        ("Diatonic", (n(h.get("diatonic_time_pct"), 1) + " % of chord time"
+                      if h.get("diatonic_time_pct") is not None else None)),
+        ("Key from chords", h.get("key_from_chords")),
+        ("Form", h.get("form_letters")),
+        ("Chorus", (f"{h.get('chorus_count')} x, "
+                    f"{n(h.get('chorus_share_pct'), 1)} % of the track"
+                    if h.get("chorus_count") else None)),
+        ("To first chorus", (n(h.get("time_to_first_chorus_s"), 1) + " s"
+                             if h.get("time_to_first_chorus_s") is not None else None)),
+        ("To vocal entry", (n(h.get("time_to_vocal_entry_s"), 1) + " s"
+                            if h.get("time_to_vocal_entry_s") is not None else None)),
+        ("Vocal range", (f"{h.get('vocal_p5_note')}-{h.get('vocal_p95_note')} "
+                         f"({n(h.get('vocal_range_p5_p95_semitones'), 1)} "
+                         f"semitones p5-p95), median {h.get('vocal_median_note')}"
+                         if h.get("vocal_range_p5_p95_semitones") is not None else None)),
+        ("Notes per second", (n(h.get("vocal_notes_per_second"), 2)
+                              if h.get("vocal_notes_per_second") is not None else None)),
+        ("Concurrent sources", (n(h.get("concurrent_sources_mean"), 2)
+                                if h.get("concurrent_sources_mean") is not None else None)),
+        ("Lyric", (f"{h.get('lyric_word_count')} words ({h.get('lyric_source')})"
+                   if h.get("lyric_word_count") else None)),
+    ]
+    pairs += [(k, v) for k, v in musical if v]
     return "## HEADLINE\n\n```\n" + kv_rows(pairs) + "\n```\n"
 
 
@@ -822,6 +863,19 @@ def corpus_row_dict(res: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+MUSIC_METHOD_LINES = [
+    "Chords: binary chord-tone templates (13 qualities x 12 roots plus no-chord) matched by cosine against beat-synchronous chroma-CQT, smoothed by a Viterbi pass with one self-transition probability. No learned model, so the chord track is reproducible from params.harmony alone. Confidence is the mean template match.",
+    "Key cross-check: the chord track implies its own key by a duration-weighted chord-tone histogram against Krumhansl-Schmuckler. Where it disagrees with structure.key (the mean-chroma estimate) the disagreement is in FLAGS.",
+    "Downbeats and meter: beats per bar and phase are the pair that maximises the mean downbeat accent, where accent is the z-scored sum of onset strength, 20-120 Hz energy and chroma change at each beat. The margin over the next meter is reported; it is what the confidence is derived from.",
+    "Microtiming: onsets are re-detected at hop 128 (5.8 ms) and measured against the subdivided beat grid. The beat tracker and the onset detector each carry a constant lag, so read median_minus_common_mode_ms -- the differences between stems, where that offset cancels.",
+    "Form: sections are clustered into letters by cosine distance over their measured vectors, then runs of the same letter are merged into parts. That is the measurement. Function names (verse, chorus, bridge) are an inference over that measurement by the rules in params.form, and every label carries its evidence and a confidence.",
+    "Melody: librosa.pyin on the separated vocal stem, segmented into notes with hysteresis. Pitch-quantisation is forensics, not a judgement about a singer: it reports the deviation from the semitone grid and the note-to-note transition time, and the inference is labelled as one.",
+    "Inter-stem masking: per third-octave band energies per stem, and for each ordered pair the masker's level inside the target's own energy distribution, in dB. Nothing here is a verdict; a positive number means the masker carries more energy where the target lives.",
+    "Delivery conditions: the file is encoded by ffmpeg to AAC 256 and Opus 128, decoded back and re-measured, so a true-peak over introduced by the encode is visible before release. The band-pass, mono fold and excerpts are the same measurement over a filtered or sliced signal.",
+    "Declared metadata: a declared.json sidecar is passed through with source=declared and is never merged into a measured field or into online.*.",
+    "Cohort position is not in this file. It is `mtx cohort` over a folder, into a separate file: a per-track measurement must not change because of what else is beside it.",
+]
+
 METHOD_LINES = [
     "LUFS-I/LRA: ITU-R BS.1770-4 K-weighting, 400 ms blocks 75% overlap, gates -70 LUFS / -10 LU; LRA on 3 s blocks, gates -70 / -20 LU, P95-P10. Cross-checked against ffmpeg ebur128 (tolerance 0.2 LU).",
     "True peak: scipy.signal.resample_poly (Kaiser beta 5.0) at 4x and 16x, both reported; overs counted as contiguous excursions at 16x.",
@@ -866,7 +920,330 @@ def _method(res: dict[str, Any]) -> str:
         note = ("NOT validated against a published DR rating "
                 "(see loudness.dr14.validation).")
     lines = [ln.replace("{dr14_validation}", note) for ln in METHOD_LINES]
+    # The musical method lines only appear on a run that produced any of it.
+    if any((res.get(k) or {}).get("available")
+           for k in ("harmony", "form", "rhythm", "delivery")):
+        lines = lines + MUSIC_METHOD_LINES
     return "## METHOD\n\n" + "\n".join(f"- {ln}" for ln in lines) + "\n"
+
+
+def _block_harmony(res: dict[str, Any]) -> str:
+    H = res.get("harmony", {})
+    if not H.get("available"):
+        return ""
+    v = H.get("vocabulary") or {}
+    hr = H.get("harmonic_rhythm") or {}
+    dg = H.get("degrees") or {}
+    lp = (H.get("loop") or {}).get("loop") or {}
+    cad = (H.get("cadences") or {}).get("counts") or {}
+    xc = H.get("key_cross_check") or {}
+    prog = H.get("progression") or []
+    lines = [
+        f"chords {H.get('chord_count')} in {v.get('distinct_chords')} shapes, "
+        f"entropy {n(v.get('entropy_bits'), 2)} bits; "
+        f"match {n(H.get('mean_template_match'), 3)} [{H.get('confidence')}]",
+        f"harmonic rhythm {n(hr.get('changes_per_bar'), 2)} changes/bar, "
+        f"median {n(hr.get('median_duration_beats'), 1)} beats/chord",
+    ]
+    if dg.get("available"):
+        lines.append(f"against {dg.get('key_used')}: "
+                     f"{n(dg.get('diatonic_time_pct'), 1)}% diatonic, "
+                     f"{n(dg.get('borrowed_time_pct'), 1)}% borrowed")
+    if lp:
+        lines.append(f"loop {lp.get('bars')} bars "
+                     f"({n(100 * (lp.get('match_fraction') or 0), 0)}% of bars repeat)")
+    if any(cad.values()):
+        lines.append("cadences " + ", ".join(f"{k} {v2}" for k, v2 in cad.items() if v2))
+    if H.get("pedal_points"):
+        lines.append(f"{len(H['pedal_points'])} pedal point(s)")
+    mod = H.get("modulation") or {}
+    if mod.get("change_count"):
+        lines.append(f"{mod['change_count']} windowed key change(s) [low]")
+    if xc:
+        lines.append(f"key cross-check: chroma {xc.get('chroma_key')} vs chord "
+                     f"track {xc.get('chord_track_key')} -> "
+                     f"{'agree' if xc.get('agree') else 'DISAGREE'}")
+    lines.append("progression: " + " ".join(prog[:40])
+                 + (" ..." if len(prog) > 40 else ""))
+    return "### Harmony\n\n```\n" + "\n".join(lines) + "\n```\n"
+
+
+def _block_groove(res: dict[str, Any]) -> str:
+    R = res.get("rhythm", {})
+    if not R.get("available"):
+        return ""
+    d = R.get("downbeats") or {}
+    sw = R.get("swing") or {}
+    g = (R.get("grid") or {}).get("deviation") or {}
+    gi = (R.get("grid") or {}).get("inference") or {}
+    sy = R.get("syncopation") or {}
+    bp = R.get("beat_position_profile") or {}
+    inf = bp.get("inference") or {}
+    pr = R.get("pulse_rate") or {}
+    lines = []
+    if d.get("available"):
+        lines.append(f"meter {d.get('time_signature')} over {d.get('bar_count')} bars, "
+                     f"accent contrast {n(d.get('downbeat_accent_contrast'), 3)}, "
+                     f"margin {n(d.get('meter_margin'), 3)} [{d.get('confidence')}]")
+    if sw.get("available"):
+        lines.append(f"off-beat at {n(sw.get('offbeat_position_median'), 3)} of the beat "
+                     f"(swing ratio {n(sw.get('swing_ratio'), 2)}; 0.5/1.00 is straight)")
+    if g.get("median_ms") is not None:
+        lines.append(f"grid deviation median {n(g.get('median_ms'), 1)} ms, "
+                     f"sd {n(g.get('std_ms'), 1)} ms, "
+                     f"{n(100 * (g.get('share_within_10ms') or 0), 0)}% within 10 ms "
+                     f"-> programmed grid: {gi.get('programmed_grid')}")
+    if sy.get("available"):
+        lines.append(f"syncopation {n(sy.get('mean_per_bar'), 2)} per bar "
+                     f"(LHL, max {n(sy.get('max_per_bar'), 0)})")
+    if bp.get("available") is not False and inf:
+        lines.append(f"four-on-the-floor {inf.get('four_on_the_floor')}, "
+                     f"backbeat {inf.get('backbeat_on_2_and_4')} "
+                     f"(kick on-vs-off beat {db(bp.get('kick_on_minus_off_beat_db'))} dB)")
+    if pr.get("available"):
+        lines.append(f"pulse-rate switches: {pr.get('switch_count')} "
+                     f"(track median {n(pr.get('track_median_onsets_per_beat'), 2)} onsets/beat)")
+    return "### Groove\n\n```\n" + "\n".join(lines) + "\n```\n" if lines else ""
+
+
+def _block_form(res: dict[str, Any]) -> str:
+    F = res.get("form", {})
+    if not F.get("available") or not F.get("parts"):
+        return ""
+    rows = []
+    for p in F["parts"][:16]:
+        rows.append([p.get("letter", ""), p.get("label", ""),
+                     n(p.get("start_s"), 1), n(p.get("duration_s"), 1),
+                     n(p.get("lufs_i"), 1),
+                     {True: "y", False: "n", None: "?"}[p.get("vocal_present")],
+                     p.get("label_confidence", "")])
+    lo = F.get("loopability") or {}
+    end = F.get("ending") or {}
+    tail = (f"\nletters {F.get('letters')}  |  chorus {F.get('chorus_count')}x, "
+            f"{n(F.get('chorus_share_pct'), 1)}% of the track"
+            f"\nto first chorus {n(F.get('time_to_first_chorus_s'), 1)} s "
+            f"({n(100 * (F.get('time_to_first_chorus_fraction') or 0), 0)}% in), "
+            f"vocal entry {n(F.get('time_to_vocal_entry_s'), 1)} s, "
+            f"intro {n(F.get('intro_length_s'), 1)} s"
+            f"\nending {end.get('type') or 'n/a'}; loopability cosine "
+            f"{n(lo.get('spectral_cosine'), 2)}, level delta "
+            f"{db(lo.get('level_delta_db'))} dB"
+            "\nlabels are an inference over measured evidence; the letters are the "
+            "measurement")
+    extra = len(F["parts"]) - 16
+    if extra > 0:
+        tail += f"\n(+{extra} further parts in analysis.json)"
+    return ("### Form\n\n```\n"
+            + table(["", "label", "start", "dur", "LUFS", "voc", "conf"], rows)
+            + tail + "\n```\n")
+
+
+def _block_masking(res: dict[str, Any]) -> str:
+    M = (res.get("stems") or {}).get("masking") or {}
+    if not M.get("available"):
+        return ""
+    names = M.get("stems_compared") or []
+    rows = []
+    for target in names:
+        cells = []
+        for masker in names:
+            if masker == target:
+                cells.append("-")
+                continue
+            hit = next((p for p in M["pairs"]
+                        if p["target"] == target and p["masker"] == masker), None)
+            cells.append(n(hit.get("masking_index_db") if hit else None, 1))
+        rows.append([target] + cells)
+    lines = [table(["target \\ masker"] + list(names), rows)]
+    lines.append("positive = the masker carries more energy than the target does, "
+                 "weighted by where the target lives")
+    v = M.get("vocal") or {}
+    sib = v.get("sibilance") or {}
+    hp = v.get("high_pass") or {}
+    rv = v.get("reverb") or {}
+    dt = (v.get("delay_throws") or {}).get("strongest") or {}
+    if sib.get("available"):
+        lines.append(f"vocal sibilance: {db(sib['ratio_db'].get('median'))} dB median "
+                     f"over 1-4k, slope {n(sib.get('regression_slope_db_per_db'), 2)} "
+                     f"dB/dB (R2 {n(sib.get('regression_r2'), 2)}) -> band "
+                     f"compression {sib['inference'].get('band_compression')}")
+    if hp.get("available"):
+        lines.append(f"vocal high-pass corner {hz(hp.get('corner_hz'))} Hz, "
+                     f"{n(hp.get('slope_below_corner_db_per_oct'), 1)} dB/oct below it")
+    if rv.get("pre_delay_ms") is not None:
+        lines.append(f"vocal reverb pre-delay {n(rv.get('pre_delay_ms'), 0)} ms "
+                     f"[{rv.get('confidence')}]")
+    if dt:
+        lines.append(f"strongest delay throw at {n(dt.get('subdivision_beats'), 2)} beat "
+                     f"({n(dt.get('lag_ms'), 0)} ms), excess "
+                     f"{n(dt.get('excess_over_baseline'), 3)} over its neighbourhood")
+    rel = M.get("masking_release") or {}
+    hot = [(k, r.get("range_db")) for k, r in rel.items() if r.get("range_db")]
+    if hot:
+        hot.sort(key=lambda kv: -kv[1])
+        lines.append("widest masking swing across sections: "
+                     + ", ".join(f"{k} {n(v2, 1)} dB" for k, v2 in hot[:3]))
+    return "### Inter-stem masking\n\n```\n" + "\n".join(lines) + "\n```\n"
+
+
+def _block_melody(res: dict[str, Any]) -> str:
+    M = ((res.get("stems") or {}).get("melody") or {}).get("vocals") or {}
+    if not M.get("available"):
+        return ""
+    rg = M.get("range") or {}
+    te = M.get("tessitura") or {}
+    iv = M.get("intervals") or {}
+    ph = M.get("phrases") or {}
+    vb = M.get("vibrato") or {}
+    q = M.get("pitch_quantisation") or {}
+    dl = M.get("delivery") or {}
+    ch = M.get("chromaticism") or {}
+    lines = [
+        f"{M.get('note_count')} notes over {n(M.get('voiced_time_s'), 1)} s voiced, "
+        f"{n(M.get('notes_per_second_of_voicing'), 2)} notes/s",
+        f"range {rg.get('p5_note')}-{rg.get('p95_note')} "
+        f"({n(rg.get('p5_p95_semitones'), 1)} semitones, duration-weighted "
+        f"p5-p95); tessitura {te.get('median_note')} "
+        f"+/- {n(te.get('iqr_semitones'), 1)}",
+        f"extremes {(rg.get('lowest') or {}).get('note')} to "
+        f"{(rg.get('highest') or {}).get('note')} at "
+        f"{(rg.get('highest') or {}).get('time', 'n/a')} "
+        f"({n(rg.get('semitones'), 1)} st) -- read the percentile range, not "
+        f"this one; {n((rg.get('octave_outliers') or {}).get('time_share_pct'), 1)}% "
+        f"of note time was a tracker octave outlier [{rg.get('confidence')}]",
+        f"intervals {n(100 * (iv.get('stepwise_share') or 0), 0)}% stepwise, "
+        f"median |{n(iv.get('median_abs_semitones'), 1)}| semitones",
+        f"phrases {ph.get('count')}, median {n((ph.get('duration_s') or {}).get('median'), 1)} s, "
+        f"{n(ph.get('notes_per_phrase_median'), 1)} notes each; melisma index "
+        f"{n(M.get('melisma_index'), 2)}",
+    ]
+    if ch:
+        lines.append(f"against {ch.get('key')}: "
+                     f"{n(ch.get('out_of_scale_time_pct'), 1)}% of note time off the scale")
+    if vb.get("available"):
+        lines.append(f"vibrato {n(vb.get('rate_hz_median'), 2)} Hz, "
+                     f"{n(vb.get('depth_cents_median'), 0)} cents, on "
+                     f"{n(100 * (vb.get('share_of_long_notes') or 0), 0)}% of long notes")
+    if q.get("available"):
+        lines.append(f"pitch grid: {n(100 * q['cents_off_grid']['share_within_tolerance'], 0)}% "
+                     f"of notes within {n(q['cents_off_grid']['tolerance_cents'], 0)} cents, "
+                     f"median transition {n(q['transition_ms'].get('median'), 0)} ms "
+                     f"-> grid-snapped {q['inference'].get('grid_snapped')} [{q.get('confidence')}]")
+    if dl.get("available"):
+        lines.append(f"delivery {dl['inference'].get('delivery')} "
+                     f"(stable-pitch share {n(dl.get('stable_pitch_share'), 2)}) "
+                     f"[{dl['inference'].get('confidence')}]")
+    return "### Melody (vocal stem)\n\n```\n" + "\n".join(lines) + "\n```\n"
+
+
+def _block_arrangement(res: dict[str, Any]) -> str:
+    A = (res.get("stems") or {}).get("arrangement") or {}
+    if not A.get("available"):
+        return ""
+    rows = [[e.get("stem"), n(e.get("first_present_s"), 1),
+             str(e.get("first_present_bar", "")),
+             n(e.get("present_time_pct"), 0)] for e in A.get("entry_exit", [])]
+    d = A.get("density") or {}
+    lines = [table(["stem", "in at", "bar", "% present"], rows),
+             f"concurrent sources: mean {n(d.get('mean'), 2)}, max {d.get('max')}"]
+    dr = A.get("drums") or {}
+    if dr.get("available"):
+        lines.append(f"drum hits: consistency {n(dr.get('spectral_consistency_median'), 2)}, "
+                     f"level sd {n(dr.get('hit_level_std_db'), 1)} dB -> "
+                     f"sampled/programmed {dr['inference'].get('sampled_or_programmed')}")
+    b = A.get("bass") or {}
+    if b.get("available"):
+        lines.append(f"bass: {n(b.get('sub_share_pct'), 0)}% below "
+                     f"{hz(b.get('sub_split_hz'))} Hz, decay "
+                     f"{n((b.get('note_decay_ms') or {}).get('median'), 0)} ms, glide "
+                     f"{n(100 * ((b.get('glide') or {}).get('share') or 0), 0)}% -> "
+                     f"{b['inference'].get('sub_character')}, long sub note "
+                     f"{b['inference'].get('long_sub_note')}")
+    v = A.get("vocals") or {}
+    lb = v.get("lead_vs_backing") or {}
+    ad = v.get("adlibs") or {}
+    ly = v.get("layers") or {}
+    if lb.get("available"):
+        lines.append(f"vocal centre energy {n(lb.get('centre_energy_pct'), 1)}%; "
+                     f"side-dominant onsets "
+                     f"{n(100 * (ad.get('side_dominant_share') or 0), 1)}%")
+    if ly.get("available"):
+        c = ly.get("simultaneous_pitch_count") or {}
+        lines.append(f"simultaneous vocal pitches: median {n(c.get('median'), 1)}, "
+                     f"p90 {n(c.get('p90'), 1)} [low]")
+    return "### Arrangement\n\n```\n" + "\n".join(lines) + "\n```\n"
+
+
+def _block_microtiming(res: dict[str, Any]) -> str:
+    M = (res.get("stems") or {}).get("microtiming") or {}
+    if not M.get("available"):
+        return ""
+    rows = []
+    for name, st in sorted((M.get("per_stem") or {}).items()):
+        rows.append([name, n(st.get("median_ms"), 1),
+                     n(st.get("median_minus_common_mode_ms"), 1),
+                     n(st.get("std_ms"), 1), str(st.get("onsets_measured", ""))])
+    tail = (f"\ncommon-mode offset {n(M.get('common_mode_offset_ms'), 1)} ms "
+            f"(read the relative column); earliest {M.get('earliest_stem')}, "
+            f"latest {M.get('latest_stem')}, spread {n(M.get('spread_ms'), 1)} ms"
+            f"\nonset resolution {n(M.get('onset_resolution_ms'), 1)} ms; "
+            "positive is behind the grid")
+    return ("### Per-stem microtiming\n\n```\n"
+            + table(["stem", "median ms", "rel ms", "sd ms", "onsets"], rows)
+            + tail + "\n```\n")
+
+
+def _block_delivery(res: dict[str, Any]) -> str:
+    D = res.get("delivery", {})
+    if not D.get("available"):
+        return ""
+    lines = []
+    enc = D.get("encode") or {}
+    for r in enc.get("renderings", []):
+        if not r.get("available"):
+            lines.append(f"{r.get('name')}: unavailable ({r.get('reason')})")
+            continue
+        m, dv = r["measured"], r["delta_vs_source"]
+        hf = r.get("hf_damage") or {}
+        lines.append(f"{r['name']:9s} {n(m.get('integrated_lufs'), 2)} LUFS "
+                     f"({n(dv.get('integrated_lufs'), 2)}), TP "
+                     f"{n(m.get('true_peak_dbtp_4x'), 2)} dBTP "
+                     f"({n(dv.get('true_peak_dbtp_4x'), 2)}), "
+                     f"HF {n(hf.get('band_level_delta_db'), 2)} dB, "
+                     f"{int(m.get('sample_rate_hz') or 0)} Hz"
+                     + (", NEW OVER above 0 dBTP" if (r.get("new_overs") or {}).get(0.0)
+                        else ""))
+    if not enc.get("available") and enc.get("reason"):
+        lines.append(f"encode pass unavailable: {enc['reason']}")
+    ss = D.get("small_speaker") or {}
+    if ss.get("available"):
+        lines.append(f"400 Hz-8 kHz window: {n(ss.get('energy_share_pct'), 1)}% of the "
+                     f"energy, {n(ss.get('loudness_delta_lu'), 2)} LU quieter")
+    mf = D.get("mono_fold") or {}
+    if mf.get("available"):
+        lines.append(f"mono fold: {n(mf.get('loudness_delta_lu'), 2)} LU, true peak "
+                     f"{n(mf.get('true_peak_delta_db'), 2)} dB")
+    ex = D.get("excerpts") or {}
+    for e in ex.get("excerpts", []):
+        m = e.get("measured") or {}
+        lines.append(f"{e['name']:12s} {n(m.get('integrated_lufs'), 2)} LUFS, TP "
+                     f"{n(m.get('true_peak_dbtp_4x'), 2)} dBTP, crest "
+                     f"{n(m.get('crest_db'), 1)} dB")
+    return "### Delivery conditions\n\n```\n" + "\n".join(lines) + "\n```\n" if lines else ""
+
+
+def _block_coverage(res: dict[str, Any]) -> str:
+    C = res.get("coverage") or {}
+    if not C.get("feature_count"):
+        return ""
+    rows = [[g, f"{r['present']}/{r['features']}", n(r.get("present_pct"), 0),
+             str(r.get("low_confidence", 0))]
+            for g, r in (C.get("by_group") or {}).items()]
+    tail = (f"\n{C['present_count']}/{C['feature_count']} features present "
+            f"({n(C.get('present_pct'), 1)}%). Full per-field mask in "
+            "analysis.json under coverage.features.")
+    return ("### Coverage\n\n```\n"
+            + table(["block", "present", "%", "low-conf"], rows) + tail + "\n```\n")
 
 
 # ------------------------------------------------------------------- assembly
@@ -894,6 +1271,18 @@ DETAIL_BLOCKS = [
     (7, "spectral descriptors", "spectrum", _block_descriptors),
     (8, "resonances", "spectrum", _block_resonances),
     (8, "arrangement gaps", "structure", _block_gaps),
+    # The musical half.  Masking and melody sit high because they are the two
+    # things nothing else in the output says: every other stem number is
+    # measured in isolation, and the pitch content of the vocal was thrown away.
+    (2, "inter-stem masking", "masking", _block_masking),
+    (2, "form", "form", _block_form),
+    (3, "harmony", "harmony", _block_harmony),
+    (3, "melody", "melody", _block_melody),
+    (4, "groove", "rhythm", _block_groove),
+    (4, "delivery conditions", "delivery", _block_delivery),
+    (5, "arrangement", "arrangement", _block_arrangement),
+    (4, "per-stem microtiming", "rhythm", _block_microtiming),
+    (9, "coverage", "coverage", _block_coverage),
 ]
 
 SECTION_GROUPS = tuple(sorted({g for _, _, g, _ in DETAIL_BLOCKS}))
@@ -959,6 +1348,10 @@ def render_digest(res: dict[str, Any], budget: int | None = None,
         # says separation was unavailable.
         has_table = bool(stems_block) and (res.get("stems", {}) or {}).get("available")
         budget = SIZE_BUDGET_BYTES + (STEMS_BUDGET_BONUS if has_table else 0)
+        has_music = any((res.get(k) or {}).get("available")
+                        for k in ("harmony", "form", "rhythm"))
+        if has_music:
+            budget += MUSIC_BUDGET_BONUS
 
     fixed = header + _headline(res) + "\n" + _flags(res) + "\n"
     after = (("\n" + stems_block) if stems_block else "")

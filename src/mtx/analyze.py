@@ -15,11 +15,16 @@ from typing import Any
 import numpy as np
 
 from . import SCHEMA_VERSION, __version__
+from . import declared as declared_mod
 from .audio import AudioSource
+from .coverage import build as build_coverage
 from .parallel import resolve_threads
-from .metrics import (dynamics as m_dynamics, fileinfo as m_fileinfo,
-                      forensics as m_forensics, loudness as m_loudness,
-                      processing as m_processing, spectrum as m_spectrum,
+from .metrics import (delivery as m_delivery, dynamics as m_dynamics,
+                      embedding as m_embedding, fileinfo as m_fileinfo,
+                      forensics as m_forensics, form as m_form,
+                      harmony as m_harmony, loudness as m_loudness,
+                      lyrics as m_lyrics, processing as m_processing,
+                      rhythm as m_rhythm, spectrum as m_spectrum,
                       stereo as m_stereo, structure as m_structure)
 from .params import PARAMS, profile_params
 from .split import DEFAULT_PART_BYTES
@@ -52,7 +57,8 @@ def _probe_versions() -> dict[str, Any]:
         "mtx": __version__,
     }
     for mod in ("numpy", "scipy", "soundfile", "mutagen", "pyloudnorm",
-                "librosa", "numba", "matplotlib", "sklearn"):
+                "librosa", "numba", "matplotlib", "sklearn", "demucs",
+                "torch", "pyarrow", "vaderSentiment", "allin1"):
         try:
             m = __import__(mod)
             out[mod] = getattr(m, "__version__", "unknown")
@@ -91,7 +97,7 @@ def _headline(res: dict[str, Any]) -> dict[str, Any]:
     tempo = STR.get("tempo", {}) if STR.get("available") else {}
     key = STR.get("key", {}) if STR.get("available") else {}
     crest = D.get("crest", {})
-    return {
+    out = {
         "lufs_i": L.get("integrated_lufs"),
         "lra_lu": L.get("lra_lu"),
         "true_peak_dbtp_16x": tp.get("overall_dbtp_16x"),
@@ -121,16 +127,76 @@ def _headline(res: dict[str, Any]) -> dict[str, Any]:
         "section_count": STR.get("section_count") if STR.get("available") else None,
         "duration_s": res.get("audio", {}).get("duration_s"),
     }
+    out.update(_headline_musical(res))
+    return out
+
+
+def _headline_musical(res: dict[str, Any]) -> dict[str, Any]:
+    """The musical half of the headline: harmony, rhythm, form, melody, lyric.
+
+    Every one of these is null on a run that could not compute it -- a quick
+    profile, a file with no beat grid, a run without --stems -- and never a
+    stand-in value.
+    """
+    H = res.get("harmony", {}) or {}
+    R = res.get("rhythm", {}) or {}
+    F = res.get("form", {}) or {}
+    LY = res.get("lyrics", {}) or {}
+    STM = res.get("stems", {}) or {}
+    down = R.get("downbeats", {}) if R.get("available") else {}
+    grid = R.get("grid", {}) if R.get("available") else {}
+    swing = R.get("swing", {}) if R.get("available") else {}
+    sync = R.get("syncopation", {}) if R.get("available") else {}
+    hr = H.get("harmonic_rhythm", {}) if H.get("available") else {}
+    deg = H.get("degrees", {}) if H.get("available") else {}
+    voc = ((STM.get("melody") or {}).get("vocals") or {}) if STM.get("available") else {}
+    arr = (STM.get("arrangement") or {}) if STM.get("available") else {}
+    stats = LY.get("statistics", {}) if LY.get("available") else {}
+    return {
+        "beats_per_bar": down.get("beats_per_bar"),
+        "bar_count": R.get("bar_count") if R.get("available") else None,
+        "swing_ratio": swing.get("swing_ratio"),
+        "grid_deviation_std_ms": (grid.get("deviation") or {}).get("std_ms"),
+        "syncopation_per_bar": sync.get("mean_per_bar"),
+        "chord_count": H.get("chord_count") if H.get("available") else None,
+        "distinct_chords": (H.get("vocabulary") or {}).get("distinct_chords"),
+        "chord_changes_per_bar": hr.get("changes_per_bar"),
+        "diatonic_time_pct": deg.get("diatonic_time_pct"),
+        "key_from_chords": (H.get("key_from_chords") or {}).get("key"),
+        "chorus_count": F.get("chorus_count") if F.get("available") else None,
+        "chorus_share_pct": F.get("chorus_share_pct") if F.get("available") else None,
+        "time_to_first_chorus_s": F.get("time_to_first_chorus_s") if F.get("available") else None,
+        "time_to_vocal_entry_s": F.get("time_to_vocal_entry_s") if F.get("available") else None,
+        "form_letters": F.get("letters") if F.get("available") else None,
+        "vocal_range_p5_p95_semitones": (voc.get("range") or {}).get("p5_p95_semitones"),
+        "vocal_p5_note": (voc.get("range") or {}).get("p5_note"),
+        "vocal_p95_note": (voc.get("range") or {}).get("p95_note"),
+        "vocal_median_note": (voc.get("tessitura") or {}).get("median_note"),
+        "vocal_notes_per_second": voc.get("notes_per_second_of_voicing"),
+        "concurrent_sources_mean": (arr.get("density") or {}).get("mean"),
+        "lyric_word_count": stats.get("words"),
+        "lyric_source": LY.get("source"),
+    }
 
 
 def analyze_file(path: str, profile: str = "full", want_stems: bool = False,
-                 log=None, threads: int | None = None) -> dict[str, Any]:
+                 log=None, threads: int | None = None, *,
+                 stems_model: str | None = None, declared_path: str | None = None,
+                 want_transcript: bool = False, want_embedding: bool = False,
+                 ) -> dict[str, Any]:
     """Run the full metric set over one file and return the result dictionary.
 
     `threads` is how many threads the metrics inside this one file may use.
     `None` means "decide from the machine", which is what a single-file run
     wants; `mtx scan` passes 1 because it is already running one process per
     file and the two layers must not multiply.
+
+    `stems_model` picks the demucs model, and with it how many stems there are:
+    `htdemucs_6s` splits guitar and piano out of `other`.  `declared_path`
+    points at a `declared.json` sidecar, whose contents are passed through
+    labelled as declared and never merged into anything measured.
+    `want_transcript` and `want_embedding` each enable one optional, heavy,
+    model-backed block that is off by default.
     """
     random.seed(SEED)
     np.random.seed(SEED)
@@ -184,13 +250,50 @@ def analyze_file(path: str, profile: str = "full", want_stems: bool = False,
     step("processing forensics")
     res["processing"] = m_processing.analyse(src, collector, res["structure"], profile)
 
+    step("rhythm, downbeats, groove")
+    res["rhythm"] = m_rhythm.analyse(src, res["structure"], collector, profile)
+
+    step("harmony, chords")
+    res["harmony"] = m_harmony.analyse(src, res["structure"], res["rhythm"],
+                                       collector, profile)
+
+    stem_sources = None
     if want_stems:
         step("stem separation")
         from .metrics import stems as m_stems
-        res["stems"] = m_stems.analyse(src, collector, profile)
+        stem_sources = m_stems.load(src, collector, stems_model)
+        step("stems, masking, melody, arrangement")
+        res["stems"] = m_stems.analyse(src, collector, profile, stem_sources,
+                                       res["structure"], res["rhythm"],
+                                       stems_model)
     else:
         res["stems"] = {"requested": False,
-                        "note": "run with --stems to separate and measure stems"}
+                        "note": "run with --stems to separate and measure stems; "
+                                "pitch, inter-stem masking and arrangement all "
+                                "depend on it"}
+
+    step("song form")
+    res["form"] = m_form.analyse(src, res["structure"], res["rhythm"],
+                                 res["forensics"], stem_sources, collector,
+                                 profile)
+
+    step("delivery conditions")
+    res["delivery"] = m_delivery.analyse(src, collector, res["structure"],
+                                         res["form"], profile)
+
+    step("declared metadata and version identity")
+    res["declared"] = declared_mod.load(path, collector, explicit=declared_path)
+    res["version"] = declared_mod.version_identity(res.get("tags") or {})
+
+    step("lyrics")
+    res["lyrics"] = m_lyrics.analyse(res.get("tags") or {}, res["declared"],
+                                     res["stems"], res["structure"], collector,
+                                     want_transcript=want_transcript)
+
+    step("embedding")
+    res["embedding"] = m_embedding.analyse(
+        src, (res["structure"].get("sections") or []) if res["structure"].get("available") else [],
+        collector, enabled=want_embedding)
 
     step(None)
     res["headline"] = _headline(res)
@@ -203,6 +306,10 @@ def analyze_file(path: str, profile: str = "full", want_stems: bool = False,
         "elapsed_seconds": round(time.time() - t_start, 3),
         "profile": profile,
         "stems_requested": bool(want_stems),
+        "stems_model": stems_model or PARAMS["stems"]["model"],
+        "transcript_requested": bool(want_transcript),
+        "embedding_requested": bool(want_embedding),
+        "declared_sidecar": res.get("declared", {}).get("path"),
         "random_seed": SEED,
         "versions": _versions(),
         "reproducibility": (
@@ -213,6 +320,9 @@ def analyze_file(path: str, profile: str = "full", want_stems: bool = False,
     }
     res["params"] = dict(PARAMS)
     res["params"]["profile"] = profile_params(profile)
+    # Last, so it sees every block: the uniform present/trusted mask over the
+    # whole document, which saves every consumer from walking it themselves.
+    res["coverage"] = build_coverage(res)
     return res
 
 

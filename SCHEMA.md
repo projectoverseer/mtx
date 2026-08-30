@@ -1,10 +1,16 @@
 # `analysis.json` schema
 
-`schema_version` **1.1.0**.
+`schema_version` **1.2.0**.
 
-Changes since 1.0.0, all additive: `processing.multiband_timeline.
-band_envelope_correlation` gains `offdiagonal`, `least_correlated_pairs` and
-`most_correlated_pair`; `loudness.dr14.validation` gains `record` and its
+Changes since 1.1.0, all additive. Nine new top-level blocks -- `harmony`,
+`rhythm`, `form`, `delivery`, `lyrics`, `declared`, `version`, `embedding` and
+`coverage` -- plus `stems.masking`, `stems.melody`, `stems.arrangement` and
+`stems.microtiming`. `headline` gains its musical half. Nothing was renamed and
+nothing was removed, so a 1.1.0 consumer reads a 1.2.0 document unchanged.
+
+Changes in 1.1.0: `processing.multiband_timeline.band_envelope_correlation`
+gains `offdiagonal`, `least_correlated_pairs` and `most_correlated_pair`;
+`loudness.dr14.validation` gains `record` and its
 `validated_against_published_reference` is no longer always `false`.
 
 One line per field. Units are in the field name wherever they exist. Any field
@@ -242,6 +248,131 @@ drums/bass/other/vocals, each holding the full `loudness`, `dynamics`,
 (`rms_db`, `lufs_delta`) and its own `warnings`. Every number under `stems` is
 measured on a separated signal, not on the mix.
 
+`stem_names` lists what the model separated: four sources by default, six with
+`--stems-model htdemucs_6s`, which splits guitar and piano out of `other`.
+
+Four further blocks exist only because there is more than one signal:
+
+| Block | Description |
+| --- | --- |
+| `stems.masking` | Per third-octave band energy per stem; for every ordered pair a `masking_index_db` (the masker's level inside the target's own energy distribution), `per_third_octave` deltas and a symmetric `spectral_overlap`. `per_section` repeats it per section and adds `vocal_minus_instrumental_lu`; `masking_release` is the swing across sections. `vocal` holds `sibilance` (de-esser evidence as a dB/dB slope), `high_pass` (corner and slope), `reverb` (per-octave tail plus an inferred `pre_delay_ms`) and `delay_throws` (autocorrelation at musical subdivisions, with a local baseline). |
+| `stems.melody` | `vocals` and `bass` pitch tracks. `range` carries the duration-weighted `p5_p95_semitones` (**read this one**), the robust `lowest`/`highest` with timestamps, `absolute` raw extremes, and `octave_outliers`. Also `tessitura`, `intervals`, `phrases`, `melisma_index`, `self_similarity`, `chromaticism`, `contour_per_section`, `vibrato`, `delivery` (sung vs spoken/rapped) and `pitch_quantisation` (forensics: grid deviation and note-to-note transition time). |
+| `stems.arrangement` | `density` (concurrent-source count over time), `entry_exit` per stem in seconds and bars, `per_section` stems present, `drums` (hit spectral consistency and level spread -> sampled/programmed), `bass` (sub share, note decay, glide, sub character), `vocals` (`layers`, `lead_vs_backing`, `adlibs` and call-and-response), and an `instrument_tagging` hook. |
+| `stems.microtiming` | Per-stem onset deviation from the subdivided beat grid. Read `median_minus_common_mode_ms`: the beat tracker and the onset detector each carry a constant lag that is identical for every stem and cancels between them. |
+
+## `harmony`
+
+The chord track, and everything that needs one. `available: false` under
+`--profile quick`.
+
+| Field | Description |
+| --- | --- |
+| `chords[]` | One entry per chord segment: `start_s`, `start`, `duration_s`, `label`, `quality`, `match`, and where a low-register chroma was available `bass_note`, `inversion` and `slash_label`. |
+| `progression[]` | The chord labels in order, first 400. |
+| `chord_count`, `no_chord_time_pct`, `mean_template_match`, `confidence` | How much of the track carried a recognisable chord, and how well. |
+| `vocabulary` | `distinct_chords`, `entropy_bits`, `time_s_by_chord`. |
+| `harmonic_rhythm` | `changes`, `changes_per_second`, `changes_per_bar`, `median_duration_beats`, and a `per_bar_caveat` naming its dependence on the tempo level. |
+| `degrees` | Roman-numeral reduction against `structure.key`: `diatonic_time_pct`, `borrowed_time_pct`, `degree_time_s`. |
+| `cadences` | Counts and instances of V-I, IV-I, V-vi and I-V transitions. |
+| `loop` | Bar-level repeat test over `loop_candidate_bars`; `loop` is the shortest period over the threshold, or `null`. |
+| `pedal_points[]` | Runs where the bass note holds while the chord root moves. |
+| `modulation` | Sliding-window key estimates and sustained changes. Always `confidence: low`. |
+| `key_from_chords` | A second key estimate from the chord track: `key`, `diatonic_time_pct`, `tonic_chord_time_s`, `opens_on_tonic`, `closes_on_tonic`, `runner_up`, `runner_up_is_relative_key`, `margin`, `confidence`, `accuracy_note`. |
+| `key_cross_check` | `chroma_key` vs `chord_track_key`, `agree`, `same_tonic_different_mode`, and `read_this_one`. A disagreement is also a `warnings[]` entry. |
+
+## `rhythm`
+
+Downbeats, meter and groove over the beat grid `structure.tempo` measured.
+`available: false` under `--profile quick` or without a beat grid.
+
+| Field | Description |
+| --- | --- |
+| `downbeats` | `beats_per_bar`, `time_signature`, `phase_beat_index`, `downbeat_times_s`, `bar_count`, `downbeat_accent_contrast`, `meter_margin`, `per_meter[]`, `accent_components`, `confidence`. |
+| `tempo_octave` | `midpoint_ratio`, `alternation_ratio`, `suggested_factor`, `suggested_bpm`, `reported_level_is_best_supported`, and `measured_on_reference_set` stating how well the test actually performs. |
+| `swing` | `offbeat_position_median` (0.5 is straight), `swing_ratio`, `offbeat_position_iqr`, `events`. |
+| `grid` | `subdivision`, `onset_resolution_ms`, `deviation` (median/mean/IQR/sd/p10/p90/share within 10 ms) and a `programmed_grid` inference. |
+| `syncopation` | Longuet-Higgins & Lee weights over a 16-step bar: `mean_per_bar`, `median_per_bar`, `max_per_bar`, `per_bar[]`. |
+| `beat_position_profile` | Kick- and snare-band level at each position in the bar, `kick_on_minus_off_beat_db`, and `four_on_the_floor` / `backbeat_on_2_and_4` inferences gated on a kick pattern existing at all. |
+| `pulse_rate` | Onsets per beat per section, `relative_pulse_rate`, and half/double-time `switches[]`. |
+
+## `form`
+
+A labelling pass over `structure.sections`, never a replacement for it.
+
+| Field | Description |
+| --- | --- |
+| `letters` | One letter per **part**; `letters_per_section` is one per section. Clustering is the measurement. |
+| `parts[]` | `letter`, `label`, `label_confidence`, `label_evidence[]`, `start_s`, `end_s`, `duration_s`, `lufs_i`, `vocal_present`, `members[]`. |
+| `sections[]` | The same labels mapped back onto the measured sections, plus `part_index`. |
+| `part_rule`, `label_method` | Why consecutive same-letter sections are one part, and that function names are an inference. |
+| `vocal_presence` | Per-section vocal-stem RMS and the presence rule. Needs `--stems`. |
+| `vocal_entry` | First sustained vocal-stem level, with its rule. |
+| `chorus_count`, `chorus_share_pct`, `time_to_first_chorus_s`, `time_to_first_chorus_fraction`, `intro_length_s`, `time_to_vocal_entry_s` | The questions people ask a record. |
+| `time_to_title_s` | `null` without an aligned lyric; the reason is next to it. |
+| `second_chorus_vs_first` | Deltas of the measured section vectors between the first two choruses. |
+| `beat_switch_count` | From `rhythm.pulse_rate`. |
+| `ending` | `fade` or `cold stop`, with the `forensics.silence` fields it was read from. |
+| `loopability` | Spectral cosine and level delta between the first and last window. |
+| `learned_segmentation` | The optional `allin1` model's opinion, reported beside the measurement and never merged. |
+
+## `delivery`
+
+What the master does once it is distributed. `available: false` under
+`--profile quick`.
+
+| Field | Description |
+| --- | --- |
+| `encode` | Per rendering (`aac_256`, `opus_128`): `measured` (LUFS, true peak 4x, sample peak, crest, PLR, tilt), `delta_vs_source`, `new_overs`, `hf_damage`, `encoded_bytes`, `resampled`. Needs ffmpeg. |
+| `small_speaker` | The 400 Hz - 8 kHz window: `energy_share_pct`, `loudness_delta_lu`, `band_passed`. |
+| `mono_fold` | Loudness-weighted and per-octave, next to the broadband view already in `stereo.mono_sum_damage`. |
+| `excerpts` | `first_15s`, `first_30s` and `chorus_15s`, each measured as if it were the whole file. |
+
+## `lyrics`
+
+| Field | Description |
+| --- | --- |
+| `source` | `declared`, `file:tag`, `transcript`, or `null` with a reason and a `coverage_note`. |
+| `is_inference` | True when the text is a transcript rather than a lyric. |
+| `language` | Script share or stop-word frequency, with a confidence; a declared language overrides and says so. |
+| `statistics` | Word/line counts, type-token ratio, repeated-line percentage, zlib compression ratio, longest and most repeated n-gram, pronoun distribution, explicit-term count, title occurrences. `syllables` and `readability_flesch` are `available: false` outside English rather than meaningless. |
+| `rhyme` | Scheme, perfect/slant split, internal rhymes, density. English only, `confidence: low`. |
+| `sentiment`, `concreteness` | `available: false` with what to install: no lexicon ships with mtx. |
+| `transcript` | The backend's raw output when `--transcribe` ran. |
+| `alignment` | Word timings, and the `delivery_rate` (syllables per second of voicing, and per beat) they make possible. |
+
+## `declared` and `version`
+
+`declared` is the `declared.json` sidecar, if there is one. Every value is
+wrapped as `{value, source: "declared"}`; unrecognised keys are passed through
+and listed in `unknown_fields`. Nothing here is merged into a measured field or
+into `online.*`.
+
+`version` is version identity from tags alone: `title_without_version_markers`,
+`markers[]` (radio edit, clean, sped up, remix, live, ...),
+`is_primary_version`, `work_key` and `sibling_versions` (always unavailable
+offline). Two files that agree on `work_key` and differ on `markers` are two
+versions of one song.
+
+## `embedding`
+
+`available: false` unless `--embed` was passed and a backend is installed. When
+present: `vector`, `dimensions`, `l2_norm`, `backend`, `model`, `version`, and
+optionally `per_section`. A fingerprint, not a measurement: no measured value is
+derived from it, and nearest-neighbour search over these vectors is
+`mtx cohort`.
+
+## `coverage`
+
+One uniform present/trusted mask over the whole document, built last so it sees
+every block.
+
+| Field | Description |
+| --- | --- |
+| `features` | `path -> {present, kind, confidence}` for every leaf field outside `params`/`run`/`warnings`. Series carry a `length`; an unavailable block carries its `reason`. |
+| `by_group` | Per top-level block: `features`, `present`, `present_pct`, `low_confidence`, `unavailable_blocks`. |
+| `feature_count`, `present_count`, `present_pct` | The headline of the mask. |
+| `declared_confidences` | `confidence_notes[]` as a lookup. |
+
 ## `headline`
 
 The ~28 numbers the digest table is built from, all also present in their home
@@ -253,6 +384,16 @@ sections: `lufs_i`, `lra_lu`, `true_peak_dbtp_16x`, `sample_peak_dbfs`,
 `correlation_min`, `flat_top_sample_count`, `flat_top_longest_run_ms`,
 `hf_cutoff_hz`, `effective_bit_depth`, `tempo_bpm`, `key`, `section_count`,
 `duration_s`.
+
+Since 1.2.0 it also carries the musical half, each `null` on a run that could
+not compute it and never a stand-in value: `beats_per_bar`, `bar_count`,
+`swing_ratio`, `grid_deviation_std_ms`, `syncopation_per_bar`, `chord_count`,
+`distinct_chords`, `chord_changes_per_bar`, `diatonic_time_pct`,
+`key_from_chords`, `chorus_count`, `chorus_share_pct`,
+`time_to_first_chorus_s`, `time_to_vocal_entry_s`, `form_letters`,
+`vocal_range_p5_p95_semitones`, `vocal_p5_note`, `vocal_p95_note`,
+`vocal_median_note`, `vocal_notes_per_second`, `concurrent_sources_mean`,
+`lyric_word_count`, `lyric_source`.
 
 ## `warnings[]` and `confidence_notes[]`
 
@@ -416,6 +557,29 @@ result: `available`, `errors[]`, `requests`, the `match` breakdown
 A wrong match is therefore auditable rather than invisible.
 
 ---
+
+## `cohort.json` (`mtx cohort`)
+
+Written beside a folder of analyses, never into them: a per-track measurement
+must not change because of what else is in the folder.
+
+| Field | Description |
+| --- | --- |
+| `metrics[]` | The fixed list of `{key, label}` a cohort position is computed for. |
+| `cohorts` | `cohort key -> [track indices]`. Keys are `genre=...`, `year=lo-hi`, and the two combined, plus `all`. |
+| `tracks[]` | Per track: `artist`, `title`, `genre`/`year` with the `*_source` each came from, `primary_cohort` and `primary_cohort_size`, `primary_cohort_is_fallback`, `metrics` (per metric: `value`, and corpus/cohort/artist `percentile`, `z` and `n`), `typicality.mean_abs_z`, `distance_to_cohort_centroid` and `neighbours`. |
+| `hygiene` | `tracks`, `distinct_artists`, `largest_artist_share`, `cohort_sizes`, and `problems[]` naming a corpus too small or too dominated by one artist to support statistics. |
+
+`typicality.mean_abs_z` is a distance from the cohort centre, not a rating.
+
+## `mtx_tracks.csv` / `mtx_sections.csv` (`mtx export`)
+
+Flat tables over a folder of analyses. `mtx_tracks.csv` is one row per track,
+every scalar under its full dotted path. `mtx_sections.csv` is one row per
+(track, section), joining what `structure.sections` measured to the `form`
+label, the per-section masking indices, the per-section pulse rate, the melodic
+contour and the arrangement density. Parquet is written alongside when
+`pyarrow` is installed.
 
 ## `comparison.json` (`mtx compare`)
 

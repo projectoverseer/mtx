@@ -209,6 +209,243 @@ PARAMS: dict[str, Any] = {
         },
         "vocal_band_hz": [1000.0, 4000.0],
     },
+    "harmony": {
+        "chroma": "librosa chroma_cqt at 22.05 kHz / hop 512, L1-normalised per "
+                  "frame, aggregated to the beat grid by median when "
+                  "structure.tempo supplies one",
+        "qualities": ["maj", "min", "dim", "aug", "sus2", "sus4", "maj7",
+                      "min7", "dom7", "min6", "maj6", "hdim7", "dim7"],
+        "template": "Pearson correlation between the chroma frame and the "
+                    "binary chord-tone mask (both mean-removed, then "
+                    "L2-normalised), so energy on a tone the chord does not "
+                    "contain counts against it",
+        "template_note": "a plain cosine against uncentred masks cannot work: a "
+                         "four-tone mask that contains a triad scores at least "
+                         "as high as the triad whenever the fourth tone has any "
+                         "energy at all, so every chord came back as a seventh",
+        "complexity_penalty": 0.18,
+        "complexity_penalty_note": "subtracted from the score once per chord "
+                                   "tone beyond the third, so a seventh has to "
+                                   "earn its place against the triad inside it",
+        "quality_prior": {"sus2": 0.03, "sus4": 0.03, "dim": 0.05,
+                          "aug": 0.08, "dim7": 0.08, "hdim7": 0.06},
+        "quality_prior_note": "a suspended or diminished chord is rarer than a "
+                              "triad; without this the recogniser reaches for "
+                              "one whenever a passing tone lands on the second "
+                              "or the fourth",
+        "no_chord_score": 0.22,
+        "emission_gain": 30.0,
+        "key_from_chords": {
+            "method": "the key whose scale explains the most chord time, plus "
+                      "the evidence that says which of the two relative keys "
+                      "sharing that scale is the tonic: time on the tonic "
+                      "chord, and whether the track opens and closes on it",
+            "tonic_weight": 0.4,
+            "first_chord_weight": 0.10,
+            "final_chord_weight": 0.0,
+            "final_chord_weight_note": "measured to hurt on the reference set "
+                                       "and left at zero: pop records fade out "
+                                       "rather than cadence, so the last chord "
+                                       "the recogniser sees is often the "
+                                       "quietest and least reliable one",
+            "measured_accuracy": "3 of 7 published keys before the tonic "
+                                 "evidence, 4 of 7 after; structure.key (mean "
+                                 "chroma) got 5 of 7 on the same seven tracks. "
+                                 "This is a second opinion, not a better one, "
+                                 "and its failure mode is the relative key.",
+            "note": "a scale fit cannot separate a major key from its relative "
+                    "minor -- they contain the same seven notes -- so without "
+                    "the tonic evidence this estimate lands on the wrong one of "
+                    "the pair about half the time",
+        },
+        "viterbi_self_transition": 0.86,
+        "loop_candidate_bars": [1, 2, 4, 8, 16],
+        "loop_match_threshold": 0.75,
+        "modulation": {"window_s": 20.0, "hop_s": 5.0, "min_hold_s": 10.0,
+                       "min_margin": 0.02},
+        "pedal_min_chords": 3,
+        "cadence_degrees": {"authentic": [7, 0], "plagal": [5, 0],
+                            "deceptive": [7, 9], "half": [0, 7]},
+    },
+    "melody": {
+        "f0": {"algorithm": "librosa.pyin", "sr_hz": 22050,
+               "frame_length": 2048, "hop_length": 256,
+               "vocal_fmin_hz": 65.406, "vocal_fmax_hz": 2093.005,
+               "bass_fmin_hz": 27.5, "bass_fmax_hz": 523.251},
+        "note_segmentation": {"median_filter_frames": 5,
+                              "split_semitones": 0.6,
+                              "min_note_ms": 60.0,
+                              "unvoiced_gap_ms": 100.0},
+        "phrase_gap_ms": 350.0,
+        "stable_frame_cents": 30.0,
+        "vibrato": {"min_note_ms": 300.0, "rate_range_hz": [3.0, 9.0],
+                    "min_depth_cents": 20.0},
+        "quantisation": {"transition_target_fraction": 0.8,
+                         "grid_tolerance_cents": 5.0,
+                         "fast_transition_ms": 40.0},
+        "self_similarity_ngram": 4,
+        "octave_outlier_semitones": 14.0,
+        "range_rule": "the reported range is taken over the notes within "
+                      "octave_outlier_semitones of the duration-weighted median "
+                      "pitch. The raw extremes are reported too, separately: "
+                      "measured against four reference vocals they were 40-58 "
+                      "semitones wide, because a monophonic pitch tracker "
+                      "running on a separated stem makes octave errors on 7-12% "
+                      "of note time, and one of them sets the maximum.",
+        "note": "pitch is measured on a separated stem; every number inherits "
+                "source=separated",
+    },
+    "rhythm": {
+        "meters": [2, 3, 4, 6],
+        "octave_check": {
+            "midpoint_ratio_double": 0.80,
+            "alternation_ratio_half": 0.50,
+            "method": "onset strength sampled on the beat grid itself: the "
+                      "energy halfway between beats relative to the energy on "
+                      "them (a high ratio means the real beat is twice as "
+                      "fast), and the weaker of the two alternating beat "
+                      "phases relative to the stronger (a low ratio means "
+                      "every other beat is empty and the real beat is half as "
+                      "fast)",
+            "why_not_autocorrelation": "a periodic pulse train correlates with "
+                                       "itself just as well at twice its "
+                                       "period as at its own, so an "
+                                       "autocorrelation comparison is biased "
+                                       "toward the slower reading and reports "
+                                       "half tempo on a plain click track",
+            "note": "librosa's beat tracker picks a metrical level, not the "
+                    "only one: on the reference set it reported half the "
+                    "published tempo for one track and double it for another. "
+                    "The ambiguity is measured and reported rather than "
+                    "resolved, because every bar-relative number here inherits "
+                    "whichever level was chosen.",
+        },
+        "downbeat_accent": "z-scored sum of the onset-strength value, the "
+                           "20-120 Hz band energy and the chroma change at each "
+                           "beat; meter and phase are the pair that maximises "
+                           "the mean accent on the downbeat",
+        "grid_subdivision": 4,
+        "onset_hop_length": 128,
+        "onset_hop_note": "onsets are re-detected at hop 128 (5.8 ms) rather than reusing the shared hop-512 envelope: a 23 ms quantisation would be larger than most of the microtiming it is meant to measure",
+        "swing": {"search_fraction": [0.30, 0.75], "min_events": 8},
+        "syncopation": "Longuet-Higgins & Lee metric weights over a 16-step bar",
+        "microtiming_max_deviation_ms": 120.0,
+        "pulse_rate_window_bars": 4,
+        "programmed_tightness_ms": 8.0,
+    },
+    "form": {
+        "cluster": {
+            "features": "per-section mean chroma(12) and MFCC(20) plus the "
+                        "measured section vector (LUFS, crest, tilt, "
+                        "side-minus-mid, onset rate, 8 band percentages), each "
+                        "z-scored across the sections of this track",
+            "distance": "cosine",
+            "merge_threshold": 0.8,
+            "merge_threshold_note": "chosen so a track keeps a "
+                                    "song-like alphabet: across "
+                                    "eight reference tracks of "
+                                    "16-31 sections this yields "
+                                    "3-7 letters, where 0.22 "
+                                    "yielded 11-25",
+        },
+        "vocal_presence_db_below_p95": 12.0,
+        "use_allin1": False,
+        "use_allin1_note": "when true and the optional allin1 model is "
+                           "installed, its segmentation is reported alongside "
+                           "the measured one as a second opinion",
+        "loopability_window_s": 8.0,
+        "labels": ["intro", "verse", "pre-chorus", "chorus", "post-chorus",
+                   "bridge", "drop", "instrumental", "outro"],
+        "rule_note": "functional labels are an inference over measured evidence "
+                     "(letter clustering, loudness rank, repeat count, vocal "
+                     "presence, position); the measured boundaries and letters "
+                     "are never replaced by them",
+    },
+    "arrangement": {
+        "presence_db_below_stem_p95": 18.0,
+        "density_hop_s": 0.5,
+        "sub_bass_split_hz": 60.0,
+        "eight_o_eight": {"min_decay_ms": 400.0, "sub_share_min_pct": 45.0},
+        "glide": {"max_gap_ms": 60.0, "min_semitones": 2.0},
+        "drum_hit_window_ms": 80.0,
+        "layer_salience_floor_db": -12.0,
+        "call_response_lag_s": [0.2, 2.0],
+    },
+    "masking": {
+        "bands": "third-octave centres, 20 Hz - 20 kHz",
+        "pair_metric": "energy-weighted level of the masker inside the target's "
+                       "own band-energy distribution, in dB",
+        "overlap_metric": "cosine and Bhattacharyya coefficient between the two "
+                          "L1-normalised band-energy vectors",
+        "sibilance_band_hz": [5000.0, 10000.0],
+        "sibilance_reference_band_hz": [1000.0, 4000.0],
+        "sibilance_frame_ms": 25.0,
+        "delay_throw_subdivisions": [0.25, 0.5, 0.75, 1.0, 1.5, 2.0],
+        "highpass_probe_hz": [20.0, 500.0],
+        "highpass_plateau_hz": [200.0, 500.0],
+    },
+    "lyrics": {
+        "sources_in_priority_order": ["declared", "file:tag", "transcript"],
+        "transcript": {
+            "backends": ["whisperx", "whisper_timestamped", "faster_whisper"],
+            "note": "optional; a transcript is an inference and is never merged "
+                    "into a declared or tagged lyric",
+        },
+        "language_detection": "unicode-script share plus stop-word frequency "
+                              "over a fixed table",
+        "syllable_counter_languages": ["en"],
+        "rhyme": {"languages": ["en"],
+                  "slant_rule": "same vowel nucleus with a different coda, or "
+                                "the same coda with a different nucleus"},
+        "ngram_max": 8,
+        "sentiment": {"backend": "vaderSentiment (optional)",
+                      "note": "no lexicon ships with mtx; without one the "
+                              "valence arc is null with a reason"},
+        "lexicons": {"concreteness": None, "valence": None},
+    },
+    "embedding": {
+        "backends_in_priority_order": ["laion_clap", "openl3", "transformers:MERT"],
+        "note": "an embedding is a fingerprint, not a measurement: it is stored "
+                "in its own block with the model name and version, and no "
+                "measured field is ever derived from it",
+        "section_embeddings": True,
+    },
+    "delivery": {
+        "encodes": [
+            {"name": "aac_256", "codec": "aac", "bitrate": "256k", "suffix": ".m4a"},
+            {"name": "opus_128", "codec": "libopus", "bitrate": "128k", "suffix": ".opus"},
+        ],
+        "small_speaker_band_hz": [400.0, 8000.0],
+        "excerpt_s": [15.0, 30.0],
+        "hf_damage_band_hz": [10000.0, 20000.0],
+        "requires": "ffmpeg; without it every rendering is null with a reason",
+    },
+    "version": {
+        "markers": "title, subtitle, version and comment tags matched against a "
+                   "fixed vocabulary (radio edit, clean, explicit, remix, live, "
+                   "acoustic, instrumental, extended, sped up, slowed, "
+                   "remaster, demo, edit)",
+        "work_key": "case-folded, accent-stripped, punctuation-stripped artist "
+                    "and title with every version marker removed",
+    },
+    "declared": {
+        "sidecar": "declared.json beside the audio file, or passed with "
+                   "--declared",
+        "rule": "a declared value is passed through with source=declared and is "
+                "never merged into a measured or database-sourced field",
+    },
+    "cohort": {
+        "year_window": 2,
+        "min_cohort_size": 12,
+        "min_corpus_for_statistics": 200,
+        "max_single_artist_share": 0.15,
+        "percentile_rule": "share of the cohort strictly below the value, plus "
+                           "half the ties",
+        "label_priority": ["declared", "online", "file:tag"],
+        "note": "computed by `mtx cohort` into its own file; `analyze` never "
+                "reads the folder its output goes into, because a per-track "
+                "measurement must not depend on what else is beside it",
+    },
     "compare": {
         "level_match": "gain both files to equal LUFS-I before any comparison",
         "null_test": {
@@ -242,6 +479,13 @@ QUICK_SKIPS: tuple[str, ...] = (
     "processing.transient_density",
     "spectrum.ltas_lowfreq",
     "forensics.wow_flutter",
+    "harmony",
+    "rhythm",
+    "form",
+    "melody.vibrato",
+    "delivery",
+    "lyrics.transcript",
+    "embedding",
 )
 # `stems` is deliberately absent: separation is opt-in through --stems at
 # either profile, never a profile switch.  The per-stem measurements inherit
