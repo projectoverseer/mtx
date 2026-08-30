@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 
 import pytest
 
@@ -543,3 +544,84 @@ def test_only_a_memory_failure_steps_down(stderr, expected):
     from mtx.metrics import stems as m
 
     assert m._out_of_memory(stderr) is expected
+
+
+# ------------------------------------------------- how many share the card
+
+@pytest.mark.parametrize("vram, expected", [
+    (4095, 3),      # GTX 1650: three streams measured at 1.51x, four will not fit
+    (2048, 1),      # a 2 GiB card has room for one and no reserve to spare
+    (6144, 4),      # past four the SM is saturated; the cap, not the memory, binds
+    (24564, 4),
+])
+def test_streams_are_what_the_card_holds(vram, expected, monkeypatch):
+    from mtx.metrics import stems as m
+
+    monkeypatch.delenv(m.ENV_STREAMS, raising=False)
+    monkeypatch.setattr(m, "device_vram_mib", lambda: vram)
+    assert m.separation_streams() == expected
+
+
+def test_no_card_means_one_at_a_time(monkeypatch):
+    from mtx.metrics import stems as m
+
+    monkeypatch.delenv(m.ENV_STREAMS, raising=False)
+    monkeypatch.setattr(m, "device_vram_mib", lambda: None)
+    assert m.separation_streams() == 1
+
+
+def test_an_explicit_request_beats_the_arithmetic(monkeypatch):
+    """A card this reads wrongly can still be driven by hand."""
+    from mtx.metrics import stems as m
+
+    monkeypatch.setattr(m, "device_vram_mib", lambda: 4095)
+    assert m.separation_streams(1) == 1
+    assert m.separation_streams(8) == 8
+    monkeypatch.setenv(m.ENV_STREAMS, "2")
+    assert m.separation_streams() == 2
+
+
+def test_separations_overlap_but_every_track_is_reported_once(monkeypatch):
+    """Three streams, eight tracks, one line each and one lock around them."""
+    import threading
+
+    from mtx import scan as scan_mod
+    from mtx.metrics import stems as m
+
+    live, peak = 0, 0
+    guard = threading.Lock()
+
+    def fake_separate(path, collector, model=None, **kw):
+        nonlocal live, peak
+        with guard:
+            live += 1
+            peak = max(peak, live)
+        time.sleep(0.05)
+        with guard:
+            live -= 1
+        return {"vocals": path}
+
+    monkeypatch.setattr(m, "separate", fake_separate)
+    lines = []
+    sources = [f"/library/{i:02d}.flac" for i in range(8)]
+    done = scan_mod.separate_first(sources, None, lines.append, streams=3)
+
+    assert done == 8
+    assert peak == 3, "the card was given exactly the streams it was promised"
+    reported = [ln for ln in lines if ln.startswith("[stems ")]
+    assert len(reported) == 8
+    assert sorted(int(ln.split("/")[0].rsplit(" ", 1)[1])
+                  for ln in reported) == list(range(1, 9))
+
+
+def test_one_stream_keeps_the_sequential_path(monkeypatch):
+    """`streams=1` must not wrap a thread pool around a serial run."""
+    from mtx import scan as scan_mod
+    from mtx.metrics import stems as m
+
+    order = []
+    monkeypatch.setattr(m, "separate", lambda p, c, model=None, **kw:
+                        (order.append(p), {"vocals": p})[1])
+    scan_mod.separate_first(["/a.flac", "/b.flac"], None, lambda _: None,
+                            streams=1)
+    assert order == ["/a.flac", "/b.flac"]

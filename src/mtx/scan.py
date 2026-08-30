@@ -49,7 +49,8 @@ import json
 import os
 import time
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import (ProcessPoolExecutor, ThreadPoolExecutor,
+                                as_completed)
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -68,7 +69,12 @@ ROOT_MARKER = ".mtx-root.json"
 SUMMARY_NAME = "summary.csv"
 
 # Directories that never hold masters worth measuring.
-SKIP_DIRS = {".mtx", ".mtx_cache", "mtx_out", ".git", ".svn", "__pycache__",
+# A mirror tree holds no audio, but a stem cache is nothing but audio, and both
+# are commonly parked beside the library they describe.  Walking into either is
+# how a scan ends up measuring its own output: a separated vocal is not a
+# master, and analysing one would quietly poison the corpus.
+SKIP_DIRS = {".mtx", ".mtx_cache", "mtx_out", "_mtx_out", "_mtx_stems",
+             ".git", ".svn", "__pycache__",
              "$RECYCLE.BIN", "System Volume Information"}
 
 ENV_REGISTRY = "MTX_SCAN_ROOTS"
@@ -578,44 +584,71 @@ def materialize_duplicate(dup: Duplicate, *, profile: str, stems: bool,
 # -------------------------------------------------------- separation up front
 
 def separate_first(sources: list[str], stems_model: str | None,
-                   log=print) -> int:
-    """Separate every track on the GPU, one at a time, before measuring starts.
+                   log=print, streams: int | None = None) -> int:
+    """Separate every track on the GPU before measuring starts.
 
-    A card is fast but small.  The pool runs several files at once, and several
-    separations on one consumer GPU is an out-of-memory error rather than
-    several times the speed -- so on a GPU the separations come out of the pool
-    and are done here, back to back, each with the whole card and every core
-    for the decode and write around it.
+    A card is fast but small, so the separations come out of the pool and are
+    done here rather than inside workers that would each want their own copy
+    of the model.  They are not done one at a time.  A single separation
+    leaves a GTX 1650 68 % busy -- the rest of each track goes on decoding the
+    input and writing four uncompressed wavs, with the device idle -- and
+    overlapping a few streams fills those gaps for 1.51x at three.  How many
+    the card's memory holds is `separation_streams()`, which leaves a reserve
+    rather than discovering the ceiling through an out-of-memory failure.
 
     Nothing else changes: each result lands in the same content-addressed cache
     the workers read, so the pool that follows finds every one of them already
     there and spends its processes on the DSP, which is what processes are good
-    for here.  Stopping partway through costs only the separation in flight --
+    for here.  Stopping partway through costs only the separations in flight --
     the rest stay cached, and the next run starts from them.
     """
+    import threading
+
     from .metrics import stems as m_stems
     from .util import Collector
 
+    if streams is None:
+        streams = m_stems.separation_streams()
+    streams = max(1, min(int(streams), len(sources)))
+
     t0 = time.time()
+    lock = threading.Lock()
     done = 0
-    for n, src in enumerate(sources, 1):
+    seen = 0
+
+    def one(src: str) -> None:
+        nonlocal done, seen
         collector = Collector()
         s0 = time.time()
         paths = m_stems.separate(src, collector, stems_model)
         spent = time.time() - s0
         name = os.path.basename(src)
-        for w in collector.warnings:
-            log(f"  {name}: {w}")
-        if paths is None:
-            log(f"[stems {n}/{len(sources)}] {name}: not separated; the file "
-                "will be measured without stems")
-            continue
-        done += 1
-        rate = (time.time() - t0) / n
-        tail = "" if n == len(sources) else \
-            f"  eta {_fmt_hms(rate * (len(sources) - n))}"
-        cached = " (cached)" if spent < 1.0 else ""
-        log(f"[stems {n}/{len(sources)}] {name}: {spent:.0f} s{cached}{tail}")
+        # One lock for the counters and the line they print, so a track's
+        # warnings stay attached to it while several separations report.
+        with lock:
+            seen += 1
+            n = seen
+            for w in collector.warnings:
+                log(f"  {name}: {w}")
+            if paths is None:
+                log(f"[stems {n}/{len(sources)}] {name}: not separated; the "
+                    "file will be measured without stems")
+                return
+            done += 1
+            # Wall clock over completions already carries the concurrency:
+            # `streams` tracks finishing together shorten the mean directly.
+            rate = (time.time() - t0) / n
+            tail = "" if n == len(sources) else \
+                f"  eta {_fmt_hms(rate * (len(sources) - n))}"
+            cached = " (cached)" if spent < 1.0 else ""
+            log(f"[stems {n}/{len(sources)}] {name}: {spent:.0f} s{cached}{tail}")
+
+    if streams == 1:
+        for src in sources:
+            one(src)
+    else:
+        with ThreadPoolExecutor(max_workers=streams) as pool:
+            list(pool.map(one, sources))
     return done
 
 
@@ -755,7 +788,8 @@ def _fmt_hms(seconds: float) -> str:
 
 def run_scan(scan_path: str, *, out: str | None = None,
              library_root: str | None = None, profile: str = "full",
-             jobs: int | None = None, force: bool = False,
+             jobs: int | None = None, stems_jobs: int | None = None,
+             force: bool = False,
              recheck: bool = False, stems: bool = False, plots: bool = False,
              json_only: bool = False, stems_model: str | None = None,
              transcribe: bool = False, embed: bool = False,
@@ -878,10 +912,17 @@ def run_scan(scan_path: str, *, out: str | None = None,
         from .metrics import stems as m_stems
         device = m_stems.resolve_device()
         if device.startswith("cuda"):
-            log(f"stems: separating {len(todo)} file(s) on {device} before "
-                "measuring, one at a time")
+            streams = m_stems.separation_streams(stems_jobs)
+            streams = max(1, min(streams, len(todo)))
+            vram = m_stems.device_vram_mib()
+            room = f", {vram} MiB" if vram else ""
+            at_once = ("one at a time" if streams == 1
+                       else f"{streams} at a time")
+            log(f"stems: separating {len(todo)} file(s) on {device}{room} "
+                f"before measuring, {at_once}")
             try:
-                separate_first([src for src, _, _ in todo], stems_model, log)
+                separate_first([src for src, _, _ in todo], stems_model, log,
+                               streams=streams)
             except KeyboardInterrupt:
                 log("interrupted; separations that finished stay cached and "
                     "the next run picks up from there")

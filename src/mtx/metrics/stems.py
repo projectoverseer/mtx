@@ -28,7 +28,15 @@ from ..audio import AudioSource
 from ..params import PARAMS
 from ..util import Collector, db_amp
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "mtx", "stems")
+ENV_CACHE = "MTX_STEMS_CACHE"
+
+# Separation output is uncompressed wav, four of them per track, so a library
+# scan puts tens of gigabytes somewhere -- and the home directory is usually on
+# the smallest disk in the machine.  The variable names a better one.  It is
+# read once, at import, so a scan and every worker it spawns agree on where the
+# cache lives without the path having to be threaded through them.
+CACHE_DIR = (os.environ.get(ENV_CACHE) or
+             os.path.join(os.path.expanduser("~"), ".cache", "mtx", "stems"))
 
 # What each demucs model separates into.  The six-source model is the cheapest
 # way to stop calling a guitar `other`: same dependency, same runtime order,
@@ -105,6 +113,61 @@ def resolve_segment(requested: int | None = None) -> int | None:
         return int(float(env)) if env else None
     except (TypeError, ValueError):
         return None
+
+
+# A card is small but it is not busy.  Measured on a GTX 1650 (4 GiB) over 45
+# tracks at the default segment: one separation at a time holds 875 MiB and
+# leaves the SM 68 % busy, because a large share of every track is spent
+# decoding the input and writing four uncompressed wavs with the device idle.
+# Overlapping separations fills those gaps -- 1.36x at two streams, 1.51x at
+# three, where utilisation reaches 94 % and there is nothing left to fill.
+#
+# What stops it is memory, and that scales exactly linearly: 875 MiB a stream,
+# so three fit a 4 GiB card and four do not.  The reserve below is what keeps
+# the fourth from being attempted on this card -- an out-of-memory failure
+# costs a step down the segment ladder and the separation that hit it, which
+# is more than the last few percent of utilisation is worth.
+STREAM_VRAM_MIB = 900
+VRAM_RESERVE_MIB = 1100
+MAX_STREAMS = 4
+
+ENV_STREAMS = "MTX_STEMS_JOBS"
+
+
+def device_vram_mib() -> int | None:
+    """Total memory on the CUDA device, or None when there is no card.
+
+    Only ever called after `cuda_available()` has already paid for the torch
+    import, so this costs nothing a stems run has not already spent.
+    """
+    if not cuda_available():
+        return None
+    try:
+        import torch
+        total = torch.cuda.get_device_properties(0).total_memory
+        return int(total // (1024 * 1024))
+    except Exception:
+        return None
+
+
+def separation_streams(requested: int | None = None) -> int:
+    """How many separations may share the card at once.
+
+    An explicit request wins, so a card this arithmetic reads wrongly can
+    still be driven by hand.  Otherwise it is what the device's memory holds
+    with a reserve left over, capped: past about four streams the SM is
+    already saturated and the extra memory buys nothing.
+    """
+    if requested is None:
+        env = os.environ.get(ENV_STREAMS)
+        requested = int(env) if env and env.isdigit() else None
+    if requested is not None:
+        return max(1, int(requested))
+    vram = device_vram_mib()
+    if not vram:
+        return 1
+    fits = (vram - VRAM_RESERVE_MIB) // STREAM_VRAM_MIB
+    return max(1, min(MAX_STREAMS, int(fits)))
 
 
 def _out_of_memory(stderr: str) -> bool:

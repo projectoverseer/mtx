@@ -461,7 +461,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
     try:
         stats = run_scan(
             args.path, out=args.out, library_root=args.library_root,
-            profile=args.profile, jobs=args.jobs, force=args.force,
+            profile=args.profile, jobs=args.jobs,
+            stems_jobs=getattr(args, "stems_jobs", None), force=args.force,
             recheck=args.recheck, stems=args.stems, plots=args.plots,
             json_only=args.json_only, max_part_bytes=parse_part_size(args),
             stems_model=getattr(args, "stems_model", None),
@@ -749,7 +750,12 @@ def build_parser() -> argparse.ArgumentParser:
                     default="auto",
                     help="where to separate (default auto: the GPU if torch "
                          "can see one). On a GPU the separations are done "
-                         "up front, one at a time, since a card holds one")
+                         "up front, a few at a time, before the pool starts")
+    sc.add_argument("--stems-jobs", type=int, metavar="N",
+                    help="separations to run on the card at once (default: "
+                         "what its memory holds, about 900 MiB each, capped "
+                         "at 4). One stream leaves a card two thirds busy; "
+                         "the rest of a track is decode and wav writing")
     sc.add_argument("--stems-segment", type=int, metavar="SECONDS",
                     help="seconds of audio demucs holds on the device at once. "
                          "Lower it if a small card runs out of memory; the "
