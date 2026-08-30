@@ -20,10 +20,7 @@ ci_blind/
 ci_sec/
 ci_big/
 ci_batch/
-<<<<<<< HEAD
 ci_cache/
-=======
->>>>>>> 425d1b1c98d36da4d8be6bf9a20bfab8da99db3a
 ci_masters.csv
 ci_pred.txt
 ci_signal.flac

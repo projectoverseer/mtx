@@ -267,7 +267,6 @@ Both are rendered into the digest's `FLAGS` section, before the detail.
 
 ---
 
-<<<<<<< HEAD
 ## `split` and the part files
 
 Present only when the document was too large for one file. `analysis.json` is
@@ -301,8 +300,6 @@ describes how the document was carried, not what was measured.
 
 ---
 
-=======
->>>>>>> 425d1b1c98d36da4d8be6bf9a20bfab8da99db3a
 ## `corpus_row.json` (written next to `digest.md`)
 
 The `CORPUS ROW` block as typed JSON, so a measurement reaches an archive
@@ -316,7 +313,6 @@ the PSR minimum. Anything mtx cannot measure is `null`, never guessed --
 `Engineers` always is, and no session field (calibration, lessons, verdict)
 appears at all.
 
-<<<<<<< HEAD
 ## `online.json` (`mtx enrich`)
 
 `online.schema_version` **1.0.0**. A **sidecar**, written beside
@@ -399,8 +395,6 @@ A wrong match is therefore auditable rather than invisible.
 
 ---
 
-=======
->>>>>>> 425d1b1c98d36da4d8be6bf9a20bfab8da99db3a
 ## `comparison.json` (`mtx compare`)
 
 | Field | Description |
