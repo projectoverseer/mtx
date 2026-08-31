@@ -17,7 +17,7 @@ The short version, for anyone who only wants the conclusion:
 ## The bench
 
 | component | |
-|---|---|
+| --- | --- |
 | CPU | Intel i7-9750H, **6 physical / 12 logical**, base 2.6 GHz, 45 W mobile |
 | RAM | 31.7 GB |
 | GPU | NVIDIA GTX 1650 Mobile, **4095 MiB**, driver 591.74, 30 W enforced limit |
@@ -64,7 +64,7 @@ Twelve identical tracks, stems pre-cached so nothing but DSP is timed, one
 thread per worker, `ProcessPoolExecutor` exactly as `scan.py` builds it.
 
 | workers | wall | throughput (audio-s / wall-s) | CPU s per track |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 6 | 886.6 s | 2.754 | 420.2 |
 | 9 | 891.6 s | 2.739 | 547.9 |
 | 12 | 886.0 s | **2.756** | 823.8 |
@@ -108,7 +108,7 @@ A follow-up sweep at `k = 5, 4, 3` was run on a **different, six-track subset**
 of the same library. Its first point reads:
 
 | workers | wall | throughput | CPU s per track |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 5 | 539.0 s | 2.204 | 325.2 |
 
 That 2.204 is **not** directly comparable to the 2.754 at `k=6` above, because
@@ -135,7 +135,7 @@ three. Fifteen fresh (uncached) tracks per point, `nvidia-smi` sampled at 1 Hz
 throughout:
 
 | streams | wall | throughput | mean GPU util | peak VRAM | speedup |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | 1 | 397.1 s | 7.24 | 68 % | 875 MiB | 1.00× |
 | 2 | 370.8 s | 9.86 | 87 % | 1750 MiB | **1.36×** |
 | 3 | 328.2 s | 10.90 | **94 %** | 2625 MiB | **1.51×** |
@@ -166,7 +166,7 @@ This is the important one, and it reorders every other optimisation.
 this corpus, per 59 tracks:
 
 | phase | wall | during which |
-|---|---|---|
+| --- | --- | --- |
 | separation, 1 stream | ~30.5 min | 6 cores mostly idle |
 | separation, 3 streams | ~20.3 min | 6 cores mostly idle |
 | **DSP at `-j 6`** | **~76 min** | GPU completely idle |
@@ -205,11 +205,263 @@ The estimate is soft because the pool is already bandwidth-saturated, so
 demucs's CPU-side work will not compose perfectly additively with DSP. Treat
 ~19 % as an optimistic bound and measure before believing it.
 
-**This has not been implemented.** It restructures the result-reporting loop in
-`run_scan`, which carries careful service-time ETA logic (see the `eta_seconds`
-docstring), and landing it without a measurement harness in place risks
-breaking the ledger and ETA behaviour for a gain that is real but not dramatic.
-It is the correct next piece of work and it should be done deliberately.
+**This has now been implemented**, and the estimate above was wrong in an
+instructive way. `scan.drive` runs the separation threads and the measuring
+pool at the same time; a track is submitted the moment *its own* stems exist.
+The card and the cores do overlap, and the separation phase does disappear.
+
+What the estimate missed is that the two halves compete for something other
+than cores. A demucs process holds **2.5 GB of host memory** while it works,
+and the byte budget below cannot see it, so every concurrent separation costs
+about half a measuring lane. Overlapping the phases is not free; it is paid
+for in RAM, on a machine where RAM is what runs out first.
+
+That is also why the pipelined default is **one separation stream**, not the
+three that Finding 2 recommends. The 1.51x from overlapping three streams
+belonged entirely to the old design, where separation was a phase the cores
+sat through. Once it hides under the measuring, a second stream buys nothing
+the pipeline needs and costs memory the measuring wants — which is exactly
+what Finding 2 predicted would happen ("once the phases are overlapped,
+further GPU work is worth nothing"), arriving sooner than expected.
+
+---
+
+## Finding 4a — measure the machine before you believe anything about the code
+
+Read this before Finding 4, which it partly invalidates.
+
+Every memory number in this document was collected on a machine that had
+`AMPLibraryAgent.exe` — the Apple Music library agent, part of the Apple
+Music app for Windows — running in the background:
+
+| | when the scan was diagnosed |
+| --- | --- |
+| commit charged by that one process | **45.4 GB** |
+| CPU it had burned since 20:13 the previous evening | **27.3 hours** |
+| wall clock over that period | 11.8 hours |
+| cores it therefore held, continuously | **2.3 of 6** |
+| commit free for everything else | **0.8 GB** |
+| commit free one second after stopping it | **47.1 GB** |
+
+It had started at 20:13, minutes before the overnight scan, and it was still
+growing at 07:00. It indexes music files, and a library scan reading 1 274 of
+them is exactly what wakes it.
+
+So the overnight run was not measuring what it looked like it was measuring. It
+was sharing the machine with a process taking a third of the cores and all but
+0.8 GB of the commit limit, and the `MemoryError`s were raised against *that*,
+not against six workers' own footprint. Allocations of **54 MiB** were failing.
+
+**What this invalidates.** Finding 4 attributes Coldplay's collapse to 192 kHz
+masters. The two are confounded: Coldplay ran last, at about 06:00, by which
+point the agent's commit had grown to its maximum. The 192 kHz footprint is
+real and measured, and it is larger, but the claim that it *alone* caused the
+collapse is not supported and should not be repeated.
+
+**What survives.** The per-track footprints (measured directly, one process at
+a time), the sample-rate distribution, the shape of the cost model, and the
+argument that admission belongs on bytes rather than on job count. Scheduling
+by size is right whether or not it was what bit that night.
+
+**Method, for next time.** Before attributing a slowdown to the code, check:
+
+```powershell
+# commit, not just working set: this is what MemoryError is raised against
+$o = Get-CimInstance Win32_OperatingSystem
+'{0:N1} GB commit free of {1:N1} GB' -f ($o.FreeVirtualMemory/1MB), ($o.TotalVirtualMemory/1MB)
+
+# who is holding it
+Get-Process | Sort-Object -Descending PrivateMemorySize64 |
+    Select-Object -First 5 Name,
+        @{n='CommitGB';e={[math]::Round($_.PrivateMemorySize64/1GB,2)}},
+        @{n='CPUh';e={[math]::Round($_.CPU/3600,1)}}
+```
+
+Working set is what `GetProcessMemoryInfo` reports and what Task Manager shows
+by default, and it is *not* the quantity that fails. A process can hold 45 GB
+of commit against a 6.9 GB working set, which is exactly what this one did —
+invisible in the obvious place to look, and fatal.
+
+Before a long unattended run on Windows, stop it:
+
+```powershell
+Stop-Process -Name AMPLibraryAgent -Force -ErrorAction SilentlyContinue
+```
+
+It is a COM-activated background agent and relaunches on demand, so this costs
+nothing but the indexing pass it was in the middle of.
+
+---
+
+## Finding 4 — the pool is bounded by memory, not by cores, and it fails hard
+
+The overnight run that produced this section measured 192 tracks in 7 h 17 m and
+lost most of that time to a limit nothing in the code was watching.
+
+Nine workers were killed outright (`BrokenProcessPool`) and fourteen more died
+with `MemoryError` — every one of them on Coldplay, whose masters are 192 kHz:
+
+```
+9  x worker lost: BrokenProcessPool: terminated abruptly
+1  x MemoryError: Unable to allocate 1.08 GiB, shape (72350720, 2), float64  loudness.py:198
+1  x MemoryError: Unable to allocate 877. MiB, shape (57458958, 2), float64  loudness.py:198
+1  x MemoryError: Unable to allocate 794. MiB, shape (52052480, 2), float64  _signaltools.py
+...
+```
+
+The per-artist throughput tells the rest of the story:
+
+| artist | tracks | wall | audio-s / wall-s | rate |
+| --- | --- | --- | --- | --- |
+| Ariana Grande (44.1 kHz) | 121 | 3 h 34 m | 1.8 | healthy |
+| Adele (44.1 kHz) | 24 | 1 h 03 m | 1.7 | healthy |
+| Calvin Harris (44.1 kHz) | 24 | 49 m | 1.8 | healthy |
+| **Coldplay (192 kHz)** | **7 of 30** | **49 m** | **0.5** | **collapsed** |
+
+The collapse is worse than it looks. A single process measuring one 192 kHz
+track end to end, with warm stems, sustains **0.49 audio-s/wall-s**. Six
+workers on the same content managed **0.5 in total** — the pool as a whole did
+no more than one worker alone would have.
+
+*How much of that was the 192 kHz masters and how much was the background
+agent of Finding 4a is not separable from this run.* Coldplay ran last, when
+the agent was at its largest. The footprints below are measured one process at
+a time and stand on their own; the attribution of this particular collapse does
+not.
+
+### What a worker actually holds
+
+Peak working set, measured with `GetProcessMemoryInfo`, one track, `threads=1`:
+
+| track | peak RSS |
+| --- | --- |
+| 44.1 kHz stereo, 285 s, with stems | **4.68 GB** |
+| 192 kHz stereo, 283 s, with stems | **5.75 GB** |
+
+`audio.py`'s docstring claims "peak memory is the size of the decoded float32
+signal and not a multiple of it". That is true of *decoding* and untrue of the
+run: `AudioSource` then caches `mono`, `mid`, `side`, `band_x`, `band_mid`,
+`band_side` and an int32 copy, all but the first in float64, and a stems run
+holds **five of these objects at once** — the master and four stems.
+
+Six lanes × 4.68 GB is 28 GB on a 34 GB machine. It fits, barely, which is why
+44.1 kHz artists ran at full speed. Six lanes × the 192 kHz footprint does not,
+and nothing in the code noticed.
+
+### Why worker count is the wrong unit
+
+`-j 6` is a statement about cores. Memory demand is a statement about frames ×
+channels, and those two disagree by a factor of four across this library:
+
+| rate | files | share of files | share of all frames |
+| --- | --- | --- | --- |
+| 44.1 kHz | 743 | 58.3 % | 46.5 % |
+| 48 kHz | 353 | 27.7 % | 23.3 % |
+| 88.2–192 kHz | 178 | **14.0 %** | **30.2 %** |
+
+Hi-res is 14 % of the files and 30 % of the samples, and it is not confined to
+one corner: Queen (40 files), Mariah Carey (29), Taylor Swift (26), Coldplay
+(21), Elvis Presley (14), Harry Styles (12), Amy Winehouse (11), Bruno Mars (9).
+Any library scan will walk into it.
+
+So admission is now by size. Each job carries `decoded_bytes`, `drive` holds a
+byte budget rather than a job count, and a run of long or high-rate tracks
+narrows the pool by itself:
+
+| track | modelled | measured | lanes admitted |
+| --- | --- | --- | --- |
+| 44.1 kHz, 285 s, stems | 4.73 GB | 4.68 GB | **5** |
+| 48 kHz, 303 s, stems | 5.13 GB | — | **5** |
+| 192 kHz, 283 s, stems | 7.07 GB | 5.75 GB | **3** |
+| 192 kHz, 435 s, stems (longest in the library) | 10.87 GB | — | **2** |
+
+The model is built from what `audio.py` keeps rather than fitted to a curve,
+which is why it lands within 1 % on the common case. It is deliberately
+conservative on hi-res: the estimate counts every cached view as live for the
+whole run, and Windows trims working sets, so the modelled 7.07 GB against a
+measured 5.75 GB is headroom, not error.
+
+The budget is `total RAM − 3 GB − 3 GB per separation stream`, held back as
+amounts rather than a share. Both are roughly constant — the OS and the file
+cache the decoding leans on, and a demucs process measured at 2.47 GB — so taking
+a proportion would punish a small machine, where the reserve matters most. On
+this bench, with the pipeline's one stream, that is 28.1 GB.
+
+Note what that costs. **Six lanes of 44.1 kHz fitted before the pipeline and
+five fit after it**, because a concurrent separation holds about half a lane's
+worth of memory. That is the price of overlapping the phases on this machine,
+and it is smaller than the phase the overlap removes.
+
+---
+
+## Where a track's time actually goes
+
+cProfile over one full-profile 44.1 kHz track with warm stems, 285 s of audio,
+one thread — cumulative seconds, so the entries nest:
+
+| what | cumulative | share |
+| --- | --- | --- |
+| `stems.analyse` (four stems, every metric) | 274 s | 56 % |
+| `delivery.analyse` (lossy encode passes) | 105 s | 22 % |
+| `loudness.analyse` × 5 (master + 4 stems) | 111 s | 23 % |
+| `resample_poly` / `upfirdn` (true-peak oversampling) | 85 s | 18 % |
+| `melody.track_f0` / librosa `pyin` | 71 s | 15 % |
+
+There is no redundant work of consequence in here. The one uncached view —
+`AudioSource.channel()`, rebuilt 50 times a track — costs about 5 GB of
+repeated float64 conversion, which at this machine's bandwidth is well under a
+second against a 486 s run. Caching it would trade ~1 GB of extra resident
+memory for that. It is not worth it, and it is written down here so nobody
+measures it a third time.
+
+**The DSP cost is inherent.** Per-worker throughput is ~0.48 audio-s/wall-s on
+both 44.1 kHz and 192 kHz content, and six workers saturate memory bandwidth at
+~2.75–2.9. That is the ceiling this machine has; the work below was about
+reaching it, not raising it.
+
+---
+
+## Two things the pipeline got wrong first, and what they cost
+
+Both were found by running it, not by reading it. Both are worth knowing about
+because the same shapes will recur in any producer/consumer stage added here.
+
+### The card must never wait on the memory gate
+
+The first version had the separation threads submit their own track to the
+pool. A stage thread that finished separating and found no memory free would
+block *holding its separation slot*, so the card stopped — waiting on a core.
+That is precisely the coupling the pipeline exists to remove, reintroduced one
+layer down.
+
+`drive` now puts a feeder thread between them. Separation threads separate,
+push onto a queue and go straight back to the card; the feeder alone waits for
+memory. The card runs on to the next track, the next album, the next artist,
+and stops only when the *disk* lookahead says it is far enough ahead.
+
+### The budget has to count the separations too
+
+The first pipelined run of nine tracks failed **all nine** with `MemoryError` —
+including allocations as small as 4 MiB, which is what an exhausted commit
+looks like. The budget had admitted five measuring lanes against 28 GB while
+three demucs processes held 7.5 GB it knew nothing about.
+
+| quantity | bytes |
+| --- | --- |
+| measured demucs peak, one stream | **2.47 GB** |
+| reserve now held back per stream | 3 GB |
+| base reserve (OS, file cache, parent) | 3 GB |
+
+With one stream that leaves 28.1 GB, five lanes of a 4.7 GB track, and a
+29.6 GB peak on a 34.1 GB machine.
+
+### A failed track keeps its stems
+
+`--prune-stems` originally dropped a track's stems on any completion. A track
+that failed therefore lost minutes of GPU to save 165 MB of disk for the few
+seconds until the next run reached it. It now drops them only on success,
+which is the rule the standalone `tools/prune_stems.py` already followed (it
+requires a `corpus_row.json` before deleting anything).
 
 ---
 
@@ -219,10 +471,16 @@ Extrapolating the measured 106 min per 59 tracks to 100 000 masters, at this
 corpus's mean of 225 s a track:
 
 | configuration | est. continuous runtime |
-|---|---|
+| --- | --- |
 | sequential phases, serial separation (before this work) | ~125 days |
-| sequential phases, 3 separation streams (**current**) | ~113 days |
-| overlapped phases (not implemented) | ~89–98 days |
+| sequential phases, 3 separation streams | ~113 days |
+| overlapped phases, five lanes (**current**) | ~101 days |
+
+The overlap does not deliver the whole of its arithmetic, because it is
+paid for in the memory a concurrent separation holds: the phase
+disappears, and a measuring lane goes with it. On a machine with more RAM
+the same code keeps six lanes and the gain is larger; that is the single
+upgrade this workload responds to.
 
 Storage matters as much as time at that scale, and neither number is small:
 
@@ -234,7 +492,7 @@ Storage matters as much as time at that scale, and neither number is small:
 This is not a scale-out worry to be handled later. On the bench library:
 
 | quantity | |
-|---|---|
+| --- | --- |
 | tracks | 1 274 |
 | stem cache if all are separated | **210.2 GB** |
 | output | 21.7 GB |
@@ -305,7 +563,7 @@ person's library and would rot. What matters is the method:
 ## Changes this document produced
 
 | change | file | status |
-|---|---|---|
+| --- | --- | --- |
 | `MTX_STEMS_CACHE` to relocate the stem cache off the system disk | `metrics/stems.py` | landed |
 | `_mtx_out` / `_mtx_stems` added to `SKIP_DIRS` so a scan cannot measure its own separated stems as masters | `scan.py` | landed |
 | `separation_streams()`, VRAM-derived, `--stems-jobs` to override | `metrics/stems.py`, `cli.py` | landed |
