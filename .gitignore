@@ -24,3 +24,6 @@ ci_cache/
 ci_masters.csv
 ci_pred.txt
 ci_signal.flac
+
+# Machine-specific CPU baseline recorded by tools/bench_cpu.py
+tools/.cpu_baseline.json

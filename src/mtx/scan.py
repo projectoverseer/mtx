@@ -653,6 +653,13 @@ def lookahead_for(procs: int, streams: int, requested: int | None = None) -> int
     return max(floor, int(requested)) if requested else floor
 
 
+# How many times the feeder may pass over a waiting track before it stops
+# admitting anything else.  Rarely reached -- a skipped track holds its
+# lookahead permit, so the window fills with skipped tracks on its own -- but
+# it turns "eventually" into a bound.
+SKIP_LIMIT = 64
+
+
 def drive(jobs_list: list[dict[str, Any]], submit, report, *,
           separate=None, streams: int = 1, lookahead: int = 0,
           budget: int = 0, restart=None, log=print) -> bool:
@@ -710,20 +717,6 @@ def drive(jobs_list: list[dict[str, Any]], submit, report, *,
     # budget still has to be measured, and it measures alone.
     biggest = max((int(j.get("bytes") or 0) for j in jobs_list), default=0)
 
-    def admit(job: dict[str, Any]) -> None:
-        """Wait until this track's decoded size fits beside what is running."""
-        nonlocal in_flight
-        need = int(job.get("bytes") or 0)
-        if not budget or not need:
-            return
-        with gate:
-            # `in_flight` guards the deadlock: a track bigger than the whole
-            # budget still has to be measured, so it goes when the pool is
-            # empty rather than waiting for room that will never exist.
-            while in_flight and in_flight + need > budget and not stopping.is_set():
-                gate.wait(timeout=1.0)
-            in_flight += need
-
     def retire(job: dict[str, Any]) -> None:
         nonlocal in_flight
         need = int(job.get("bytes") or 0)
@@ -746,10 +739,49 @@ def drive(jobs_list: list[dict[str, Any]], submit, report, *,
             return
         fut.add_done_callback(lambda f: landed.put((job, f, None)))
 
-    ready: queue.Queue = queue.Queue()
+    waiting: list[dict[str, Any]] = []
+
+    def offer(job: dict[str, Any]) -> None:
+        """A separated track joins the pool of candidates for a lane."""
+        with gate:
+            waiting.append(job)
+            gate.notify_all()
+
+    def choose() -> dict[str, Any] | None:
+        """The next track worth a lane.  Called holding `gate`.
+
+        Not the head of the queue.  Strict FIFO admission cost a real
+        morning: a 9.0 GB master at the front held five smaller, already
+        separated tracks behind it for an hour while three of five workers
+        sat idle -- textbook head-of-line blocking, provoked every time a
+        library's largest tracks sit together in directory order.  So this
+        picks the *largest waiting track that fits* beside what is running,
+        and a track no lane can hold yet waits without making anything else
+        wait.
+
+        Starvation of the big track is bounded twice over.  A skipped track
+        keeps holding its lookahead permit, so separation cannot flood the
+        window with fresh small tracks indefinitely -- the window fills with
+        the very tracks being skipped until they are all there is.  And one
+        passed over `SKIP_LIMIT` times stops being skippable at all: nothing
+        further is admitted until it fits.  A track larger than the whole
+        budget fits only an empty pool, which the `in_flight` term grants it.
+        """
+        if not waiting:
+            return None
+        if not budget:
+            return waiting[0]
+        starved = [j for j in waiting if j.get("_skips", 0) >= SKIP_LIMIT]
+        pool = starved or waiting
+        fits = [j for j in pool
+                if not in_flight
+                or in_flight + int(j.get("bytes") or 0) <= budget]
+        if not fits:
+            return None
+        return max(fits, key=lambda j: int(j.get("bytes") or 0))
 
     def feed() -> None:
-        """Hand separated tracks to the pool as memory frees up.
+        """Hand tracks to the pool as memory frees up.
 
         Its own thread on purpose.  Waiting for memory here rather than in the
         separation threads is the whole point: a stage thread that blocked on
@@ -758,21 +790,31 @@ def drive(jobs_list: list[dict[str, Any]], submit, report, *,
         to the next track -- the next album, the next artist -- and stops only
         when the disk lookahead says it is far enough ahead.
         """
-        for _ in range(total):
-            job = ready.get()
-            if job is None or stopping.is_set():
-                return
-            admit(job)
-            if stopping.is_set():
-                return
+        nonlocal in_flight
+        sent = 0
+        while sent < total:
+            with gate:
+                job = choose()
+                while job is None and not stopping.is_set():
+                    gate.wait(timeout=1.0)
+                    job = choose()
+                if stopping.is_set():
+                    return
+                waiting.remove(job)
+                for other in waiting:
+                    other["_skips"] = other.get("_skips", 0) + 1
+                need = int(job.get("bytes") or 0)
+                if budget and need:
+                    in_flight += need
             send(job)
+            sent += 1
 
     room: Any = None
     sep_pool: Any = None
 
     if separate is None:
         for job in jobs_list:
-            ready.put(job)
+            offer(job)
     else:
         room = threading.Semaphore(max(1, lookahead))
 
@@ -785,7 +827,7 @@ def drive(jobs_list: list[dict[str, Any]], submit, report, *,
             except Exception as exc:  # a bad separation is not a dead run
                 log(f"  {os.path.basename(job['source'])}: separation failed "
                     f"({type(exc).__name__}: {exc}); measuring without stems")
-            ready.put(job)
+            offer(job)
 
         sep_pool = ThreadPoolExecutor(max_workers=max(1, streams),
                                       thread_name_prefix="mtx-sep")
@@ -889,7 +931,6 @@ def drive(jobs_list: list[dict[str, Any]], submit, report, *,
         stopping.set()
         with gate:
             gate.notify_all()
-        ready.put(None)
         if sep_pool is not None:
             # Wake anything parked on the semaphore so it can see the flag and
             # leave, rather than holding the shutdown open until a permit that

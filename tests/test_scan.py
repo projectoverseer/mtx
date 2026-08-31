@@ -1108,3 +1108,131 @@ def test_the_interrupt_handler_is_put_back():
                                           "ok": True}).submit,
                    lambda r: None, log=lambda m: None)
     assert signal.getsignal(signal.SIGINT) is before
+
+
+class _GatedPool:
+    """Futures that finish only when the test says so, recording the order."""
+
+    def __init__(self):
+        self.submitted = []
+        self.futures = {}
+
+    def submit(self, job):
+        fut = Future()
+        name = os.path.basename(job["source"])
+        self.submitted.append(name)
+        self.futures[name] = (fut, job)
+        return fut
+
+    def finish(self, name):
+        fut, job = self.futures[name]
+        fut.set_result({"source": job["source"], "out_dir": job["out_dir"],
+                        "ok": True})
+
+
+def _wait_for(predicate, timeout=5.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_a_big_track_does_not_block_the_small_ones_behind_it():
+    """The morning this test exists for: a 9 GB master at the head of the
+    queue held five smaller, already-separated tracks behind it for an hour
+    while three of five workers sat idle.  The feeder must admit what fits.
+    """
+    import threading
+
+    from mtx import scan as scan_mod
+
+    jobs = []
+    for name, gb in (("A", 8), ("B", 8), ("C", 1), ("D", 1)):
+        jobs.append({"source": f"/lib/{name}", "out_dir": f"/out/{name}",
+                     "bytes": gb * 1_000_000_000})
+    pool = _GatedPool()
+    done = []
+    t = threading.Thread(target=scan_mod.drive,
+                         args=(jobs, pool.submit, done.append),
+                         kwargs={"budget": 10_000_000_000,
+                                 "log": lambda m: None},
+                         daemon=True)
+    t.start()
+
+    # A fills 8 of the 10 GB.  B (8 GB) does not fit -- and must not stop
+    # C and D (1 GB each) from taking the idle lanes.
+    assert _wait_for(lambda: len(pool.submitted) == 3), \
+        f"expected 3 tracks running, saw {pool.submitted}"
+    assert sorted(pool.submitted) == ["A", "C", "D"]
+    assert "B" not in pool.submitted
+
+    pool.finish("C")
+    pool.finish("D")
+    time.sleep(0.2)
+    assert "B" not in pool.submitted, "8 in flight + 8 still does not fit"
+
+    pool.finish("A")
+    assert _wait_for(lambda: "B" in pool.submitted), \
+        "with the pool drained, the big track finally goes"
+    pool.finish("B")
+    t.join(timeout=5)
+    assert not t.is_alive()
+    assert len(done) == 4 and all(r["ok"] for r in done)
+
+
+def test_without_a_budget_the_feeder_keeps_the_given_order():
+    """Best-fit is a memory policy.  With no budget there is nothing to fit,
+    and the order the caller chose is the order the pool sees."""
+    import threading
+
+    from mtx import scan as scan_mod
+
+    jobs = _jobs(6)
+    pool = _GatedPool()
+    t = threading.Thread(target=scan_mod.drive,
+                         args=(jobs, pool.submit, lambda r: None),
+                         kwargs={"log": lambda m: None}, daemon=True)
+    t.start()
+    assert _wait_for(lambda: len(pool.submitted) == 6)
+    assert pool.submitted == [os.path.basename(j["source"]) for j in jobs]
+    for name in list(pool.submitted):
+        pool.finish(name)
+    t.join(timeout=5)
+    assert not t.is_alive()
+
+
+def test_a_starved_track_eventually_freezes_the_line(monkeypatch):
+    """After SKIP_LIMIT pass-overs, nothing else is admitted until it fits."""
+    import threading
+
+    from mtx import scan as scan_mod
+
+    monkeypatch.setattr(scan_mod, "SKIP_LIMIT", 2)
+    jobs = [{"source": "/lib/BIG", "out_dir": "/out/BIG", "bytes": 9_000_000_000}]
+    for i in range(5):
+        jobs.append({"source": f"/lib/s{i}", "out_dir": f"/out/s{i}",
+                     "bytes": 4_000_000_000})
+    pool = _GatedPool()
+    t = threading.Thread(target=scan_mod.drive,
+                         args=(jobs, pool.submit, lambda r: None),
+                         kwargs={"budget": 10_000_000_000,
+                                 "log": lambda m: None}, daemon=True)
+    t.start()
+
+    # BIG admitted first (largest that fits an empty pool). s0 does not fit
+    # beside it, so the smalls only flow after BIG is done.
+    assert _wait_for(lambda: "BIG" in pool.submitted)
+    pool.finish("BIG")
+    # Two smalls run (8 of 10 GB), the rest are skipped past... but each skip
+    # ages them, and with SKIP_LIMIT=2 the line must still drain completely.
+    def drain():
+        for name in list(pool.futures):
+            fut, _ = pool.futures[name]
+            if not fut.done():
+                pool.finish(name)
+        return len(pool.submitted) == 6
+    assert _wait_for(drain, timeout=10)
+    t.join(timeout=5)
+    assert not t.is_alive()

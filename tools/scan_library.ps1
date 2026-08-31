@@ -55,6 +55,16 @@
     throughput. They are COM-activated and relaunch on demand, so stopping one
     costs nothing but the indexing pass it was in.
 
+.PARAMETER AllowSlowCpu
+    Scan even though this machine is measurably slower than it has been.
+
+    tools\bench_cpu.py records the best single-core FFT rate this machine has
+    ever shown and compares against it. Well below that is a clamped chip, not
+    expensive audio, and the two are indistinguishable from inside a scan: one
+    morning here went to an i7-9750H pinned at 778 MHz -- 30% of nominal, on
+    AC, cooler and slower than the same machine on battery an hour before --
+    while the scan reported honest eighty-hour ETAs and looked broken.
+
 .PARAMETER AllowBattery
     Run even though the machine is on battery. It refuses by default.
 
@@ -76,7 +86,8 @@ param(
     [string] $StemsCache  = "",
     [switch] $KeepStems,
     [switch] $StopIndexers,
-    [switch] $AllowBattery
+    [switch] $AllowBattery,
+    [switch] $AllowSlowCpu
 )
 
 $ErrorActionPreference = "Stop"
@@ -150,6 +161,34 @@ if ($battery -and $battery.BatteryStatus -eq 1) {
     Write-Log "-AllowBattery given; continuing at reduced clocks."
 } elseif ($perf) {
     Write-Log ("power   : AC, cores at {0:N0}% of nominal" -f $perf)
+}
+
+# Is the machine running at the speed it usually does? A clamped CPU is
+# indistinguishable from expensive audio from inside the scan -- both look
+# like low utilisation and long tracks -- and a morning went to exactly that
+# confusion, with this chip pinned at 778 MHz while the scan reported honest
+# eighty-hour ETAs. Two seconds here against seven hours of that.
+$bench = Join-Path $Repo "tools\bench_cpu.py"
+if (Test-Path -LiteralPath $bench) {
+    $py = Join-Path $Repo ".venv\Scripts\python.exe"
+    $prev2 = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $out = & $py $bench --json 2>&1 | ForEach-Object { "$_" }
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $prev2
+    $line = ($out | Where-Object { $_ -match '^\s*\{' } | Select-Object -First 1)
+    if ($line) {
+        $b = $line | ConvertFrom-Json
+        Write-Log ("cpu     : {0} FFT/s, {1:P0} of this machine's best ({2})" -f `
+            $b.now, $b.ratio, $b.best)
+        if ($code -eq 4 -and -not $AllowSlowCpu) {
+            Write-Log "The machine is well below its own best speed. That is not the"
+            Write-Log "audio and not the scan: check the charger first, then a full"
+            Write-Log "power-drain reset, then cooling. Run tools\bench_cpu.py after"
+            Write-Log "each step. Pass -AllowSlowCpu to scan anyway."
+            exit 4
+        }
+    }
 }
 
 $os = Get-CimInstance Win32_OperatingSystem
