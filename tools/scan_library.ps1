@@ -125,15 +125,26 @@ $started = Get-Date
 # Preference dropped to Continue for the call, each record flattened to a
 # string so it logs as ordinary text, and the exit code trusted as the only
 # thing that says whether the program actually failed.
+#
+# The tee is written by hand because Tee-Object has no -Encoding before
+# PowerShell 6, and without one it writes UTF-16 into a log the rest of this
+# script writes as UTF-8. A StreamWriter takes the encoding, and AutoFlush
+# keeps the log current enough to watch a running scan from another window.
 $previous = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
+$writer = New-Object System.IO.StreamWriter(
+    $log, $true, (New-Object System.Text.UTF8Encoding($false)))
+$writer.AutoFlush = $true
 try {
     & $mtx @arguments 2>&1 |
-        ForEach-Object { "$_" } |
-        Tee-Object -FilePath $log -Append -Encoding utf8 |
-        Out-Host
+        ForEach-Object {
+            $line = "$_"
+            Write-Host $line
+            $writer.WriteLine($line)
+        }
     $code = $LASTEXITCODE
 } finally {
+    $writer.Close()
     $ErrorActionPreference = $previous
 }
 
