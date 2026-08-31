@@ -55,6 +55,15 @@
     throughput. They are COM-activated and relaunch on demand, so stopping one
     costs nothing but the indexing pass it was in.
 
+.PARAMETER AllowBattery
+    Run even though the machine is on battery. It refuses by default.
+
+    A laptop on battery clocks its cores to roughly a third, and nothing about
+    that looks like throttling from inside the scan -- it looks like slow code,
+    on a machine that stays cold and silent while it works. Measured here at
+    58% of nominal, 1.5 GHz against 3.9 all-core on AC: a 7-hour run becomes a
+    20-hour one, on a battery that would not last either.
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File tools\scan_library.ps1 `
         -LibraryRoot "E:\Music" -Jobs 6 -StopIndexers
@@ -66,7 +75,8 @@ param(
     [string] $Repo        = "E:\Git\projectoverseer\mtx",
     [string] $StemsCache  = "",
     [switch] $KeepStems,
-    [switch] $StopIndexers
+    [switch] $StopIndexers,
+    [switch] $AllowBattery
 )
 
 $ErrorActionPreference = "Stop"
@@ -114,6 +124,32 @@ foreach ($p in $indexers) {
             $p.ProcessName, $p.Id, $gb, $cpuh)
         Write-Log "         It will take memory and cores from this scan. Re-run with -StopIndexers."
     }
+}
+
+# A laptop on battery clocks its cores to roughly a third, which does not look
+# like throttling from inside the scan: it looks like slow code, on a machine
+# that is cold and silent while it works. Measured here at 58% of nominal --
+# 1.5 GHz against 3.9 all-core on AC -- turning a 7-hour run into a 20-hour
+# one, on a battery that would not last either.
+$battery = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue
+$perf = $null
+try {
+    $perf = (Get-Counter '\Processor Information(_Total)\% Processor Performance' `
+             -ErrorAction Stop).CounterSamples[0].CookedValue
+} catch { }
+if ($battery -and $battery.BatteryStatus -eq 1) {
+    Write-Log ("power   : ON BATTERY ({0}%){1}" -f $battery.EstimatedChargeRemaining,
+               $(if ($perf) { ", cores at {0:N0}% of nominal" -f $perf } else { "" }))
+    if (-not $AllowBattery) {
+        Write-Log "Plug the machine in. On battery this chip runs at about a third"
+        Write-Log "of its speed, which turns a 7-hour scan into a 20-hour one and"
+        Write-Log "looks like a bug rather than a power setting. Pass -AllowBattery"
+        Write-Log "to run anyway."
+        exit 3
+    }
+    Write-Log "-AllowBattery given; continuing at reduced clocks."
+} elseif ($perf) {
+    Write-Log ("power   : AC, cores at {0:N0}% of nominal" -f $perf)
 }
 
 $os = Get-CimInstance Win32_OperatingSystem
