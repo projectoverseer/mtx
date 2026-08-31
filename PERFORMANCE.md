@@ -456,6 +456,25 @@ second against a 486 s run. Caching it would trade ~1 GB of extra resident
 memory for that. It is not worth it, and it is written down here so nobody
 measures it a third time.
 
+**Correction, from 457 measured tracks.** The claim below — that per-worker
+throughput is the same at 44.1 kHz and 192 kHz — was made from a single
+benchmark track and is wrong. Every finished track writes its own wall time,
+and mined in bulk (`tools/scan_report.py`) they say:
+
+| rate | n | audio-s/wall-s per lane | median s/track |
+| --- | --- | --- | --- |
+| 44 100 | 310 | 0.412 | 498 |
+| 48 000 | 105 | 0.383 | 493 |
+| 96 000 | 34 | 0.398 | 535 |
+| **192 000** | 8 | **0.253** | **1 058** |
+
+So cost tracks audio-seconds rather than samples — 192 kHz carries 4.35x the
+samples for 1.6x the time — but not flatly. A 192 kHz album is expensive
+twice over: 1.6x the compute per second, and few enough lanes fit in memory
+that the pool runs three wide instead of six. A scan working through one is
+cool and quiet and looks broken. It is not; it is in the worst block the
+library has.
+
 **The DSP cost is inherent.** Per-worker throughput is ~0.48 audio-s/wall-s on
 both 44.1 kHz and 192 kHz content, and six workers saturate memory bandwidth at
 ~2.75–2.9. That is the ceiling this machine has; the work below was about
