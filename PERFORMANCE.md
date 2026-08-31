@@ -573,6 +573,55 @@ requires a `corpus_row.json` before deleting anything).
 
 ---
 
+## Finding 5 — what is left is memory, and it is not the scheduler
+
+With the budget corrected, the obvious next suspicion was the admission order.
+The feeder admits in queue order, so a track that does not fit blocks every
+track behind it that would have fit — textbook head-of-line blocking, and a
+192 kHz album sits contiguously in directory order, exactly the shape that
+provokes it.
+
+Simulated over this library's real 1 274 (size, duration) pairs, at a 15 GB
+budget and 5 workers, against a work-conserving best-fit admission:
+
+| policy | throughput | mean lanes in use | idle worker-hours |
+| --- | --- | --- | --- |
+| FIFO (what ships) | 1.84 audio-s/wall-s | 3.09 of 5 | 77.2 |
+| best-fit | 1.91 | 3.25 of 5 | 68.0 |
+
+**3.8 %.** Not worth a rewrite of the one component in this pipeline where a
+mistake deadlocks the run. Deepening the lookahead from 7 to 24 adds another
+5 %, and saturates there.
+
+The number that matters in that table is the middle column: **3.09 of 5 lanes**.
+The pool is idle a third of the time and the scheduler is not why. Sweeping
+the budget instead, holding everything else fixed:
+
+| machine | budget | workers | throughput | vs today |
+| --- | --- | --- | --- | --- |
+| 34 GB (this bench) | 15 GB | 5 | 1.91 | 1.00x |
+| 40 GB | 21 GB | 6 | 2.53 | **1.37x** |
+| 48 GB | 27 GB | 6 | 2.65 | 1.44x |
+| 64 GB | 39 GB | 6 | 2.69 | 1.46x |
+| 96 GB | 63 GB | 6 | 2.69 | 1.46x |
+
+RAM is the lever, it is worth about 40 %, and it stops paying at 48 GB —
+past that the memory-bandwidth ceiling of Finding 1 binds instead.
+
+One software lever remains, and it is the only one of consequence: a track
+holds all four stems decoded at once, which is 76 % of an ordinary track's
+footprint and 45 % of a 192 kHz one's. Measuring them one at a time — if the
+inter-stem masking analysis can be restructured to allow it, which is not
+obvious — simulates at **2.23 audio-s/wall-s, 1.21x**, on the machine as it
+stands.
+
+*Caveat on all three tables: the simulation charges a constant 0.45
+audio-s/wall-s per lane. Real per-lane throughput falls as lanes are added
+(Finding 1), so the high-lane rows are optimistic and the ranking is more
+trustworthy than the absolute numbers.*
+
+---
+
 ## What this means at library scale
 
 Extrapolating the measured 106 min per 59 tracks to 100 000 masters, at this
