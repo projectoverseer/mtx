@@ -394,6 +394,48 @@ and it is smaller than the phase the overlap removes.
 
 ---
 
+## What the rebuilt pipeline measures
+
+One artist, nine tracks, 1 935 s of audio, stems already cached so this is the
+measuring half alone, on a machine with the Finding 4a agent stopped:
+
+| quantity | value |
+| --- | --- |
+| wall clock | 16 m 16 s |
+| throughput | **2.0 audio-s per wall-s** |
+| sum of per-track service times | 4 580 s |
+| effective lanes (service / wall) | 4.7 of 6 |
+| per-lane rate | **0.42 audio-s per wall-s** |
+| stems freed as it went | 1.2 GB |
+
+The same code measuring the same kind of track in **one** process sustains
+**0.90 audio-s per wall-s**. So six workers return 2.8x, not 6x, which is
+Finding 1 again from a different direction: the pool is bandwidth-bound well
+before it is core-bound, and the last workers are nearly free to add and nearly
+worthless. The 4.7 effective lanes is the tail of a nine-track run draining
+narrower than the pool; a library run does not pay that.
+
+For comparison, the overnight run this work started from managed **1.55
+audio-s per wall-s** — but it was sharing the machine, so that number belongs
+to Finding 4a as much as to the old design, and the two cannot be separated
+after the fact.
+
+### The band-view change is bit-for-bit
+
+`band_mid`/`band_side` aliasing `mid`/`side` below the cap is an arithmetic
+identity, not an approximation, and it is checked rather than argued: one
+track measured before the change, re-measured after it with `--force`, and the
+two `analysis.json` files compared field by field.
+
+    numeric fields compared, differing: 1
+      .run.generated_utc
+          before '2026-08-30T23:45:47+00:00'
+          after  '2026-08-31T01:26:49+00:00'
+
+The timestamp. Nothing else in the file moved.
+
+---
+
 ## Where a track's time actually goes
 
 cProfile over one full-profile 44.1 kHz track with warm stems, 285 s of audio,
