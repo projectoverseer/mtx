@@ -35,9 +35,21 @@
     Four uncompressed wavs a track, about 165 MB: a library wants more disk
     for its stems than for itself, so this is for an album, not a library.
 
+.PARAMETER StopIndexers
+    Stop media-library indexers before starting, and say what was stopped.
+    Without this they are only reported.
+
+    A scan reading a whole music library is exactly what wakes them. One
+    measured run shared the machine with Apple Music's AMPLibraryAgent, which
+    held 45.4 GB of commit -- leaving 0.8 GB for everything else -- and 2.3 of
+    6 cores, continuously, for the whole night. The scan showed no error for
+    it: just MemoryErrors on 54 MiB allocations and a third of the expected
+    throughput. They are COM-activated and relaunch on demand, so stopping one
+    costs nothing but the indexing pass it was in.
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File tools\scan_library.ps1 `
-        -LibraryRoot "E:\Music" -Jobs 6
+        -LibraryRoot "E:\Music" -Jobs 6 -StopIndexers
 #>
 [CmdletBinding()]
 param(
@@ -45,7 +57,8 @@ param(
     [int]    $Jobs        = 6,
     [string] $Repo        = "E:\Git\projectoverseer\mtx",
     [string] $StemsCache  = "",
-    [switch] $KeepStems
+    [switch] $KeepStems,
+    [switch] $StopIndexers
 )
 
 $ErrorActionPreference = "Stop"
@@ -75,6 +88,30 @@ function Get-FreeGB([string] $Path) {
 $arguments = @("scan", $LibraryRoot, "--profile", "full", "--stems",
                "-j", "$Jobs")
 if (-not $KeepStems) { $arguments += "--prune-stems" }
+
+# Reported whether or not they are stopped: a run that quietly shares the
+# machine with one of these looks like slow code, and looked like it for a
+# whole night once.
+$indexers = Get-Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.ProcessName -match "AMPLibraryAgent|iTunesLibrary|MusicBee|WMPNetworkSvc" }
+foreach ($p in $indexers) {
+    $gb = [math]::Round($p.PrivateMemorySize64 / 1GB, 1)
+    $cpuh = [math]::Round($p.CPU / 3600, 1)
+    if ($StopIndexers) {
+        Write-Log ("stopping {0} (pid {1}): {2} GB committed, {3} CPU-hours" -f `
+            $p.ProcessName, $p.Id, $gb, $cpuh)
+        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+    } else {
+        Write-Log ("WARNING: {0} (pid {1}) is running: {2} GB committed, {3} CPU-hours." -f `
+            $p.ProcessName, $p.Id, $gb, $cpuh)
+        Write-Log "         It will take memory and cores from this scan. Re-run with -StopIndexers."
+    }
+}
+
+$os = Get-CimInstance Win32_OperatingSystem
+Write-Log ("memory  : {0:N1} GB free of {1:N1} GB; {2:N1} GB commit free" -f `
+    ($os.FreePhysicalMemory / 1MB), ($os.TotalVisibleMemorySize / 1MB), `
+    ($os.FreeVirtualMemory / 1MB))
 
 Write-Log ("library : {0}" -f $LibraryRoot)
 Write-Log ("jobs    : {0}" -f $Jobs)
