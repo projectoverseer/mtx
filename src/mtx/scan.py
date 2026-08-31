@@ -49,15 +49,15 @@ import json
 import os
 import time
 from collections import Counter
-from concurrent.futures import (ProcessPoolExecutor, ThreadPoolExecutor,
-                                as_completed)
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterator
 
 from . import SCHEMA_VERSION, __version__
-from .parallel import (apply_single_threaded_env, cpu_count, default_workers,
+from .parallel import (apply_single_threaded_env, available_memory_bytes,
+                       cpu_count, default_workers, memory_budget,
                        single_threaded_env)
 from .split import DEFAULT_PART_BYTES
 
@@ -581,75 +581,235 @@ def materialize_duplicate(dup: Duplicate, *, profile: str, stems: bool,
                 "error": f"{type(exc).__name__}: {exc}"}
 
 
-# -------------------------------------------------------- separation up front
+# ------------------------------------------------------ separation, streamed
 
-def separate_first(sources: list[str], stems_model: str | None,
-                   log=print, streams: int | None = None) -> int:
-    """Separate every track on the GPU before measuring starts.
+def separation_stage(total: int, stems_model: str | None, log=print):
+    """The per-track separation step, and the tally it keeps.
 
-    A card is fast but small, so the separations come out of the pool and are
-    done here rather than inside workers that would each want their own copy
-    of the model.  They are not done one at a time.  A single separation
+    A card is fast but small, so separations come out of the measuring pool
+    and run here rather than inside workers that would each want their own
+    copy of the model.  They are not done one at a time: a single separation
     leaves a GTX 1650 68 % busy -- the rest of each track goes on decoding the
     input and writing four uncompressed wavs, with the device idle -- and
-    overlapping a few streams fills those gaps for 1.51x at three.  How many
-    the card's memory holds is `separation_streams()`, which leaves a reserve
-    rather than discovering the ceiling through an out-of-memory failure.
+    overlapping a few streams fills those gaps for 1.51x at three.
 
-    Nothing else changes: each result lands in the same content-addressed cache
-    the workers read, so the pool that follows finds every one of them already
-    there and spends its processes on the DSP, which is what processes are good
-    for here.  Stopping partway through costs only the separations in flight --
-    the rest stay cached, and the next run starts from them.
+    The cache entry demucs wrote is recorded on the job, so the measurement
+    that follows can drop it without reading the master again to recompute its
+    hash.
     """
     import threading
 
     from .metrics import stems as m_stems
     from .util import Collector
 
-    if streams is None:
-        streams = m_stems.separation_streams()
-    streams = max(1, min(int(streams), len(sources)))
-
     t0 = time.time()
     lock = threading.Lock()
-    done = 0
-    seen = 0
+    tally = {"seen": 0, "done": 0}
 
-    def one(src: str) -> None:
-        nonlocal done, seen
+    def separate(job: dict[str, Any]) -> None:
         collector = Collector()
         s0 = time.time()
-        paths = m_stems.separate(src, collector, stems_model)
+        paths = m_stems.separate(job["source"], collector, stems_model)
         spent = time.time() - s0
-        name = os.path.basename(src)
+        job["entry"] = m_stems.entry_for(paths)
+        name = os.path.basename(job["source"])
         # One lock for the counters and the line they print, so a track's
         # warnings stay attached to it while several separations report.
         with lock:
-            seen += 1
-            n = seen
+            tally["seen"] += 1
+            n = tally["seen"]
             for w in collector.warnings:
                 log(f"  {name}: {w}")
             if paths is None:
-                log(f"[stems {n}/{len(sources)}] {name}: not separated; the "
-                    "file will be measured without stems")
+                log(f"[stems {n}/{total}] {name}: not separated; the file "
+                    "will be measured without stems")
                 return
-            done += 1
+            tally["done"] += 1
             # Wall clock over completions already carries the concurrency:
             # `streams` tracks finishing together shorten the mean directly.
             rate = (time.time() - t0) / n
-            tail = "" if n == len(sources) else \
-                f"  eta {_fmt_hms(rate * (len(sources) - n))}"
+            tail = "" if n == total else f"  eta {_fmt_hms(rate * (total - n))}"
             cached = " (cached)" if spent < 1.0 else ""
-            log(f"[stems {n}/{len(sources)}] {name}: {spent:.0f} s{cached}{tail}")
+            log(f"[stems {n}/{total}] {name}: {spent:.0f} s{cached}{tail}")
 
-    if streams == 1:
-        for src in sources:
-            one(src)
+    return separate, tally
+
+
+def lookahead_for(procs: int, streams: int, requested: int | None = None) -> int:
+    """How many tracks may sit separated but not yet measured.
+
+    Every one of them is four uncompressed wavs on disk.  Separating is about
+    six times faster than measuring, so left unbounded the GPU would separate
+    the whole library into a full disk long before the pool had measured a
+    tenth of it -- which is the failure the old separate-everything-first pass
+    hit at library scale, only sooner.
+
+    The floor is what it takes to keep the pool fed: every worker holding a
+    track, every stream working on the next one, and one spare so a stream
+    that finishes early has somewhere to put it.
+    """
+    floor = procs + streams + 1
+    return max(floor, int(requested)) if requested else floor
+
+
+def drive(jobs_list: list[dict[str, Any]], submit, report, *,
+          separate=None, streams: int = 1, lookahead: int = 0,
+          budget: int = 0, log=print) -> bool:
+    """Run every job, reporting each result as it lands.  True if interrupted.
+
+    `submit(job)` puts one track into the measuring pool and returns its
+    future.  Without `separate` every job goes in at once and the pool decides
+    the order, which is what a run with no stems wants.
+
+    With it the two halves of a stems run stop taking turns.  Separation runs
+    on its own threads while the pool measures, and a track is submitted the
+    moment *its own* stems exist rather than after every track's do -- so the
+    card is working on track n+1 while the cores measure track n.  Measuring
+    is the slower half by roughly six to one, so what this buys is not the
+    overlap of two comparable phases: it is the separation phase disappearing
+    under the measuring entirely, except for the first track.
+
+    `lookahead` bounds the tracks separated but not yet measured; a permit is
+    taken before a separation starts and returned only once that track's
+    measurement (and any eviction the caller does in `report`) is finished, so
+    the disk high-water mark is that many tracks and not the library.
+
+    `budget` bounds the bytes of decoded audio in flight, from `job["bytes"]`.
+    Worker count is the wrong unit for that: six lanes is right for a 44.1 kHz
+    album and too many for a 192 kHz one, whose tracks carry four times the
+    samples and whose stems are decoded beside them.  Overcommitting does not
+    degrade, it collapses -- lanes that page against each other lose more than
+    the lane that would have been given up to avoid it, and a pool six wide can
+    finish slower than one process on the same tracks.  So the admission is by
+    size, and a run of long tracks narrows the pool by itself.
+    """
+    import queue
+    import threading
+
+    total = len(jobs_list)
+    landed: queue.Queue = queue.Queue()
+    stopping = threading.Event()
+
+    gate = threading.Condition()
+    in_flight = 0
+
+    def admit(job: dict[str, Any]) -> None:
+        """Wait until this track's decoded size fits beside what is running."""
+        nonlocal in_flight
+        need = int(job.get("bytes") or 0)
+        if not budget or not need:
+            return
+        with gate:
+            # `in_flight` guards the deadlock: a track bigger than the whole
+            # budget still has to be measured, so it goes when the pool is
+            # empty rather than waiting for room that will never exist.
+            while in_flight and in_flight + need > budget and not stopping.is_set():
+                gate.wait(timeout=1.0)
+            in_flight += need
+
+    def retire(job: dict[str, Any]) -> None:
+        nonlocal in_flight
+        need = int(job.get("bytes") or 0)
+        if not budget or not need:
+            return
+        with gate:
+            in_flight -= need
+            gate.notify_all()
+
+    def send(job: dict[str, Any]) -> None:
+        try:
+            fut = submit(job)
+        except Exception as exc:
+            landed.put((job, None, exc))
+            return
+        fut.add_done_callback(lambda f: landed.put((job, f, None)))
+
+    ready: queue.Queue = queue.Queue()
+
+    def feed() -> None:
+        """Hand separated tracks to the pool as memory frees up.
+
+        Its own thread on purpose.  Waiting for memory here rather than in the
+        separation threads is the whole point: a stage thread that blocked on
+        the gate would hold the card idle until a core freed up, which is
+        exactly the coupling this pipeline exists to remove.  The card runs on
+        to the next track -- the next album, the next artist -- and stops only
+        when the disk lookahead says it is far enough ahead.
+        """
+        for _ in range(total):
+            job = ready.get()
+            if job is None or stopping.is_set():
+                return
+            admit(job)
+            if stopping.is_set():
+                return
+            send(job)
+
+    room: Any = None
+    sep_pool: Any = None
+
+    if separate is None:
+        for job in jobs_list:
+            ready.put(job)
     else:
-        with ThreadPoolExecutor(max_workers=streams) as pool:
-            list(pool.map(one, sources))
-    return done
+        room = threading.Semaphore(max(1, lookahead))
+
+        def stage(job: dict[str, Any]) -> None:
+            room.acquire()
+            if stopping.is_set():
+                return
+            try:
+                separate(job)
+            except Exception as exc:  # a bad separation is not a dead run
+                log(f"  {os.path.basename(job['source'])}: separation failed "
+                    f"({type(exc).__name__}: {exc}); measuring without stems")
+            ready.put(job)
+
+        sep_pool = ThreadPoolExecutor(max_workers=max(1, streams),
+                                      thread_name_prefix="mtx-sep")
+        for job in jobs_list:
+            sep_pool.submit(stage, job)
+
+    feeder = threading.Thread(target=feed, name="mtx-feed", daemon=True)
+    feeder.start()
+
+    seen = 0
+    interrupted = False
+    try:
+        while seen < total:
+            job, fut, err = landed.get()
+            seen += 1
+            if err is not None:
+                report({"source": job["source"], "out_dir": job["out_dir"],
+                        "ok": False, "elapsed": 0.0,
+                        "error": f"not submitted: {type(err).__name__}: {err}"})
+            else:
+                try:
+                    report(fut.result())
+                except Exception as exc:
+                    # A worker that died outright (killed, out of memory)
+                    # never returned a result of its own to report.
+                    report({"source": job["source"], "out_dir": job["out_dir"],
+                            "ok": False, "elapsed": 0.0,
+                            "error": f"worker lost: {type(exc).__name__}: {exc}"})
+            retire(job)
+            if room is not None:
+                room.release()
+    except KeyboardInterrupt:
+        interrupted = True
+    finally:
+        stopping.set()
+        with gate:
+            gate.notify_all()
+        ready.put(None)
+        if sep_pool is not None:
+            # Wake anything parked on the semaphore so it can see the flag and
+            # leave, rather than holding the shutdown open until a permit that
+            # is never coming.
+            for _ in range(max(1, streams) + 1):
+                room.release()
+            sep_pool.shutdown(wait=False, cancel_futures=True)
+    return interrupted
 
 
 # ------------------------------------------------------------------- workers
@@ -729,6 +889,75 @@ def _child_env(enabled: bool) -> Iterator[None]:
                 os.environ[k] = v
 
 
+# What demucs writes, whatever the master's rate: four stereo stems at the
+# model's own sample rate, so their size follows the track's duration and not
+# the rate it was delivered at.
+STEM_SR = 44100
+STEM_COUNT = 4
+
+
+def decoded_bytes(frames: int, channels: int, sample_rate: int,
+                  duration: float = 0.0, stems: bool = False) -> int:
+    """Peak decoded footprint of one track, near enough to schedule by.
+
+    Not the file size -- a FLAC is compressed, and a worker holds none of the
+    compression.  What it holds is what `audio.AudioSource` builds and keeps:
+    the float32 signal, an int32 copy for the container checks, mono, mid and
+    side in float64, the band-rate signal and its mid/side, and one float64
+    copy of the whole signal that the loudness pass makes.  Counting them is
+    better than a bytes-per-second constant because the two things that move
+    the total -- channel count and the 48 kHz band cap -- pull in opposite
+    directions: a 192 kHz master has four times the samples but its band-rate
+    views do not grow at all.
+
+    With stems there are five of these alive at once, which is the whole
+    reason a stems run needs scheduling by size: four extra sources appear
+    that the file's own rate says nothing about.
+    """
+    n = max(0, int(frames))
+    ch = max(1, int(channels))
+    sr = max(1, int(sample_rate))
+    band = n * min(sr, 48000) // sr
+
+    def held(nn: int, cc: int, bb: int) -> int:
+        """What one source keeps for as long as it is alive.
+
+        `band_mid` and `band_side` are charged only above the cap.  At or
+        below it they are `mid` and `side` themselves -- the same float64
+        arithmetic on the same values -- so they cost nothing.
+        """
+        return (8 * nn * cc          # float32 signal + the int32 copy
+                + 24 * nn            # mono, mid, side
+                + 8 * bb * cc        # band-rate signal
+                + (16 * bb if bb != nn else 0))   # band mid and side
+
+    total = held(n, ch, band)
+    if stems:
+        ns = int((duration or (n / sr)) * STEM_SR)
+        total += STEM_COUNT * held(ns, 2, ns)
+    # The loudness pass's float64 copy of a whole signal is transient, and the
+    # sources are measured one after another, so one is alive at a time rather
+    # than one per stem.  Counted on the master, which is the largest of them.
+    # Modelling it five times overstated a 192 kHz track by a third.
+    return total + 8 * n * ch
+
+
+def job_bytes(source: str, stems: bool) -> int:
+    """`decoded_bytes` for a file on disk.  Unreadable headers read as zero.
+
+    Zero means "do not schedule this one by memory", which is the same answer
+    the whole mechanism gives when the machine's RAM cannot be read: the old
+    count-based behaviour, rather than a guess in an unknown direction.
+    """
+    try:
+        import soundfile as sf
+        info = sf.info(source)
+        return decoded_bytes(int(info.frames), int(info.channels),
+                             int(info.samplerate), float(info.duration), stems)
+    except Exception:
+        return 0
+
+
 def split_budget(jobs: int, n_todo: int) -> tuple[int, int]:
     """Divide a parallelism budget into (processes, threads per process).
 
@@ -789,6 +1018,7 @@ def _fmt_hms(seconds: float) -> str:
 def run_scan(scan_path: str, *, out: str | None = None,
              library_root: str | None = None, profile: str = "full",
              jobs: int | None = None, stems_jobs: int | None = None,
+             stems_lookahead: int | None = None, prune_stems: bool = False,
              force: bool = False,
              recheck: bool = False, stems: bool = False, plots: bool = False,
              json_only: bool = False, stems_model: str | None = None,
@@ -905,34 +1135,6 @@ def run_scan(scan_path: str, *, out: str | None = None,
         log(f"jobs: {procs} process(es) x {threads} thread(s) "
             f"of {cpu_count()} core(s)")
 
-    # A GPU changes where the expensive half of a stems run belongs.  Asking
-    # for it here rather than in each worker is also what keeps torch out of
-    # the workers entirely: they find the cache warm and never import it.
-    if stems and todo:
-        from .metrics import stems as m_stems
-        device = m_stems.resolve_device()
-        if device.startswith("cuda"):
-            streams = m_stems.separation_streams(stems_jobs)
-            streams = max(1, min(streams, len(todo)))
-            vram = m_stems.device_vram_mib()
-            room = f", {vram} MiB" if vram else ""
-            at_once = ("one at a time" if streams == 1
-                       else f"{streams} at a time")
-            log(f"stems: separating {len(todo)} file(s) on {device}{room} "
-                f"before measuring, {at_once}")
-            try:
-                separate_first([src for src, _, _ in todo], stems_model, log,
-                               streams=streams)
-            except KeyboardInterrupt:
-                log("interrupted; separations that finished stay cached and "
-                    "the next run picks up from there")
-                return {"found": len(pairs), "done": 0, "skipped": skipped,
-                        "failed": 0, "duplicates": copied,
-                        "elapsed": time.time() - t_run,
-                        "out_dir": scope.out_dir, "results": results}
-        else:
-            log(f"stems: separating on {device}, inside the worker processes")
-
     jobs_list = [{"source": src, "out_dir": odir, "profile": profile,
                   "stems": stems, "plots": plots, "json_only": json_only,
                   "stems_model": stems_model, "transcribe": transcribe,
@@ -941,6 +1143,82 @@ def run_scan(scan_path: str, *, out: str | None = None,
                  for src, odir, _ in todo]
     for j in jobs_list:
         os.makedirs(j["out_dir"], exist_ok=True)
+
+    # A GPU changes where the expensive half of a stems run belongs.  Asking
+    # for it here rather than in each worker is also what keeps torch out of
+    # the workers entirely: they find the cache warm and never import it.
+    separate = sep_tally = None
+    streams = lookahead = 0
+    if stems and jobs_list:
+        from .metrics import stems as m_stems
+        device = m_stems.resolve_device()
+        if device.startswith("cuda"):
+            # One stream, unless asked for more.  Separating is about six
+            # times faster than measuring, so a single stream keeps the pool
+            # fed with margin to spare -- and the 1.51x that overlapping three
+            # of them was worth belonged entirely to the old design, where
+            # separation was a phase the cores waited through.  Now that it
+            # hides under the measuring, a second stream buys nothing and
+            # costs about a lane's worth of memory, which measuring wants.
+            streams = max(1, min(m_stems.separation_streams(stems_jobs)
+                                 if stems_jobs else 1, len(jobs_list)))
+            lookahead = min(lookahead_for(procs, streams, stems_lookahead),
+                            len(jobs_list))
+            vram = m_stems.device_vram_mib()
+            room = f", {vram} MiB" if vram else ""
+            at_once = ("one at a time" if streams == 1
+                       else f"{streams} at a time")
+            log(f"stems: separating on {device}{room}, {at_once}, while the "
+                f"pool measures; up to {lookahead} track(s) run ahead")
+            separate, sep_tally = separation_stage(len(jobs_list), stems_model,
+                                                   log)
+        else:
+            log(f"stems: separating on {device}, inside the worker processes")
+
+    # Reading 1 274 headers costs a few seconds; six lanes paging against each
+    # other on a run of 192 kHz masters cost most of a night, so the headers
+    # are read.
+    budget = memory_budget(streams)
+    if budget and jobs_list:
+        # A scan sized against the machine's memory while something else is
+        # already holding most of it will page, and paging is the one failure
+        # here that looks like slowness rather than an error.  This was worth
+        # a night: an unrelated media-library indexer held 45 GB and a third
+        # of the cores through a whole unattended run, and nothing said so.
+        free = available_memory_bytes()
+        if free and free < budget * 0.75:
+            log(f"note: only {free / 1e9:.0f} GB of memory is free, against "
+                f"the {budget / 1e9:.0f} GB this run is sized for. Something "
+                "else is holding it, and the pool will page. Close it, or "
+                "pass a smaller -j")
+        for j in jobs_list:
+            j["bytes"] = job_bytes(j["source"], stems)
+        biggest = max((j["bytes"] for j in jobs_list), default=0)
+        if biggest:
+            fits = min(procs, max(1, int(budget // biggest)))
+            log(f"memory: {budget / 1e9:.0f} GB for decoded audio; the largest "
+                f"track wants {biggest / 1e9:.1f} GB, so that one measures "
+                f"{fits} at a time and shorter ones more")
+
+    # Stems are the one output of a run that is pure cache, and the only one
+    # whose size is a problem: four uncompressed wavs a track, about 165 MB,
+    # against a mirror tree of a few megabytes.  Dropping each track's as soon
+    # as the measurement that needed them is written is what lets a library
+    # scan run in one pass instead of being cut into batches around the disk.
+    freed_bytes = 0
+    by_source = {j["source"]: j for j in jobs_list}
+
+    def drop_stems(result: dict[str, Any]) -> int:
+        """Drop one track's stems, once its measurement is safely written.
+
+        Only on success.  A track that failed will be measured again by the
+        next run, and separating it a second time is minutes of GPU to save
+        165 MB of disk for the few seconds until that run reaches it.
+        """
+        if not prune_stems or separate is None or not result.get("ok"):
+            return 0
+        from .metrics import stems as m_stems
+        return m_stems.evict((by_source.get(result["source"]) or {}).get("entry"))
 
     t0 = time.time()
     done = failed = 0
@@ -977,7 +1255,7 @@ def run_scan(scan_path: str, *, out: str | None = None,
 
     def report(r: dict[str, Any]) -> None:
         nonlocal done, failed, audio_seconds, served, served_n
-        nonlocal capacity, last_event
+        nonlocal capacity, last_event, freed_bytes
         n = done + failed + 1
         now = time.time()
         # Lanes that were actually turning over the interval that just ended:
@@ -1001,37 +1279,30 @@ def run_scan(scan_path: str, *, out: str | None = None,
             failed += 1
             log(f"[{n}/{len(jobs_list)}] {name}: FAILED {r.get('error')}")
         results.append(r)
+        # Before the caller returns this track's permit, so the disk is
+        # actually free by the time another separation is allowed to start.
+        freed_bytes += drop_stems(r)
 
     interrupted = False
-    try:
-        if procs == 1:
+    if procs == 1 and separate is None:
+        try:
             for job in jobs_list:
                 report(analyse_one(job))
-        else:
-            with _child_env(True):
-                pool = ProcessPoolExecutor(max_workers=procs,
-                                           initializer=_worker_init)
-            futures = {pool.submit(analyse_one, j): j for j in jobs_list}
-            try:
-                for fut in as_completed(futures):
-                    try:
-                        report(fut.result())
-                    except Exception as exc:
-                        # A worker that died outright (killed, out of memory)
-                        # never returned a result of its own to report.
-                        job = futures[fut]
-                        report({"source": job["source"], "out_dir": job["out_dir"],
-                                "ok": False, "elapsed": 0.0,
-                                "error": f"worker lost: {type(exc).__name__}: {exc}"})
-            except KeyboardInterrupt:
-                interrupted = True
-                # Drop what has not started; do not wait out the tracks that
-                # have, since each of them is a minute of work already spent.
-                pool.shutdown(wait=False, cancel_futures=True)
-            else:
-                pool.shutdown(wait=True)
-    except KeyboardInterrupt:
-        interrupted = True
+        except KeyboardInterrupt:
+            interrupted = True
+    else:
+        with _child_env(True):
+            pool = ProcessPoolExecutor(max_workers=procs,
+                                       initializer=_worker_init)
+        try:
+            interrupted = drive(jobs_list,
+                                lambda j: pool.submit(analyse_one, j), report,
+                                separate=separate, streams=streams,
+                                lookahead=lookahead, budget=budget, log=log)
+        finally:
+            # Drop what has not started; do not wait out the tracks that have,
+            # since each of them is a minute of work already spent.
+            pool.shutdown(wait=not interrupted, cancel_futures=interrupted)
     if interrupted:
         log("interrupted; finished tracks keep their results and will be "
             "skipped on the next run")
@@ -1054,6 +1325,8 @@ def run_scan(scan_path: str, *, out: str | None = None,
     elapsed = time.time() - t_run
     log(f"measured {done} file(s) in {_fmt_hms(elapsed)}"
         + (f", copied {copied} from an identical file" if copied else "")
+        + (f", separated {sep_tally['done']}" if sep_tally else "")
+        + (f", freed {freed_bytes / 1e9:.1f} GB of stems" if freed_bytes else "")
         + (f", {failed} failure(s)" if failed else ""))
     if done and audio_seconds:
         log(f"throughput: {audio_seconds / max(elapsed, 1e-9):.1f} s of audio "

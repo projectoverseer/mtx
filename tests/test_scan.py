@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import pytest
 
@@ -581,6 +582,37 @@ def test_an_explicit_request_beats_the_arithmetic(monkeypatch):
     assert m.separation_streams() == 2
 
 
+def _jobs(n, prefix="/library"):
+    return [{"source": f"{prefix}/{i:02d}.flac", "out_dir": f"/out/{i:02d}"}
+            for i in range(n)]
+
+
+class _ThreadPool:
+    """A real pool, for the tests that need submit() to return before the work."""
+
+    def __init__(self, fn, workers):
+        self.fn = fn
+        self.pool = ThreadPoolExecutor(max_workers=workers)
+
+    def submit(self, job):
+        return self.pool.submit(self.fn, job)
+
+
+class _InlinePool:
+    """A pool that measures on the calling thread, so tests stay deterministic."""
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    def submit(self, job):
+        fut = Future()
+        try:
+            fut.set_result(self.fn(job))
+        except Exception as exc:            # pragma: no cover - test helper
+            fut.set_exception(exc)
+        return fut
+
+
 def test_separations_overlap_but_every_track_is_reported_once(monkeypatch):
     """Three streams, eight tracks, one line each and one lock around them."""
     import threading
@@ -602,11 +634,17 @@ def test_separations_overlap_but_every_track_is_reported_once(monkeypatch):
         return {"vocals": path}
 
     monkeypatch.setattr(m, "separate", fake_separate)
+    monkeypatch.setattr(m, "entry_for", lambda paths: None)
     lines = []
-    sources = [f"/library/{i:02d}.flac" for i in range(8)]
-    done = scan_mod.separate_first(sources, None, lines.append, streams=3)
+    jobs = _jobs(8)
+    separate, tally = scan_mod.separation_stage(len(jobs), None, lines.append)
+    scan_mod.drive(jobs, _InlinePool(lambda j: {"source": j["source"],
+                                                "out_dir": j["out_dir"],
+                                                "ok": True}).submit,
+                   lambda r: None, separate=separate, streams=3,
+                   lookahead=8, log=lines.append)
 
-    assert done == 8
+    assert tally["done"] == 8
     assert peak == 3, "the card was given exactly the streams it was promised"
     reported = [ln for ln in lines if ln.startswith("[stems ")]
     assert len(reported) == 8
@@ -614,14 +652,252 @@ def test_separations_overlap_but_every_track_is_reported_once(monkeypatch):
                   for ln in reported) == list(range(1, 9))
 
 
-def test_one_stream_keeps_the_sequential_path(monkeypatch):
-    """`streams=1` must not wrap a thread pool around a serial run."""
+def test_one_stream_separates_in_order(monkeypatch):
+    """`streams=1` hands the card one track at a time, in the order given."""
     from mtx import scan as scan_mod
     from mtx.metrics import stems as m
 
     order = []
     monkeypatch.setattr(m, "separate", lambda p, c, model=None, **kw:
                         (order.append(p), {"vocals": p})[1])
-    scan_mod.separate_first(["/a.flac", "/b.flac"], None, lambda _: None,
-                            streams=1)
-    assert order == ["/a.flac", "/b.flac"]
+    monkeypatch.setattr(m, "entry_for", lambda paths: None)
+    jobs = _jobs(2)
+    separate, _ = scan_mod.separation_stage(len(jobs), None, lambda _: None)
+    scan_mod.drive(jobs, _InlinePool(lambda j: {"source": j["source"],
+                                                "out_dir": j["out_dir"],
+                                                "ok": True}).submit,
+                   lambda r: None, separate=separate, streams=1, lookahead=2)
+    assert order == ["/library/00.flac", "/library/01.flac"]
+
+
+def test_measuring_starts_before_every_track_is_separated(monkeypatch):
+    """The point of the pipeline: track 1 is measured while 2 is separating.
+
+    The old pass separated the whole todo list first, so the first measurement
+    could not begin until the last separation ended.  Here the first job must
+    reach the pool while separations are still running, or the card and the
+    cores are still taking turns.
+    """
+    import threading
+
+    from mtx import scan as scan_mod
+    from mtx.metrics import stems as m
+
+    separating = 0
+    guard = threading.Lock()
+    overlapped = []
+
+    def fake_separate(path, collector, model=None, **kw):
+        nonlocal separating
+        with guard:
+            separating += 1
+        time.sleep(0.05)
+        with guard:
+            separating -= 1
+        return {"vocals": path}
+
+    def measure(job):
+        with guard:
+            overlapped.append(separating > 0)
+        return {"source": job["source"], "out_dir": job["out_dir"], "ok": True}
+
+    monkeypatch.setattr(m, "separate", fake_separate)
+    monkeypatch.setattr(m, "entry_for", lambda paths: None)
+    jobs = _jobs(8)
+    separate, _ = scan_mod.separation_stage(len(jobs), None, lambda _: None)
+    scan_mod.drive(jobs, _InlinePool(measure).submit, lambda r: None,
+                   separate=separate, streams=3, lookahead=8)
+
+    assert len(overlapped) == 8
+    assert any(overlapped), "no track was measured while the card was busy"
+
+
+def test_separation_never_runs_further_ahead_than_the_permits(monkeypatch):
+    """The disk bound: unmeasured separations may not exceed the lookahead.
+
+    Each one is four uncompressed wavs, so this is the whole reason a library
+    scan can run in one pass -- without it the card, six times faster than the
+    measuring, separates the library into a full disk.
+    """
+    import threading
+
+    from mtx import scan as scan_mod
+    from mtx.metrics import stems as m
+
+    guard = threading.Lock()
+    outstanding = 0
+    high_water = 0
+
+    def fake_separate(path, collector, model=None, **kw):
+        nonlocal outstanding, high_water
+        time.sleep(0.02)
+        with guard:
+            outstanding += 1
+            high_water = max(high_water, outstanding)
+        return {"vocals": path}
+
+    def report(r):
+        nonlocal outstanding
+        with guard:
+            outstanding -= 1
+
+    monkeypatch.setattr(m, "separate", fake_separate)
+    monkeypatch.setattr(m, "entry_for", lambda paths: None)
+    jobs = _jobs(30)
+    separate, _ = scan_mod.separation_stage(len(jobs), None, lambda _: None)
+    scan_mod.drive(jobs, _InlinePool(
+        lambda j: {"source": j["source"], "out_dir": j["out_dir"],
+                   "ok": True}).submit,
+        report, separate=separate, streams=4, lookahead=5)
+
+    assert high_water <= 5, f"{high_water} tracks were on disk, 5 was the bound"
+
+
+def test_a_lost_worker_is_reported_against_its_own_track():
+    """A worker that dies outright never returned a result to report."""
+    from mtx import scan as scan_mod
+
+    def measure(job):
+        if job["source"].endswith("02.flac"):
+            raise MemoryError("out of memory")
+        return {"source": job["source"], "out_dir": job["out_dir"], "ok": True}
+
+    seen = []
+    scan_mod.drive(_jobs(4), _InlinePool(measure).submit, seen.append)
+
+    assert len(seen) == 4
+    bad = [r for r in seen if not r["ok"]]
+    assert len(bad) == 1
+    assert bad[0]["source"].endswith("02.flac")
+    assert "MemoryError" in bad[0]["error"]
+
+
+def test_a_separation_that_raises_still_gets_its_track_measured(monkeypatch):
+    """One unseparable track must not strand the rest of a library scan."""
+    from mtx import scan as scan_mod
+    from mtx.metrics import stems as m
+
+    def fake_separate(path, collector, model=None, **kw):
+        if path.endswith("01.flac"):
+            raise RuntimeError("the card fell over")
+        return {"vocals": path}
+
+    monkeypatch.setattr(m, "separate", fake_separate)
+    monkeypatch.setattr(m, "entry_for", lambda paths: None)
+    jobs = _jobs(4)
+    separate, _ = scan_mod.separation_stage(len(jobs), None, lambda _: None)
+    seen = []
+    scan_mod.drive(jobs, _InlinePool(
+        lambda j: {"source": j["source"], "out_dir": j["out_dir"],
+                   "ok": True}).submit,
+        seen.append, separate=separate, streams=2, lookahead=4)
+
+    assert len(seen) == 4 and all(r["ok"] for r in seen)
+
+
+def test_big_tracks_narrow_the_pool_instead_of_swapping():
+    """The night this was written for: six lanes of 192 kHz against 32 GB.
+
+    The bound is on bytes in flight, not on jobs, so a run of large tracks
+    admits fewer of them at once and a run of small ones admits more.
+    """
+    import threading
+
+    from mtx import scan as scan_mod
+
+    guard = threading.Lock()
+    live = 0
+    high_water = 0
+
+    def measure(job):
+        nonlocal live, high_water
+        with guard:
+            live += job["bytes"]
+            high_water = max(high_water, live)
+        time.sleep(0.01)
+        return {"source": job["source"], "out_dir": job["out_dir"], "ok": True}
+
+    def report(r):
+        nonlocal live
+        with guard:
+            live -= by_source[r["source"]]["bytes"]
+
+    jobs = _jobs(20)
+    for j in jobs:
+        j["bytes"] = 5_000_000_000          # 5 GB a track
+    by_source = {j["source"]: j for j in jobs}
+
+    scan_mod.drive(jobs, _ThreadPool(measure, 6).submit, report,
+                   budget=21_000_000_000)
+
+    assert high_water <= 21_000_000_000, (
+        f"{high_water / 1e9:.0f} GB was in flight against a 21 GB budget")
+
+
+def test_a_track_bigger_than_the_budget_still_gets_measured():
+    """Refusing it forever would hang the run; it goes when the pool is empty."""
+    from mtx import scan as scan_mod
+
+    jobs = _jobs(3)
+    for j in jobs:
+        j["bytes"] = 40_000_000_000         # larger than the whole budget
+    seen = []
+    scan_mod.drive(jobs, _ThreadPool(
+        lambda j: {"source": j["source"], "out_dir": j["out_dir"],
+                   "ok": True}, 4).submit,
+        seen.append, budget=21_000_000_000)
+    assert len(seen) == 3 and all(r["ok"] for r in seen)
+
+
+def test_no_budget_leaves_the_pool_to_decide():
+    """A machine whose RAM cannot be read keeps the behaviour it had."""
+    from mtx import scan as scan_mod
+
+    jobs = _jobs(12)
+    for j in jobs:
+        j["bytes"] = 5_000_000_000
+    seen = []
+    scan_mod.drive(jobs, _ThreadPool(
+        lambda j: {"source": j["source"], "out_dir": j["out_dir"],
+                   "ok": True}, 6).submit,
+        seen.append, budget=0)
+    assert len(seen) == 12
+
+
+def test_the_band_cap_is_what_stops_a_192k_master_costing_four_times_more():
+    """Four times the samples, but the band-rate views do not grow at all."""
+    from mtx.scan import decoded_bytes
+
+    at_44 = decoded_bytes(13_230_000, 2, 44100, 300, stems=False)
+    at_192 = decoded_bytes(57_600_000, 2, 192000, 300, stems=False)
+    assert at_192 > at_44
+    assert at_192 < 4 * at_44, "the 48 kHz cap bought nothing"
+
+
+def test_stems_are_sized_by_duration_not_by_the_masters_rate():
+    """demucs writes at its own rate, so two masters of one song agree."""
+    from mtx.scan import decoded_bytes
+
+    a = decoded_bytes(13_230_000, 2, 44100, 300, stems=True) - \
+        decoded_bytes(13_230_000, 2, 44100, 300, stems=False)
+    b = decoded_bytes(57_600_000, 2, 192000, 300, stems=True) - \
+        decoded_bytes(57_600_000, 2, 192000, 300, stems=False)
+    assert a == b
+
+
+def test_an_unreadable_header_opts_out_of_memory_scheduling(tmp_path):
+    from mtx.scan import job_bytes
+    bad = tmp_path / "not-audio.flac"
+    bad.write_bytes(b"nope")
+    assert job_bytes(str(bad), stems=True) == 0
+
+
+@pytest.mark.parametrize("procs,streams,asked,want", [
+    (6, 3, None, 10),        # every worker fed, every stream working, one spare
+    (6, 3, 4, 10),           # an ask under the floor cannot starve the pool
+    (6, 3, 40, 40),          # an ask over it is honoured
+    (1, 1, None, 3),
+])
+def test_the_lookahead_floor_keeps_every_worker_fed(procs, streams, asked, want):
+    from mtx import scan as scan_mod
+    assert scan_mod.lookahead_for(procs, streams, asked) == want

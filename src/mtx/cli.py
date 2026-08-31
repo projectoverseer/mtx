@@ -462,7 +462,10 @@ def cmd_scan(args: argparse.Namespace) -> int:
         stats = run_scan(
             args.path, out=args.out, library_root=args.library_root,
             profile=args.profile, jobs=args.jobs,
-            stems_jobs=getattr(args, "stems_jobs", None), force=args.force,
+            stems_jobs=getattr(args, "stems_jobs", None),
+            stems_lookahead=getattr(args, "stems_lookahead", None),
+            prune_stems=bool(getattr(args, "prune_stems", False)),
+            force=args.force,
             recheck=args.recheck, stems=args.stems, plots=args.plots,
             json_only=args.json_only, max_part_bytes=parse_part_size(args),
             stems_model=getattr(args, "stems_model", None),
@@ -756,6 +759,17 @@ def build_parser() -> argparse.ArgumentParser:
                          "what its memory holds, about 900 MiB each, capped "
                          "at 4). One stream leaves a card two thirds busy; "
                          "the rest of a track is decode and wav writing")
+    sc.add_argument("--stems-lookahead", type=int, metavar="N",
+                    help="how many tracks separation may run ahead of "
+                         "measuring (default: enough to keep every worker "
+                         "fed). Each one waiting is four wavs on disk, so "
+                         "raise it only to ride out a run of long tracks")
+    sc.add_argument("--prune-stems", action="store_true",
+                    help="delete each track's stems once its measurement is "
+                         "written. Stems are cache -- 165 MB a track, "
+                         "reproducible from the master -- and a library needs "
+                         "more disk for them than for the library. Without "
+                         "this a whole-library scan fills the disk")
     sc.add_argument("--stems-segment", type=int, metavar="SECONDS",
                     help="seconds of audio demucs holds on the device at once. "
                          "Lower it if a small card runs out of memory; the "

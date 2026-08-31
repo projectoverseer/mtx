@@ -136,6 +136,123 @@ def default_workers(cap: int = MAX_DEFAULT_WORKERS) -> int:
     return max(1, min(cap, cores - RESERVED_CORES if cores > 4 else cores))
 
 
+# What a scan leaves alone: the operating system, the file cache the decoding
+# leans on, the torch process doing the separations, and whatever the user has
+# open.  Held back as an amount rather than a share, because it is roughly
+# constant -- taking a proportion would punish a small machine, where the
+# reserve matters most, and leave a large one short of work.
+#
+# Overshooting is not a gentle degradation: lanes that page against each other
+# lose more than the lane that would have been given up to avoid it.  A run
+# that overcommitted this machine finished at a fifth of the rate a single
+# process sustains on the same tracks, and killed workers outright.
+#
+# The reserve is not fitted to that run.  It is the OS, the file cache the
+# decoding leans on, and the parent process, and 3 GB covers them with room --
+# see PERFORMANCE.md "Finding 4a" for why a number fitted to that particular
+# night would have been fitted to somebody else's memory leak.
+MEMORY_RESERVE = 3_000_000_000
+
+
+def total_memory_bytes() -> int:
+    """Physical RAM, or 0 when it cannot be determined.
+
+    Every caller treats 0 as "do not schedule by memory", so a platform this
+    cannot read falls back to the behaviour it had before rather than to a
+    guess that could be wrong in either direction.
+    """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _Status(ctypes.Structure):
+                _fields_ = [("dwLength", wintypes.DWORD),
+                            ("dwMemoryLoad", wintypes.DWORD),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            st = _Status()
+            st.dwLength = ctypes.sizeof(_Status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                return int(st.ullTotalPhys)
+        except Exception:
+            return 0
+        return 0
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
+    except (ValueError, OSError, AttributeError):
+        return 0
+
+
+# A demucs process holds about this much host memory while it separates --
+# measured at 2.47 GB peak on this bench, rounded up.  It is invisible to the
+# byte budget, which counts only what the measuring workers decode, so every
+# concurrent separation has to be held back here instead.  This is the direct
+# reason the pipelined default is one stream: a second one costs about as much
+# memory as a whole measuring lane, and measuring is the half that is slow.
+SEPARATION_RESERVE = 3_000_000_000
+
+
+def available_memory_bytes() -> int:
+    """Physical memory not currently in use, or 0 when it cannot be read.
+
+    Separate from `total_memory_bytes` because the two answer different
+    questions: what the machine has, and what is left of it.  A scan sized
+    against the first while another process holds most of the second is the
+    failure this exists to notice.
+    """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _Status(ctypes.Structure):
+                _fields_ = [("dwLength", wintypes.DWORD),
+                            ("dwMemoryLoad", wintypes.DWORD),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            st = _Status()
+            st.dwLength = ctypes.sizeof(_Status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                return int(st.ullAvailPhys)
+        except Exception:
+            return 0
+        return 0
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES"))
+    except (ValueError, OSError, AttributeError):
+        return 0
+
+
+def memory_budget(streams: int = 0, reserve: int = MEMORY_RESERVE) -> int:
+    """Bytes of decoded audio a scan may hold across all its workers.
+
+    `streams` is the separations running beside the pool; each is held back
+    because the budget cannot see it.  This is the direct reason the pipelined
+    default is one stream: a second one costs about as much memory as a whole
+    measuring lane, and measuring is the half that is slow.
+
+    Zero when the machine's RAM cannot be read, which every caller takes as
+    "schedule by worker count, as before" rather than as "no memory at all".
+    """
+    total = total_memory_bytes()
+    if not total:
+        return 0
+    return max(0, total - reserve - max(0, int(streams)) * SEPARATION_RESERVE)
+
+
 def resolve_threads(requested: int | None) -> int:
     """Threads this process may use inside a single file.
 

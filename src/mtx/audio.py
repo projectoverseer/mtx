@@ -184,7 +184,20 @@ class AudioSource:
 
     @property
     def band_mid(self) -> np.ndarray:
+        """mid at band_sr.
+
+        At or below the cap there is no resampling, so `band_x` is `x` in
+        float64 and this is arithmetic `mid` has already done -- bit for bit,
+        because float32 to float64 is exact and both sides then work in
+        float64.  Returning it saves a second full-length float64 array per
+        source, and a stems run holds five sources, so on a 44.1 kHz track it
+        is about a gigabyte of a second copy of the same answer.  Nothing
+        writes to either view in place; if something ever does, this has to
+        become a copy again.
+        """
         def build():
+            if self.sr <= BAND_SR_CAP:
+                return self.mid
             bx = self.band_x
             if self.n_ch == 1:
                 return bx[:, 0]
@@ -193,7 +206,10 @@ class AudioSource:
 
     @property
     def band_side(self) -> np.ndarray:
+        """side at band_sr.  Aliases `side` below the cap; see `band_mid`."""
         def build():
+            if self.sr <= BAND_SR_CAP:
+                return self.side
             bx = self.band_x
             if self.n_ch == 1:
                 return np.zeros(bx.shape[0])

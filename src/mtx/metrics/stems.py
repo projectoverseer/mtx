@@ -234,6 +234,52 @@ def _complete(paths: dict[str, str]) -> bool:
     return bool(paths) and all(os.path.isfile(p) for p in paths.values())
 
 
+def entry_for(paths: dict[str, str] | None) -> str | None:
+    """The cache directory holding these stems, or None if they are elsewhere.
+
+    Every entry is a direct child of `CACHE_DIR` -- content-addressed today,
+    hashed from the path before that -- so the entry is the first component of
+    the relative path and both layouts answer the same way.  Taken from a path
+    demucs actually wrote rather than recomputed from the source, which would
+    mean reading the whole file again to hash it.
+    """
+    for p in (paths or {}).values():
+        cache = os.path.abspath(CACHE_DIR)
+        full = os.path.abspath(p)
+        if not full.startswith(cache + os.sep):
+            return None
+        return os.path.join(cache, os.path.relpath(full, cache).split(os.sep)[0])
+    return None
+
+
+def entry_bytes(entry: str) -> int:
+    """Size of one cache entry on disk.  Missing or unreadable reads as zero."""
+    total = 0
+    for root, _, names in os.walk(entry):
+        for n in names:
+            try:
+                total += os.path.getsize(os.path.join(root, n))
+            except OSError:
+                pass
+    return total
+
+
+def evict(entry: str | None) -> int:
+    """Delete one cache entry, returning the bytes reclaimed.
+
+    Stems are the one output of a run that is pure cache: four uncompressed
+    wavs, about 165 MB a track, reproducible from the master at any time.  A
+    scan that keeps every one of them needs more disk than the library it is
+    measuring, so a caller measuring a whole library drops each track's stems
+    once the measurement that needed them is written.
+    """
+    if not entry or not os.path.isdir(entry):
+        return 0
+    freed = entry_bytes(entry)
+    shutil.rmtree(entry, ignore_errors=True)
+    return 0 if os.path.isdir(entry) else freed
+
+
 # What this card turned out to hold, once a file has found out.  A scan puts
 # every separation through this one process, so the second file need not
 # rediscover the first one's out-of-memory failures: each of those costs a
