@@ -797,7 +797,34 @@ def drive(jobs_list: list[dict[str, Any]], submit, report, *,
 
     seen = 0
     interrupted = False
+    installed = False
+    prev_sigint = None
     try:
+        # Ctrl-C on Windows is delivered to the whole console process group,
+        # so the workers die a moment before the KeyboardInterrupt reaches
+        # this thread.  In that gap their futures come back as
+        # BrokenProcessPool, which is indistinguishable from a worker the OS
+        # killed -- and the run answers a Ctrl-C by starting a fresh pool.
+        # Setting `stopping` from the handler closes the gap: the rebuild is
+        # already guarded on it.
+        import signal
+
+        def _on_sigint(sig, frame):
+            stopping.set()
+            with gate:
+                gate.notify_all()
+            if callable(prev_sigint):
+                prev_sigint(sig, frame)
+            else:
+                raise KeyboardInterrupt
+
+        try:
+            prev_sigint = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, _on_sigint)
+            installed = True
+        except (ValueError, OSError, AttributeError):
+            installed = False   # not the main thread; the guard is best-effort
+
         while seen < total:
             job, fut, err = landed.get()
             result = None
@@ -854,6 +881,11 @@ def drive(jobs_list: list[dict[str, Any]], submit, report, *,
     except KeyboardInterrupt:
         interrupted = True
     finally:
+        if installed:
+            try:
+                signal.signal(signal.SIGINT, prev_sigint)
+            except (ValueError, OSError):
+                pass
         stopping.set()
         with gate:
             gate.notify_all()

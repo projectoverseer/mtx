@@ -1068,3 +1068,43 @@ def test_a_break_tightens_the_budget():
     narrowed = [ln for ln in lines if "rebuilding the pool" in ln]
     assert narrowed, "the rebuild was reported"
     assert "6 GB" in narrowed[0], f"8 GB tightened to 6, got {narrowed[0]!r}"
+
+
+def test_an_interrupt_does_not_rebuild_the_pool():
+    """Ctrl-C kills the workers first, and that must not read as a crash.
+
+    On Windows a console Ctrl-C reaches the whole process group, so the
+    workers die a moment before the KeyboardInterrupt arrives here and their
+    futures come back as `BrokenProcessPool`. Answering that by starting a
+    fresh pool -- during shutdown -- is the wrong response.
+    """
+    from mtx import scan as scan_mod
+
+    jobs = _jobs(10)
+    pool = _BreakablePool(_ok, die_on=2)
+    seen = []
+
+    def report(result):
+        seen.append(result)
+        raise KeyboardInterrupt          # as if the console had signalled
+
+    interrupted = scan_mod.drive(jobs, pool.submit, report,
+                                 restart=pool.restart, log=lambda m: None)
+
+    assert interrupted is True
+    assert pool.rebuilds == 0, "no new pool was built on the way out"
+
+
+def test_the_interrupt_handler_is_put_back():
+    """`drive` borrows SIGINT for the run; a library caller gets it back."""
+    import signal
+
+    from mtx import scan as scan_mod
+
+    before = signal.getsignal(signal.SIGINT)
+    scan_mod.drive(_jobs(3),
+                   _InlinePool(lambda j: {"source": j["source"],
+                                          "out_dir": j["out_dir"],
+                                          "ok": True}).submit,
+                   lambda r: None, log=lambda m: None)
+    assert signal.getsignal(signal.SIGINT) is before
