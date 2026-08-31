@@ -198,6 +198,13 @@ def total_memory_bytes() -> int:
 # memory as a whole measuring lane, and measuring is the half that is slow.
 SEPARATION_RESERVE = 3_000_000_000
 
+# What one measuring worker holds before it decodes anything: interpreter,
+# numpy, scipy, soundfile.  Measured at 824 MB on the bench here, rounded up.
+# Six lanes is 5 GB, and a cost model that counts only decoded audio misses
+# every byte of it -- which is exactly how a run got authorised 28 GB on a
+# machine with 26 GB free.
+WORKER_RESERVE = 900_000_000
+
 
 def available_memory_bytes() -> int:
     """Physical memory not currently in use, or 0 when it cannot be read.
@@ -236,21 +243,70 @@ def available_memory_bytes() -> int:
         return 0
 
 
-def memory_budget(streams: int = 0, reserve: int = MEMORY_RESERVE) -> int:
+def memory_budget(streams: int = 0, reserve: int = MEMORY_RESERVE,
+                  procs: int = 0) -> int:
     """Bytes of decoded audio a scan may hold across all its workers.
 
-    `streams` is the separations running beside the pool; each is held back
-    because the budget cannot see it.  This is the direct reason the pipelined
-    default is one stream: a second one costs about as much memory as a whole
-    measuring lane, and measuring is the half that is slow.
+    Sized against the memory that is *free*, not the memory the machine has.
+    Those differ by whatever the OS and the desktop are already holding -- 8 GB
+    on the bench here -- and budgeting against the larger number authorises a
+    run the machine cannot hold.  That is not a slow run: the admission gate
+    lets in one lane too many, Windows kills a worker outright, and the
+    `BrokenProcessPool` takes every remaining track with it.
 
-    Zero when the machine's RAM cannot be read, which every caller takes as
-    "schedule by worker count, as before" rather than as "no memory at all".
+    Three things are subtracted, and each was measured rather than guessed:
+
+    `reserve` leaves the OS room to breathe.  `streams` is the separations
+    running beside the pool, at `SEPARATION_RESERVE` each -- the direct reason
+    the pipelined default is one stream.  `procs` is the measuring workers, at
+    `WORKER_RESERVE` each: a worker holds ~824 MB of interpreter, numpy and
+    scipy before it decodes a single sample, so six lanes start 4.9 GB down and
+    a model that counts only decoded audio is wrong by that much.
+
+    The result never drops to zero while the memory *can* be read: zero is the
+    caller's signal for "schedule by worker count", and a machine short of
+    memory needs the gate more, not less.  It floors at `SEPARATION_RESERVE`
+    instead, which the `in_flight` guard in `scan.drive` turns into one track
+    at a time -- the right degradation.
     """
     total = total_memory_bytes()
     if not total:
         return 0
-    return max(0, total - reserve - max(0, int(streams)) * SEPARATION_RESERVE)
+    free = available_memory_bytes()
+    ceiling = min(total, free) if free else total
+    room = (ceiling - reserve
+            - max(0, int(streams)) * SEPARATION_RESERVE
+            - max(0, int(procs)) * WORKER_RESERVE)
+    return max(SEPARATION_RESERVE, room)
+
+
+def workers_that_fit(requested: int, typical: int, streams: int = 0,
+                     reserve: int = MEMORY_RESERVE) -> int:
+    """The most workers whose own footprint and one track each still fit.
+
+    Starting more workers than memory can ever run at once is not free and it
+    is not merely useless: each costs `WORKER_RESERVE` of the same memory the
+    lanes need, so the seventh worker makes the six real ones narrower.  Six
+    started against a budget that fits four is 1.8 GB spent to idle.
+
+    Sized on the *typical* track, not the largest.  A library's biggest track
+    would size this pool at one; the admission gate in `scan.drive` is what
+    handles the outliers, narrowing to a single lane for the one 9.6 GB master
+    and opening back up afterwards.  This only decides how many lanes are
+    worth having open on an ordinary track.
+
+    Solved by walking down rather than dividing, because the budget itself
+    depends on the answer: fewer workers cost less overhead, which leaves more
+    for audio, which can afford another worker.  Walking down takes the
+    largest count that is consistent with its own budget.
+    """
+    requested = max(1, int(requested))
+    if requested == 1 or not typical or not total_memory_bytes():
+        return requested
+    for procs in range(requested, 1, -1):
+        if procs * typical <= memory_budget(streams, reserve, procs=procs):
+            return procs
+    return 1
 
 
 def resolve_threads(requested: int | None) -> int:

@@ -24,11 +24,19 @@
     The library to measure.
 
 .PARAMETER Jobs
-    Worker processes. Do not raise this above the physical core count:
-    measured throughput is flat from there to twice that, and only per-file
-    service time goes up. The pool narrows itself below this on long or
-    high-rate tracks, which is a memory bound and not a core one. See
-    PERFORMANCE.md.
+    An upper bound on worker processes, not an instruction. Do not raise it
+    above the physical core count: measured throughput is flat from there to
+    twice that, and only per-file service time goes up.
+
+    The run starts fewer than this whenever memory says so, and says which
+    number it chose and why. A worker holds ~824 MB before it decodes a
+    sample, and a 192 kHz master decodes to 9.7 GB against a 44.1 kHz one's
+    2.8 GB, so six workers are right for one album and impossible for another.
+    Seeing "2 process(es), not 6" on a hi-res album is the bound working.
+
+    This matters more than it sounds: the budget is sized against the memory
+    that is free when the scan starts, so anything left open does not slow the
+    run, it narrows it for the whole night. See PERFORMANCE.md.
 
 .PARAMETER KeepStems
     Keep every separation instead of dropping it once its track is measured.

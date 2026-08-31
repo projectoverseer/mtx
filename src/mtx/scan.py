@@ -56,9 +56,10 @@ from datetime import datetime, timezone
 from typing import Any, Iterator
 
 from . import SCHEMA_VERSION, __version__
-from .parallel import (apply_single_threaded_env, available_memory_bytes,
-                       cpu_count, default_workers, memory_budget,
-                       single_threaded_env)
+from .parallel import (WORKER_RESERVE, apply_single_threaded_env,
+                       available_memory_bytes, cpu_count, default_workers,
+                       memory_budget, single_threaded_env, total_memory_bytes,
+                       workers_that_fit)
 from .split import DEFAULT_PART_BYTES
 
 AUDIO_EXTENSIONS = (".flac", ".wav", ".aif", ".aiff", ".w64", ".caf", ".ogg",
@@ -654,7 +655,7 @@ def lookahead_for(procs: int, streams: int, requested: int | None = None) -> int
 
 def drive(jobs_list: list[dict[str, Any]], submit, report, *,
           separate=None, streams: int = 1, lookahead: int = 0,
-          budget: int = 0, log=print) -> bool:
+          budget: int = 0, restart=None, log=print) -> bool:
     """Run every job, reporting each result as it lands.  True if interrupted.
 
     `submit(job)` puts one track into the measuring pool and returns its
@@ -682,9 +683,19 @@ def drive(jobs_list: list[dict[str, Any]], submit, report, *,
     the lane that would have been given up to avoid it, and a pool six wide can
     finish slower than one process on the same tracks.  So the admission is by
     size, and a run of long tracks narrows the pool by itself.
+
+    `restart` rebuilds the measuring pool, and is what keeps one dead worker
+    from ending the run.  A worker killed outright -- by the OS, out of memory
+    -- does not fail its own track: it breaks the executor, so that track and
+    every one still to come fail with `BrokenProcessPool`.  Unhandled, a single
+    bad minute becomes 820 failures, which is what it did.  So a broken pool is
+    rebuilt once per break, the tracks caught in it go back on the queue, and
+    the budget tightens by a quarter each time, on the theory that a pool only
+    breaks because it was too wide.
     """
     import queue
     import threading
+    from concurrent.futures.process import BrokenProcessPool
 
     total = len(jobs_list)
     landed: queue.Queue = queue.Queue()
@@ -692,6 +703,12 @@ def drive(jobs_list: list[dict[str, Any]], submit, report, *,
 
     gate = threading.Condition()
     in_flight = 0
+    generation = 0
+    rebuilds = 0
+    MAX_REBUILDS = 8
+    # The floor the budget may tighten to: a track larger than the whole
+    # budget still has to be measured, and it measures alone.
+    biggest = max((int(j.get("bytes") or 0) for j in jobs_list), default=0)
 
     def admit(job: dict[str, Any]) -> None:
         """Wait until this track's decoded size fits beside what is running."""
@@ -717,6 +734,11 @@ def drive(jobs_list: list[dict[str, Any]], submit, report, *,
             gate.notify_all()
 
     def send(job: dict[str, Any]) -> None:
+        # The generation it went out on: a track that comes back broken was
+        # only worth rebuilding the pool for if the pool it died in is still
+        # the current one.  When a worker dies it takes several tracks with
+        # it, and without this they would each rebuild in turn.
+        job["_gen"] = generation
         try:
             fut = submit(job)
         except Exception as exc:
@@ -778,20 +800,54 @@ def drive(jobs_list: list[dict[str, Any]], submit, report, *,
     try:
         while seen < total:
             job, fut, err = landed.get()
+            result = None
+            if err is None:
+                try:
+                    result = fut.result()
+                except Exception as exc:
+                    err = exc
+
+            # A dead worker is the pool's failure, not the track's.  Rebuild
+            # and put the track back, once, before charging it as a failure --
+            # and hold its memory and its lookahead permit meanwhile, because
+            # it is about to run again.
+            if (isinstance(err, BrokenProcessPool) and restart is not None
+                    and not stopping.is_set() and not job.get("_retried")
+                    and rebuilds < MAX_REBUILDS):
+                job["_retried"] = True
+                if job.get("_gen") == generation:
+                    generation += 1
+                    rebuilds += 1
+                    with gate:
+                        # It broke because it was too wide.  Never below the
+                        # largest single track, which still has to be measured.
+                        budget = max(biggest, int(budget * 0.75)) if budget else 0
+                        gate.notify_all()
+                    log(f"  a worker died; rebuilding the pool"
+                        + (f" and measuring within {budget / 1e9:.0f} GB"
+                           if budget else ""))
+                    try:
+                        restart()
+                    except Exception as exc:
+                        log(f"  could not rebuild the pool: "
+                            f"{type(exc).__name__}: {exc}")
+                        rebuilds = MAX_REBUILDS
+                send(job)
+                continue
+
             seen += 1
-            if err is not None:
+            if result is not None:
+                report(result)
+            elif fut is None:
                 report({"source": job["source"], "out_dir": job["out_dir"],
                         "ok": False, "elapsed": 0.0,
                         "error": f"not submitted: {type(err).__name__}: {err}"})
             else:
-                try:
-                    report(fut.result())
-                except Exception as exc:
-                    # A worker that died outright (killed, out of memory)
-                    # never returned a result of its own to report.
-                    report({"source": job["source"], "out_dir": job["out_dir"],
-                            "ok": False, "elapsed": 0.0,
-                            "error": f"worker lost: {type(exc).__name__}: {exc}"})
+                # A worker that died outright (killed, out of memory) never
+                # returned a result of its own to report.
+                report({"source": job["source"], "out_dir": job["out_dir"],
+                        "ok": False, "elapsed": 0.0,
+                        "error": f"worker lost: {type(err).__name__}: {err}"})
             retire(job)
             if room is not None:
                 room.release()
@@ -1178,27 +1234,47 @@ def run_scan(scan_path: str, *, out: str | None = None,
     # Reading 1 274 headers costs a few seconds; six lanes paging against each
     # other on a run of 192 kHz masters cost most of a night, so the headers
     # are read.
-    budget = memory_budget(streams)
+    budget = memory_budget(streams, procs=procs)
     if budget and jobs_list:
-        # A scan sized against the machine's memory while something else is
-        # already holding most of it will page, and paging is the one failure
-        # here that looks like slowness rather than an error.  This was worth
-        # a night: an unrelated media-library indexer held 45 GB and a third
-        # of the cores through a whole unattended run, and nothing said so.
-        free = available_memory_bytes()
-        if free and free < budget * 0.75:
-            log(f"note: only {free / 1e9:.0f} GB of memory is free, against "
-                f"the {budget / 1e9:.0f} GB this run is sized for. Something "
-                "else is holding it, and the pool will page. Close it, or "
-                "pass a smaller -j")
         for j in jobs_list:
             j["bytes"] = job_bytes(j["source"], stems)
-        biggest = max((j["bytes"] for j in jobs_list), default=0)
+        sized = sorted(j["bytes"] for j in jobs_list if j["bytes"])
+        typical = sized[len(sized) // 2] if sized else 0
+        biggest = sized[-1] if sized else 0
+
+        # How many workers to start is a memory question as much as a core
+        # one, and asking it after the pool exists is too late.  Workers that
+        # memory can never run at once still cost their own footprint, taken
+        # from the lanes that do run.
+        if typical:
+            room_for = workers_that_fit(procs, typical, streams)
+            if room_for < procs:
+                log(f"jobs: {room_for} process(es), not {procs}: "
+                    f"{procs} would want "
+                    f"{procs * (typical + WORKER_RESERVE) / 1e9:.0f} GB "
+                    f"for a typical track and there is not that much")
+                procs = room_for
+            budget = memory_budget(streams, procs=procs)
+
+        # Said out loud because this arithmetic is the whole safety of the
+        # run, and because getting it wrong does not look like a memory
+        # problem.  Sized against total rather than free memory, this line
+        # read "28 GB" on a machine with 26 GB free and 8 GB already spoken
+        # for; the gate admitted one lane too many, Windows killed a worker,
+        # and the broken pool failed all 820 remaining tracks four minutes in.
+        total, free = total_memory_bytes(), available_memory_bytes()
+        if total and free:
+            log(f"memory: {free / 1e9:.0f} GB free of {total / 1e9:.0f} GB, "
+                f"less {(total - free) / 1e9:.0f} GB already in use and "
+                f"{procs * WORKER_RESERVE / 1e9:.1f} GB the {procs} worker(s) "
+                f"hold before decoding anything")
         if biggest:
             fits = min(procs, max(1, int(budget // biggest)))
-            log(f"memory: {budget / 1e9:.0f} GB for decoded audio; the largest "
-                f"track wants {biggest / 1e9:.1f} GB, so that one measures "
-                f"{fits} at a time and shorter ones more")
+            usual = min(procs, max(1, int(budget // typical))) if typical else procs
+            log(f"memory: {budget / 1e9:.0f} GB for decoded audio; a typical "
+                f"track wants {typical / 1e9:.1f} GB so {usual} measure at "
+                f"once, and the largest wants {biggest / 1e9:.1f} GB so that "
+                f"one measures {fits} at a time")
 
     # Stems are the one output of a run that is pure cache, and the only one
     # whose size is a problem: four uncompressed wavs a track, about 165 MB,
@@ -1291,14 +1367,29 @@ def run_scan(scan_path: str, *, out: str | None = None,
         except KeyboardInterrupt:
             interrupted = True
     else:
-        with _child_env(True):
-            pool = ProcessPoolExecutor(max_workers=procs,
-                                       initializer=_worker_init)
+        def build_pool() -> Any:
+            with _child_env(True):
+                return ProcessPoolExecutor(max_workers=procs,
+                                           initializer=_worker_init)
+
+        pool = build_pool()
+
+        def restart_pool() -> None:
+            """Replace a pool a dead worker broke, and let the old one go.
+
+            Not waited on: its remaining workers are being told to stop, and
+            the run has tracks to measure meanwhile.
+            """
+            nonlocal pool
+            old, pool = pool, build_pool()
+            old.shutdown(wait=False, cancel_futures=True)
+
         try:
             interrupted = drive(jobs_list,
                                 lambda j: pool.submit(analyse_one, j), report,
                                 separate=separate, streams=streams,
-                                lookahead=lookahead, budget=budget, log=log)
+                                lookahead=lookahead, budget=budget,
+                                restart=restart_pool, log=log)
         finally:
             # Drop what has not started; do not wait out the tracks that have,
             # since each of them is a minute of work already spent.

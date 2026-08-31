@@ -463,10 +463,11 @@ reaching it, not raising it.
 
 ---
 
-## Two things the pipeline got wrong first, and what they cost
+## Four things the pipeline got wrong first, and what they cost
 
-Both were found by running it, not by reading it. Both are worth knowing about
-because the same shapes will recur in any producer/consumer stage added here.
+All four were found by running it, not by reading it. All four are worth
+knowing about because the same shapes will recur in any producer/consumer
+stage added here.
 
 ### The card must never wait on the memory gate
 
@@ -496,6 +497,71 @@ three demucs processes held 7.5 GB it knew nothing about.
 
 With one stream that leaves 28.1 GB, five lanes of a 4.7 GB track, and a
 29.6 GB peak on a 34.1 GB machine.
+
+### The budget was sized against memory the machine did not have
+
+This is the one that cost a second run, and it is the most instructive
+failure in this document, because the mechanism worked perfectly and the
+number it was given was wrong.
+
+`memory_budget` subtracted its reserves from `total_memory_bytes()` — the RAM
+the machine *has*. What matters is the RAM that is *free*, and on this bench
+the two differ by the 8-10 GB the OS and the desktop are already holding.
+Worse, `available_memory_bytes()` existed in the same file and was used only
+to print a warning, whose threshold (`free < budget * 0.75`) was slack enough
+that 26 GB free against a 28 GB budget did not trip it.
+
+| | |
+| --- | --- |
+| budget authorised | **28.1 GB** |
+| memory actually free | **26.0 GB** |
+| already held by OS and apps | 8.0 GB |
+
+The scan was of a library whose 192 kHz albums carry 6.6-9.6 GB a track. The
+gate admitted five lanes, about 26 GB of decoded audio, into 26 GB of free
+memory. Windows killed a worker four minutes in.
+
+**What it looked like** matters as much as what it was. Not an error: the run
+went to 0% CPU, 0% GPU, 27 GB resident, and sat there. Nothing in the console
+said "out of memory" — the only clue was three `BrokenProcessPool` lines that
+PowerShell had not yet flushed to the terminal.
+
+### One dead worker must not end the run
+
+A worker killed by the OS does not fail its own track politely. It breaks the
+executor, so that track and **every track still to come** raise
+`BrokenProcessPool` on submission. One bad minute at track 4 was therefore
+about to fail all 821, and the run neither recovered nor exited.
+
+`drive` now takes a `restart` callback. A broken pool is rebuilt once per
+break — not once per track it took down, which the generation counter in
+`send()` is there to distinguish — the tracks caught in it go back on the
+queue, and the budget tightens by a quarter on the theory that a pool only
+breaks because it was too wide. A track that breaks the pool twice is reported
+as a failure rather than retried forever.
+
+### Workers that memory cannot run are not free
+
+Sizing the budget correctly exposed a smaller error in the same arithmetic: a
+measuring worker holds **824 MB** of interpreter, numpy and scipy before it
+decodes a single sample, and the cost model counted that as zero. Six workers
+start 4.9 GB down.
+
+So starting more workers than memory can ever run at once is not merely
+useless — each one takes `WORKER_RESERVE` from the lanes that do run.
+`workers_that_fit` now walks the count down until it is consistent with the
+budget its own overhead produces, sized on the **typical** track rather than
+the largest (a library's biggest master would size the pool at one; the
+admission gate is what handles outliers). On the library here — median 2.80 GB,
+p90 4.04 GB, max 9.65 GB — that is 5 workers rather than 6. Scoped to one
+192 kHz album, where the typical track is 6.0 GB, it is 2:
+
+```
+jobs: 2 process(es), not 6: 6 would want 41 GB for a typical track
+      and there is not that much
+memory: 16 GB for decoded audio; a typical track wants 6.0 GB so 2 measure
+        at once, and the largest wants 9.0 GB so that one measures 1 at a time
+```
 
 ### A failed track keeps its stems
 
@@ -610,6 +676,10 @@ person's library and would rot. What matters is the method:
 | `_mtx_out` / `_mtx_stems` added to `SKIP_DIRS` so a scan cannot measure its own separated stems as masters | `scan.py` | landed |
 | `separation_streams()`, VRAM-derived, `--stems-jobs` to override | `metrics/stems.py`, `cli.py` | landed |
 | `separate_first()` runs several streams through a thread pool | `scan.py` | landed |
-| Overlap the separation and DSP phases | `scan.py` | **open**, ~19 % est. |
+| Overlap the separation and DSP phases | `scan.py` | landed |
+| Size the memory budget against free RAM, not total | `parallel.py` | landed |
+| Charge each worker the 824 MB it holds before decoding | `parallel.py` | landed |
+| Start no more workers than memory can run (`workers_that_fit`) | `parallel.py`, `scan.py` | landed |
+| Rebuild the pool when a worker is killed, instead of failing every remaining track | `scan.py` | landed |
 | Bound and evict the stem cache | `metrics/stems.py` | **open**, blocks library-scale runs |
 | Keep one demucs process alive instead of re-importing torch per file | `metrics/stems.py` | **open**, ~6 s/track inside the non-bottleneck phase |

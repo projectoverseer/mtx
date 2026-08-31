@@ -901,3 +901,170 @@ def test_an_unreadable_header_opts_out_of_memory_scheduling(tmp_path):
 def test_the_lookahead_floor_keeps_every_worker_fed(procs, streams, asked, want):
     from mtx import scan as scan_mod
     assert scan_mod.lookahead_for(procs, streams, asked) == want
+
+
+class _BreakablePool:
+    """A pool whose worker dies partway, the way an out-of-memory kill does.
+
+    A killed worker does not fail its own track politely: it breaks the
+    executor, so the running future and every later submission raise
+    `BrokenProcessPool` until something rebuilds it.
+    """
+
+    def __init__(self, fn, die_on=2, deaths=1):
+        self.fn = fn
+        self.die_on = die_on
+        self.deaths = deaths
+        self.n = 0
+        self.broken = False
+        self.rebuilds = 0
+
+    def submit(self, job):
+        from concurrent.futures.process import BrokenProcessPool
+        if self.broken:
+            raise BrokenProcessPool("pool is broken")
+        self.n += 1
+        fut = Future()
+        if self.n == self.die_on and self.deaths > 0:
+            self.deaths -= 1
+            self.broken = True
+            fut.set_exception(BrokenProcessPool("worker terminated abruptly"))
+        else:
+            fut.set_result(self.fn(job))
+        return fut
+
+    def restart(self):
+        self.broken = False
+        self.rebuilds += 1
+
+
+def _ok(j):
+    return {"source": j["source"], "out_dir": j["out_dir"], "ok": True}
+
+
+def test_a_dead_worker_does_not_end_the_run():
+    """One killed worker costs its own track a retry, not the whole library."""
+    from mtx import scan as scan_mod
+
+    jobs = _jobs(20)
+    pool = _BreakablePool(_ok, die_on=2)
+    seen = []
+    scan_mod.drive(jobs, pool.submit, seen.append,
+                   restart=pool.restart, log=lambda m: None)
+
+    assert len(seen) == 20, "every track was accounted for"
+    assert all(r["ok"] for r in seen), "and the rebuilt pool measured them"
+    assert pool.rebuilds == 1, "rebuilt once, not once per track it took down"
+
+
+class _BatchKillPool:
+    """A worker dies with several tracks in flight, taking all of them down.
+
+    This is what an out-of-memory kill actually looks like: not one future
+    failing, but every future the dead worker held, plus every submission
+    afterwards, until the executor is replaced.
+    """
+
+    def __init__(self, fn, kill_at=3):
+        self.fn = fn
+        self.kill_at = kill_at
+        self.pending = []
+        self.n = 0
+        self.broken = False
+        self.rebuilds = 0
+
+    def submit(self, job):
+        from concurrent.futures.process import BrokenProcessPool
+        if self.broken:
+            raise BrokenProcessPool("pool is broken")
+        self.n += 1
+        fut = Future()
+        if self.n < self.kill_at:
+            self.pending.append(fut)        # still measuring
+            return fut
+        if self.n == self.kill_at:
+            self.broken = True
+            for f in self.pending + [fut]:
+                f.set_exception(BrokenProcessPool("worker terminated abruptly"))
+            self.pending = []
+            return fut
+        fut.set_result(self.fn(job))
+        return fut
+
+    def restart(self):
+        self.broken = False
+        self.kill_at = -1                   # rebuilt narrower; it holds now
+        for f in self.pending:
+            f.set_result(self.fn({"source": "x", "out_dir": "y"}))
+        self.pending = []
+        self.rebuilds += 1
+
+
+def test_the_pool_is_rebuilt_once_per_break_not_once_per_victim():
+    """A dying worker takes several tracks with it; they share one rebuild."""
+    from mtx import scan as scan_mod
+
+    jobs = _jobs(12)
+    pool = _BatchKillPool(_ok, kill_at=3)
+    seen = []
+    scan_mod.drive(jobs, pool.submit, seen.append,
+                   restart=pool.restart, log=lambda m: None)
+
+    assert len(seen) == 12, "every track was accounted for"
+    assert all(r["ok"] for r in seen), "and all of them measured in the end"
+    assert pool.rebuilds == 1, "one break is one rebuild, not one per victim"
+
+
+def test_without_a_restart_a_broken_pool_still_terminates():
+    """No `restart` is the old behaviour: report the failures, but finish."""
+    from mtx import scan as scan_mod
+
+    jobs = _jobs(12)
+    pool = _BreakablePool(_ok, die_on=2)
+    seen = []
+    scan_mod.drive(jobs, pool.submit, seen.append, log=lambda m: None)
+
+    assert len(seen) == 12
+    assert sum(1 for r in seen if r.get("ok")) == 1
+    assert all("BrokenProcessPool" in r["error"]
+               for r in seen if not r.get("ok"))
+
+
+def test_a_track_that_breaks_the_pool_twice_is_reported_not_retried_forever():
+    """The retry is once per track, so a genuinely fatal file cannot loop."""
+    from mtx import scan as scan_mod
+
+    jobs = _jobs(3)
+    # Dies on every submission, so the retry breaks it again.
+    pool = _BreakablePool(_ok, die_on=1, deaths=99)
+    pool.die_on = 1
+
+    def submit(job):
+        from concurrent.futures.process import BrokenProcessPool
+        fut = Future()
+        fut.set_exception(BrokenProcessPool("worker terminated abruptly"))
+        return fut
+
+    seen = []
+    scan_mod.drive(jobs, submit, seen.append,
+                   restart=lambda: None, log=lambda m: None)
+
+    assert len(seen) == 3, "it terminated instead of retrying forever"
+    assert all("worker lost" in r["error"] for r in seen)
+
+
+def test_a_break_tightens_the_budget():
+    """A pool only breaks because it was too wide, so the next one is narrower."""
+    from mtx import scan as scan_mod
+
+    jobs = _jobs(6)
+    for j in jobs:
+        j["bytes"] = 1_000_000_000
+    pool = _BreakablePool(_ok, die_on=2)
+    lines = []
+    scan_mod.drive(jobs, pool.submit, lambda r: None, budget=8_000_000_000,
+                   restart=pool.restart, log=lines.append)
+
+    narrowed = [ln for ln in lines if "rebuilding the pool" in ln]
+    assert narrowed, "the rebuild was reported"
+    assert "6 GB" in narrowed[0], f"8 GB tightened to 6, got {narrowed[0]!r}"
