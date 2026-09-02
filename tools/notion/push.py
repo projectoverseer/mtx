@@ -95,6 +95,13 @@ def ensure_databases(api: Notion, parent: str, state: State,
 
     known = state.data.get("databases") or {}
     if known.get("tracks") and known.get("observations"):
+        # Still push the schema.  Skipping this because the ids were already
+        # known meant a property added to schema.py never reached the live
+        # database, and every page then failed with "Could not find property"
+        # -- the run cannot write a column the database has not been told
+        # about.  Adding properties is safe and idempotent; nothing is removed
+        # here (that is what --prune-options is for).
+        api.update_database(known["tracks"], database_schema())
         return known["tracks"], known["observations"]
 
     existing = api.find_databases(parent)
