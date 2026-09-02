@@ -245,7 +245,7 @@ def main() -> int:
     def work(folder):
         name = os.path.basename(folder)
         try:
-            doc = load_folder(folder, outcomes)
+            doc = load_folder(folder, outcomes, args.root)
             sha = dig(doc, "file.sha256") or folder
         except (OSError, ValueError) as exc:
             return folder, None, 0, f"{name}: cannot read analysis: {exc}"

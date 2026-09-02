@@ -92,24 +92,42 @@ def lookup(client: Client, local: dict[str, Any]) -> dict[str, Any]:
         return result
 
     headers = {"Authorization": f"Discogs token={tok}"}
-    params: dict[str, Any] = {"type": "release", "per_page": 10}
-    if local.get("barcode"):
-        params["barcode"] = local["barcode"]
-    else:
-        params["artist"] = local.get("artist") or ""
-        params["track"] = local.get("title") or ""
-        params["release_title"] = local.get("album") or ""
-    url = build_url(f"{BASE}/database/search", **params)
-    body, err = client.get_json(url, headers=headers)
-    result["requests"] += 1
-    if err:
-        result["errors"].append(f"search: {err}")
-        return result
 
-    hits = [h for h in (body or {}).get("results") or [] if h.get("id")]
+    # A barcode is the exact query when Discogs has it, and useless when it
+    # does not -- a digital release's UPC is often absent from a database
+    # built around physical pressings.  Searching by it alone gave "no
+    # results" on the whole corpus while artist+track matched immediately, so
+    # the barcode is tried first and then fallen back on rather than trusted.
+    attempts: list[tuple[str, dict[str, Any]]] = []
+    if local.get("barcode"):
+        attempts.append(("barcode",
+                         {"type": "release", "per_page": 10,
+                          "barcode": local["barcode"]}))
+    text_query: dict[str, Any] = {"type": "release", "per_page": 10,
+                                  "artist": local.get("artist") or "",
+                                  "track": local.get("title") or ""}
+    if local.get("album"):
+        text_query["release_title"] = local["album"]
+    attempts.append(("artist+track", text_query))
+
+    hits: list[dict[str, Any]] = []
+    matched_by = None
+    for name, params in attempts:
+        url = build_url(f"{BASE}/database/search", **params)
+        body, err = client.get_json(url, headers=headers)
+        result["requests"] += 1
+        if err:
+            result["errors"].append(f"search ({name}): {err}")
+            continue
+        hits = [h for h in (body or {}).get("results") or [] if h.get("id")]
+        if hits:
+            matched_by = name
+            break
+
     if not hits:
         result["errors"].append("no results")
         return result
+    result["matched_by"] = matched_by
 
     # Search hits carry no duration, so rank on title text and prefer the
     # earliest year -- the original pressing over a later compilation.

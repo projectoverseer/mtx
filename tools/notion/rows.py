@@ -23,8 +23,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 from mtx.export import flatten, track_row          # noqa: E402
 from mtx.split import load_analysis                # noqa: E402
 
-from schema import (PROPERTIES, TRAIT_VERSION, dig,   # noqa: E402
-                    trait_documentation, trait_states)
+from schema import (PROPERTIES, TRAIT_VERSION, catalogue_artist,  # noqa: E402
+                    dig, trait_documentation, trait_states)
 
 TEXT_LIMIT = 2000          # Notion's per-rich-text-object cap
 BLOCK_LINES = 45           # lines per code block, keeps each well under the cap
@@ -47,7 +47,8 @@ def load_outcomes(root: str) -> dict:
         return {}
 
 
-def load_folder(folder: str, outcomes: dict | None = None) -> dict:
+def load_folder(folder: str, outcomes: dict | None = None,
+                root: str | None = None) -> dict:
     """`analysis.json` with `online.json` mounted at `online.`.
 
     The sidecar is mounted rather than merged because that is what it is:
@@ -66,8 +67,21 @@ def load_folder(folder: str, outcomes: dict | None = None) -> dict:
     if os.path.isfile(declared_path):
         with open(declared_path, encoding="utf-8") as fh:
             doc.setdefault("declared", {}).update(json.load(fh))
+    # The catalogue this track belongs to, taken from the top-level scan
+    # folder rather than the artist tag.  `mtx scan` mirrors the library, so
+    # that folder is one name per artist; the tag carries features, casing
+    # drift and separator damage -- "Tyler, The Creator", "Tyler; The Creator"
+    # and "Tyler, The Creator / Daniel Caesar" are one catalogue and three
+    # strings, and as a categorical they are three unrelated values.
+    catalogue = ""
+    if root:
+        rel = os.path.relpath(os.path.abspath(folder), os.path.abspath(root))
+        head = rel.replace("\\", "/").split("/")[0]
+        if head not in (".", "..", ""):
+            catalogue = head
     doc["mtx"] = {"analysis_path": os.path.abspath(folder),
-                  "folder": os.path.basename(folder)}
+                  "folder": os.path.basename(folder),
+                  "catalogue_artist": catalogue}
     sha = dig(doc, "file.sha256")
     doc["outcome"] = (outcomes or {}).get(sha) or {}
     return doc
@@ -395,7 +409,9 @@ def observations_for(doc: dict) -> list[dict]:
         return []
     sha = dig(doc, "file.sha256") or ""
     title = dig(doc, "tags.named.title") or dig(doc, "mtx.folder") or "untitled"
-    artist = dig(doc, "tags.named.artist") or ""
+    # The same canonical the track row uses.  Reading the raw tag here is what
+    # turned this column into 264 values across 55 artists.
+    artist = catalogue_artist(doc)
     out = []
     for metric, path in OBSERVATION_METRICS:
         value = _number(dig(doc, path))

@@ -255,12 +255,20 @@ def enrich(analysis: dict[str, Any], cache_dir: str | None = None,
         "file:tag": [local["genre_tag"]] if local.get("genre_tag") else None,
     }
     out["genres"] = genre.collect({k: v for k, v in genre_sources.items() if v})
+    # Every name attached to this record, so that "billie eilish" cannot end
+    # up in a mood vocabulary alongside "nocturnal" and "party".
+    artist_names = [local.get("artist") or ""]
+    artist_names += [a.get("name") for a in (mb.get("artists") or [])
+                     if isinstance(a, dict)]
+    artist_names += [p.get("name") for p in
+                     ((out.get("credits") or {}).get("main artist") or [])
+                     if isinstance(p, dict)]
     out["descriptive_tags"] = genre.collect_tags({
         "musicbrainz:recording": mb.get("tags_recording"),
         "musicbrainz:release-group": mb.get("tags_release_group"),
         "lastfm:track": lf.get("tags_track"),
         "lastfm:artist": lf.get("tags_artist"),
-    })
+    }, exclude=artist_names)
 
     # -- cross-checks --------------------------------------------------------
 

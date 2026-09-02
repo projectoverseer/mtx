@@ -200,46 +200,66 @@ def coverage_pct(doc: dict) -> Any:
     return round(100.0 * present / total, 2) if total else None
 
 
-def _split_artists(raw: Any) -> list[str]:
-    """`A feat. B and C / A / C` -> `['A', 'B', 'C']`, order kept, deduped.
+def catalogue_artist(doc: dict) -> str:
+    """The artist whose catalogue this track belongs to.
 
-    Artist tags arrive joined by ";", NUL or " / " depending on the container
-    and on how mutagen flattened a list, and a featured credit is often folded
-    into the same string.  Left whole, one Vietnamese track produced the select
-    option "Le Hieu feat. Soobin Hoang Son and Touliver / Le Hieu / Touliver /
-    ..." -- which is a unique option per collaboration, so grouping by artist
-    stops working and the within-artist outcome normalisation that the corpus
-    depends on has nothing to group on.
+    Deliberately the top-level scan folder, not the artist tag.  `mtx scan`
+    mirrors the library, so that folder is exactly one name per artist, while
+    the tag carries features, casing drift and separator damage: "Tyler, The
+    Creator", "Tyler; The Creator" and "Tyler, The Creator / Daniel Caesar"
+    are one catalogue and three strings.  Grouped on the tag this column held
+    264 values for 55 artists, and every within-artist comparison built on it
+    was comparing the wrong things.
+
+    Falls back to the album artist, then the track artist, when a folder is
+    loaded without a root.
     """
-    import re
-    if not raw:
-        return []
-    parts, seen = [], set()
-    for chunk in re.split(r"[;\x00/]|\bfeat\.|\bfeaturing\b|\bwith\b|\band\b|&",
-                          str(raw)):
-        name = chunk.strip(" ,")
-        key = name.lower()
-        if name and key not in seen:
-            seen.add(key)
-            parts.append(name)
-    return parts
+    name = dig(doc, "mtx.catalogue_artist")
+    if name:
+        return str(name)
+    for path in ("tags.named.albumartist", "tags.named.artist"):
+        raw_name = dig(doc, path)
+        if raw_name:
+            return str(raw_name).replace(";", ",").split(" / ")[0].strip()
+    return ""
 
 
-def primary_artist(doc: dict) -> Any:
-    """One name to group a catalogue by: the album artist, else the first."""
-    album = _split_artists(dig(doc, "tags.named.albumartist"))
-    if album:
-        return album[0]
-    first = _split_artists(dig(doc, "tags.named.artist"))
-    return first[0] if first else None
+def artist_mbid(doc: dict) -> Any:
+    """The primary artist's MusicBrainz id -- the machine-readable key.
+
+    A name is a label for people.  An MBID is what a join should actually run
+    on: it survives spelling, casing, and the fact that this library has a
+    folder called "Red Hot Chilli Peppers".
+    """
+    for a in dig(doc, "online.musicbrainz.artists", []) or []:
+        if isinstance(a, dict) and a.get("mbid"):
+            return a["mbid"]
+    return None
 
 
 def all_artists(doc: dict) -> list[str]:
-    names = _split_artists(dig(doc, "tags.named.artist"))
-    for extra in _split_artists(dig(doc, "tags.named.albumartist")):
-        if extra.lower() not in {n.lower() for n in names}:
-            names.append(extra)
-    return names
+    """Every credited artist, from MusicBrainz rather than from the tag.
+
+    MusicBrainz returns them already separated and already canonical, so this
+    is a list of real names instead of one string that happens to contain
+    slashes.
+    """
+    out, seen = [], set()
+    for a in dig(doc, "online.musicbrainz.artists", []) or []:
+        name = str((a or {}).get("name") or "").strip()
+        if name and name.lower() not in seen:
+            seen.add(name.lower())
+            out.append(name)
+    if not out:
+        head = catalogue_artist(doc)
+        if head:
+            out.append(head)
+    return out
+
+
+def all_artist_mbids(doc: dict) -> list[str]:
+    return [a["mbid"] for a in (dig(doc, "online.musicbrainz.artists", []) or [])
+            if isinstance(a, dict) and a.get("mbid")]
 
 
 LYRIC_MIN_WORDS = 20
@@ -305,8 +325,17 @@ def _group(label: str, props: list[Prop]) -> None:
 
 _group("identity", [
     P("Title", "title", "tags.named.title"),
-    P("Artist", "select", primary_artist),
+    # `Artist` is the grouping facet.  Notion rejects commas in select and
+    # multi-select option names outright, so "Tyler, The Creator" cannot be
+    # stored as itself here -- the comma becomes a semicolon.  The exact name
+    # is kept losslessly in `Artist canonical`, and the join key a machine
+    # should actually use is `Artist MBID`.
+    P("Artist", "select", catalogue_artist),
+    P("Artist canonical", "rich_text",
+      lambda d: (all_artists(d) or [catalogue_artist(d)])[0] or None),
+    P("Artist MBID", "rich_text", artist_mbid),
     P("Artists all", "multi_select", all_artists),
+    P("Artist MBIDs", "multi_select", all_artist_mbids),
     P("Album", "rich_text", "tags.named.album"),
     P("Release date", "date", "online.cross_checks.release_date.earliest"),
     P("Year", "number", lambda d: _year(dig(d, "online.cross_checks.release_date.earliest")
