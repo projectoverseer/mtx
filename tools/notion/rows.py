@@ -368,12 +368,16 @@ def body_blocks(doc: dict) -> list[dict]:
 # --------------------------------------------------------------------------
 
 
+# Track-level figures only.  `deezer_album_fans` is a property of the album
+# and `lastfm_artist_listeners` of the artist, so logging either per track
+# writes the same number 137 times for Drake and adds no information while
+# making the log 1.7x larger.  Both stay on the track row as `Latest ...`
+# caches; if artist momentum over time becomes interesting, it wants its own
+# per-artist log rather than a column repeated across a catalogue.
 OBSERVATION_METRICS = [
     ("deezer_rank", "online.popularity.deezer_rank"),
-    ("deezer_album_fans", "online.popularity.deezer_album_fans"),
     ("lastfm_listeners", "online.popularity.lastfm_listeners"),
     ("lastfm_playcount", "online.popularity.lastfm_playcount"),
-    ("lastfm_artist_listeners", "online.popularity.lastfm_artist_listeners"),
 ]
 
 

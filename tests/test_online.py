@@ -268,3 +268,59 @@ def test_a_provider_that_raises_does_not_lose_the_others(tmp_path, monkeypatch):
                  providers=("deezer", "itunes"), version="0.0.0")
     assert any("boom" in e for e in got["errors"])
     assert "itunes" in got
+
+
+def test_host_pacing_is_shared_across_clients_and_threads(tmp_path):
+    """One request a second to MusicBrainz, however many clients ask.
+
+    The pacing is a promise to the host, not a property of a client object.
+    `tools/enrich_fast.py` runs a thread pool to overlap the waiting, and
+    before the clock moved to module level each client kept its own -- so
+    eight workers meant eight requests a second and a 503 the caller had
+    earned.
+    """
+    import threading
+    import time
+
+    from mtx.online import http
+
+    interval = http.MIN_INTERVAL["musicbrainz.org"]
+    http._HOST_LAST_CALL.pop("musicbrainz.org", None)
+
+    stamps: list[float] = []
+    lock = threading.Lock()
+
+    def call() -> None:
+        # A separate Client per thread, which is the case that used to break.
+        client = http.Client(cache_dir=str(tmp_path), user_agent="test/0")
+        client._wait("musicbrainz.org")
+        with lock:
+            stamps.append(time.monotonic())
+
+    threads = [threading.Thread(target=call) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    stamps.sort()
+    gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+    assert len(gaps) == 5
+    # Allow a little slack for scheduling, but nothing near a doubled rate.
+    assert min(gaps) >= interval * 0.9, f"requests too close together: {gaps}"
+
+
+def test_host_pacing_does_not_serialise_unrelated_hosts(tmp_path):
+    """Deezer must not wait behind MusicBrainz; the overlap is the whole point."""
+    import time
+
+    from mtx.online import http
+
+    for host in ("musicbrainz.org", "api.deezer.com"):
+        http._HOST_LAST_CALL.pop(host, None)
+
+    client = http.Client(cache_dir=str(tmp_path), user_agent="test/0")
+    client._wait("musicbrainz.org")
+    started = time.monotonic()
+    client._wait("api.deezer.com")
+    assert time.monotonic() - started < http.MIN_INTERVAL["musicbrainz.org"] / 2
