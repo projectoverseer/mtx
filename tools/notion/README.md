@@ -17,6 +17,29 @@ the lyric shape test that works around a corpus written before the
 
 ---
 
+## The order to run things in
+
+```bash
+# 1. Enrich. Parallel; ~1 hour for 1,321 tracks against ~3.5 sequential.
+set LASTFM_API_KEY=...
+python tools/enrich_fast.py "E:\Music\_mtx_out" -j 8 --providers all
+
+# 2. Derive the outcome variable from what enrichment returned.
+python tools/notion/outcome.py "E:\Music\_mtx_out"
+
+# 3. Push.
+set NOTION_TOKEN=...
+python tools/notion/push.py "E:\Music\_mtx_out" --parent <page_id>
+```
+
+Step 2 must follow step 1 and precede step 3: `outcome.py` reads `online.json`
+and writes `outcome.json`, and `push.py` reads both. Skip it and the
+within-artist columns are simply empty — the loader says so rather than
+inventing them.
+
+Re-run steps 1–3 with `--refresh` on the enrich to take a fresh popularity
+snapshot. That appends to the Observations log; it does not correct it.
+
 ## Run it
 
 ```bash
@@ -32,8 +55,8 @@ Two databases are created under it and reused on every later run:
 
 | Database | Shape | Grows by |
 | --- | --- | --- |
-| **mtx Tracks** | one page per analysed folder | one row per track |
-| **mtx Observations** | append-only log | one row per figure per lookup |
+| **Corpus** | one page per analysed folder | one row per track |
+| **Corpus Observations** | append-only log | one row per figure per lookup |
 
 The run is **idempotent** on tracks — matched by `file.sha256`, recorded in
 `<root>/.notion_state.json` — and **additive** on observations. Interrupt it
@@ -41,6 +64,11 @@ and run it again; it resumes.
 
 Useful flags: `--limit N`, `--force` (re-push known tracks), `--no-body`
 (properties only, much faster), `--skip-observations`.
+
+`--archive-db "Masters"` retires a superseded database once the push has
+succeeded with zero failures — never before. An archived database is
+recoverable from Notion's trash; a window where the old data is gone and the
+new is not yet there is not worth risking.
 
 ---
 
@@ -111,7 +139,7 @@ the same. Nor can the difference be recovered later: Deezer rank and Last.fm
 playcount are **current-value endpoints with no history**, so a figure not
 captured this month is gone for good.
 
-So time-varying figures go to **mtx Observations**, one row per
+So time-varying figures go to **Corpus Observations**, one row per
 `(track, metric, value, observed_at, source)`, never updated. Re-run
 `mtx enrich --refresh` on a schedule and push again: new rows, old ones
 untouched. What that buys:
@@ -137,7 +165,9 @@ stop moving, so they belong on the row. Fill them from `declared.json`.
 | `schema.py` | the ~150 tier-1 properties, the derived readers that reach into lists, and the trait rules |
 | `rows.py` | one analysed folder → Notion properties + body blocks + observation rows |
 | `client.py` | stdlib-only Notion client: pinned API version, ~2.8 req/s throttle, retries 429 and 5xx |
-| `push.py` | CLI, database creation, resume state |
+| `push.py` | CLI, database creation, resume state, `--archive-db` |
+| `outcome.py` | within-artist playcount z, terciles, single-vs-album cut |
+| `../enrich_fast.py` | parallel `mtx enrich` over a corpus, ~3.2x faster |
 
 No third-party dependency. `mtx`'s `online/` subpackage is stdlib-only for the
 same reason, and a loader that needs a dependency tree to move JSON would be a
@@ -147,9 +177,11 @@ poor advertisement for a tool whose point is reproducible local measurement.
 
 ## Before the first real run
 
-1. **`mtx enrich` the corpus.** Without it there is no genre, no release date,
-   no ISRC and no popularity — roughly a third of the tier-1 properties stay
-   empty, and cohorts are not expressible at all.
+1. **Enrich the corpus.** Without it there is no genre, no release date, no
+   ISRC and no popularity — roughly a third of the tier-1 properties stay
+   empty, and cohorts are not expressible at all. Use `enrich_fast.py`; it
+   calls the same `enrich()` and writes the same `online.json`, it just stops
+   waiting on one host at a time.
 2. **Set `LASTFM_API_KEY`.** It is free, and it is the only provider that
    returns playcount. Without it the Observations log gets Deezer rank only.
 3. **Re-scan for lyrics.** Analyses written before the `lyrics.py` fix carry a
