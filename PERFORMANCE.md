@@ -733,6 +733,13 @@ person's library and would rot. What matters is the method:
   so a real folder named `Play (Deluxe) [E]` matches nothing and the cmdlet
   returns **zero rows with no error** — which looks exactly like data loss.
   Use `-LiteralPath`, or walk the tree from a shell that does not do this.
+- A path component that **ends in a dot or a space is not refused, it is
+  trimmed**. `makedirs("03. Sometimes...")` creates `03. Sometimes` and reports
+  success, so the mismatch surfaces later as an `ENOENT` on a write into a
+  folder that was just created — inside demucs, or inside `mtx` itself, minutes
+  into a track. Names like that come straight off a CD rip (`03.
+  Sometimes....flac`), so every folder named after a filename or a tag goes
+  through `safe_component()`.
 
 ---
 
@@ -751,3 +758,4 @@ person's library and would rot. What matters is the method:
 | Rebuild the pool when a worker is killed, instead of failing every remaining track | `scan.py` | landed |
 | Bound and evict the stem cache | `metrics/stems.py` | **open**, blocks library-scale runs |
 | Keep one demucs process alive instead of re-importing torch per file | `metrics/stems.py` | **open**, ~6 s/track inside the non-bottleneck phase |
+| One naming rule (`safe_component()`) for every folder named after a file, and `--filename` so demucs stops naming its own | `util.py`, `scan.py`, `metrics/stems.py`, `cli.py` | landed |

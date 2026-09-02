@@ -61,6 +61,7 @@ from .parallel import (WORKER_RESERVE, apply_single_threaded_env,
                        memory_budget, single_threaded_env, total_memory_bytes,
                        workers_that_fit)
 from .split import DEFAULT_PART_BYTES
+from .util import safe_component
 
 AUDIO_EXTENSIONS = (".flac", ".wav", ".aif", ".aiff", ".w64", ".caf", ".ogg",
                     ".opus", ".mp3", ".m4a", ".aac", ".wv", ".ape")
@@ -176,7 +177,11 @@ class Scope:
         rel = os.path.relpath(self.scan_path, self.library_root)
         if rel == os.curdir:
             return self.out_dir
-        return os.path.join(self.out_dir, rel)
+        # Sanitised the same way `out_dir_for()` sanitises them, or the summary
+        # would be written beside the tracks it is meant to cover.
+        return os.path.join(self.out_dir,
+                            *[c if c in (os.curdir, os.pardir) else safe_component(c)
+                              for c in rel.replace("/", os.sep).split(os.sep)])
 
 
 def resolve_scope(scan_path: str, out: str | None = None,
@@ -268,13 +273,21 @@ def out_dir_for(scope: Scope, source: str, collide: bool = False) -> str:
     The folder is named after the audio file, not after its tags: the name has
     to be known before the file is analysed for the skip check to be cheap, and
     a mirror of the library is easier to navigate than a flat list anyway.
+
+    Every component goes through `safe_component()` first.  A filename is not
+    automatically a legal folder name: `03. Sometimes....flac` loses its
+    extension and leaves a name Windows will not keep, and the mismatch only
+    shows up as a missing directory once the track has been measured.  Names
+    that differ only in what it strips are a collision like any other, and
+    `plan()` gives both of them their extension back.
     """
     rel_dir = os.path.relpath(os.path.dirname(source), scope.library_root)
     stem = os.path.basename(source) if collide else os.path.splitext(os.path.basename(source))[0]
     parts = [scope.out_dir]
     if rel_dir != os.curdir:
-        parts.append(rel_dir)
-    parts.append(stem)
+        parts += [c if c in (os.curdir, os.pardir) else safe_component(c)
+                  for c in rel_dir.replace("/", os.sep).split(os.sep)]
+    parts.append(safe_component(stem))
     return os.path.join(*parts)
 
 

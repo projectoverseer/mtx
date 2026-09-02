@@ -19,6 +19,7 @@ from typing import Any
 from . import __version__
 from .parallel import cpu_count, default_workers
 from .scan import AUDIO_EXTENSIONS
+from .util import BAD_FS_CHARS, safe_component
 
 
 def _log(msg: str) -> None:
@@ -32,13 +33,14 @@ def _log(msg: str) -> None:
         print(safe, file=sys.stderr, flush=True)
 
 
-# Characters no Windows path component may contain (POSIX only bars "/").
-_BAD_FS_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-
-
 def _sanitise_component(s: str) -> str:
-    """Make a tag value usable as a single path component."""
-    return re.sub(r"\s+", " ", _BAD_FS_CHARS.sub("_", s)).strip()
+    """Make a tag value usable as a single path component.
+
+    Half of the rule: the characters.  The other half -- what a name may not
+    end in -- `safe_component()` applies to the assembled folder name, which is
+    where the end of it actually is.
+    """
+    return re.sub(r"\s+", " ", BAD_FS_CHARS.sub("_", s)).strip()
 
 
 def _join_artists(raw: str) -> str:
@@ -72,8 +74,8 @@ def _folder_name(path: str, res: dict[str, Any] | None = None) -> str:
         name = title
     else:
         name = ""
-    name = name[:150].strip().rstrip(". ")  # Windows: no trailing dot or space
-    return name or os.path.splitext(os.path.basename(path))[0]
+    name = safe_component(name[:150].strip(), fallback="")
+    return name or safe_component(os.path.splitext(os.path.basename(path))[0])
 
 
 def _default_out(base_out: str | None, path: str,
@@ -491,9 +493,10 @@ def cmd_compare(args: argparse.Namespace) -> int:
     _check_readable(args.file_a)
     _check_readable(args.file_b)
     out_dir = args.out or os.path.join(
-        "mtx_out", "compare_" +
-        os.path.splitext(os.path.basename(args.file_a))[0] + "__vs__" +
-        os.path.splitext(os.path.basename(args.file_b))[0])
+        "mtx_out", safe_component(
+            "compare_" +
+            os.path.splitext(os.path.basename(args.file_a))[0] + "__vs__" +
+            os.path.splitext(os.path.basename(args.file_b))[0]))
     paths = compare_files(args.file_a, args.file_b, out_dir,
                           null_test=args.null_test, profile=args.profile,
                           max_part_bytes=parse_part_size(args), log=_log)

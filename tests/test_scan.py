@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 
@@ -20,6 +21,7 @@ import pytest
 
 from mtx import SCHEMA_VERSION, __version__
 from mtx import declared as declared_mod
+from mtx.util import Collector
 from mtx.parallel import ordered_window, resolve_threads, single_threaded_env
 from mtx.scan import (Duplicate, NoRootRegistered, find_audio, ledger_path,
                       materialize_duplicate, out_dir_for,
@@ -150,6 +152,95 @@ def test_stem_collisions_keep_the_extension(library, registry, tmp_path):
                       if os.path.basename(s).startswith("01. Eraser"))
     assert clashing == ["01. Eraser.flac", "01. Eraser.wav"]
 
+
+def test_a_folder_is_named_something_the_filesystem_will_keep(library, registry,
+                                                              tmp_path):
+    """`03. Sometimes....flac` must not ask Windows for a name it drops.
+
+    Trailing dots and spaces are not refused there, they are quietly removed:
+    the folder is created under a shorter name, `makedirs` reports success, and
+    the first write into the name that was asked for fails with ENOENT after
+    the track has already been measured.
+    """
+    album = library / "Ed Sheeran" / "÷"
+    (album / "03. Sometimes....flac").write_bytes(b"x")
+    out = str(tmp_path / "out")
+    scope, _ = resolve_scope(str(library), out=out, registry=registry)
+    d = out_dir_for(scope, str(album / "03. Sometimes....flac"))
+
+    assert os.path.basename(d) == "03. Sometimes"
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "analysis.json"), "w", encoding="utf-8") as f:
+        f.write("{}")          # the write the old name could not survive
+    assert os.path.isfile(os.path.join(d, "analysis.json"))
+
+
+def test_names_that_differ_only_in_what_is_stripped_are_a_collision(
+        library, registry, tmp_path):
+    """Stripping must not silently merge two tracks into one folder."""
+    album = library / "Ed Sheeran" / "÷"
+    (album / "03. Sometimes....flac").write_bytes(b"x")
+    (album / "03. Sometimes.flac").write_bytes(b"y")
+    scope, _ = resolve_scope(str(library), out=str(tmp_path / "out"),
+                             registry=registry)
+    pairs = plan(scope, find_audio(str(library)))
+    dirs = [d for _, d in pairs]
+    assert len(set(dirs)) == len(dirs)
+    assert sorted(os.path.basename(d) for s, d in pairs
+                  if os.path.basename(s).startswith("03. Sometimes")) == [
+        "03. Sometimes....flac", "03. Sometimes.flac"]
+
+
+@pytest.mark.parametrize("name, expected", [
+    ("03. Sometimes...", "03. Sometimes"),
+    ("07. Question... ", "07. Question"),
+    ("ordinary name", "ordinary name"),
+    ("Don't Panic", "Don't Panic"),
+    ("AC/DC: Back?", "AC_DC_ Back_"),
+    ("NUL", "NUL_"),
+    ("nul.wav", "nul.wav_"),
+    ("...", "_"),
+])
+def test_safe_component_is_the_one_naming_rule(name, expected):
+    """Applied on POSIX too: one mirror tree, whichever machine wrote it."""
+    from mtx.util import safe_component
+
+    assert safe_component(name) == expected
+
+
+def test_demucs_is_told_where_to_put_the_stems(monkeypatch, tmp_path):
+    """The stem folder is the cache's name for it, never the input filename.
+
+    Left to name the folder itself demucs derives it from the file, and a track
+    whose name trails off then fails inside demucs, minutes into a separation
+    that had already worked.
+    """
+    from mtx.metrics import stems as m
+
+    src = tmp_path / "03. Sometimes....flac"
+    src.write_bytes(b"RIFF" + os.urandom(1024))
+    monkeypatch.setattr(m, "CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(m, "resolve_device", lambda *a, **k: "cpu")
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        out_root = cmd[cmd.index("-o") + 1]
+        d = os.path.join(out_root, "htdemucs", m.STEM_DIR)
+        os.makedirs(d, exist_ok=True)
+        for s in m.stem_names("htdemucs"):
+            open(os.path.join(d, f"{s}.wav"), "wb").close()
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    monkeypatch.setattr(m.shutil, "which", lambda _: "demucs")
+    paths = m.separate(str(src), Collector())
+
+    assert seen["cmd"][seen["cmd"].index("--filename") + 1] == \
+        m.STEM_DIR + "/{stem}.{ext}"
+    assert paths and all(os.path.isfile(p) for p in paths.values())
+    assert all(os.path.basename(os.path.dirname(p)) == m.STEM_DIR
+               for p in paths.values())
 
 # ------------------------------------------------------------- the skip ledger
 

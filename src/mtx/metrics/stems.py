@@ -337,8 +337,14 @@ def separate(path: str, collector: Collector, model: str | None = None, *,
     asked = resolve_device(device)
     attempts = _attempts(asked, resolve_segment(segment), model)
     for i, (dev, seg) in enumerate(attempts):
+        # --filename puts the stems straight into the fixed folder the content
+        # key expects.  Left to itself demucs names that folder after the input
+        # file, which is not merely untidy: `03. Sometimes....flac` asks for a
+        # directory Windows will not create under the name it was given, and
+        # demucs finds that out only when it opens `drums.wav` inside it and
+        # gets ENOENT, minutes into a separation that had already succeeded.
         cmd = [sys.executable, "-m", "demucs", "-n", model, "-d", dev,
-               "-o", out_root]
+               "-o", out_root, "--filename", STEM_DIR + "/{stem}.{ext}"]
         if seg is not None:
             cmd += ["--segment", str(int(seg))]
         cmd.append(path)
@@ -361,11 +367,12 @@ def separate(path: str, collector: Collector, model: str | None = None, *,
         collector.warn("stems",
                        f"{dev} ran out of memory at segment {seg}; retrying on "
                        f"{nxt[0]}" + (f" at segment {nxt[1]}" if nxt[1] else ""))
-    # demucs names its output folder after the input file; give it the fixed
-    # name the content key expects, so the next copy of this master finds it.
+    # A demucs too old for --filename named the folder after the input file
+    # instead; move it to the name the content key expects, so the next copy of
+    # this master finds it.
     produced = os.path.join(out_root, model,
                             os.path.splitext(os.path.basename(path))[0])
-    if produced != stem_dir and os.path.isdir(produced):
+    if not _complete(have) and produced != stem_dir and os.path.isdir(produced):
         shutil.rmtree(stem_dir, ignore_errors=True)
         try:
             os.replace(produced, stem_dir)

@@ -1,8 +1,9 @@
-"""Small shared helpers: dB maths, note names, JSON sanitising, warnings."""
+"""Small shared helpers: dB maths, note names, path and JSON sanitising, warnings."""
 
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
@@ -16,6 +17,37 @@ EPS = 1e-20
 DB_FLOOR = -200.0
 
 NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+
+# ------------------------------------------------------------- path components
+
+# Characters no Windows path component may hold (POSIX only bars "/"), and the
+# device names it still reserves in every directory.
+BAD_FS_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_TRAILING = re.compile(r"[.\s]+$")
+_RESERVED = frozenset(["CON", "PRN", "AUX", "NUL"]
+                      + [f"COM{i}" for i in range(1, 10)]
+                      + [f"LPT{i}" for i in range(1, 10)])
+
+
+def safe_component(name: str, fallback: str = "_") -> str:
+    """`name` made usable as one path component, on every platform.
+
+    Windows does not refuse a trailing dot or space -- it drops it, silently
+    and only sometimes: `makedirs("03. Sometimes...")` creates `03. Sometimes`
+    and reports success, and the write into the folder that was asked for then
+    fails with ENOENT halfway through the track.  A title that trails off is an
+    ordinary thing for a file to be called, so everything this tool names after
+    a filename or a tag goes through here.
+
+    The rule is applied on POSIX too, where those names are legal: a mirror of
+    a library has to hold the same folder names whichever machine wrote it, or
+    the same track measured from two sides of a share is measured twice.
+    """
+    out = _TRAILING.sub("", BAD_FS_CHARS.sub("_", name))
+    if out.upper().split(".")[0] in _RESERVED:
+        out += "_"
+    return out or fallback
+
 
 
 def db_amp(x: Any, floor: float = DB_FLOOR) -> Any:
