@@ -35,7 +35,19 @@ BLOCK_LINES = 45           # lines per code block, keeps each well under the cap
 # --------------------------------------------------------------------------
 
 
-def load_folder(folder: str) -> dict:
+def load_outcomes(root: str) -> dict:
+    """`{sha256: entry}` from `outcome.json`, or empty when it has not been run."""
+    path = os.path.join(root, "outcome.json")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh).get("tracks") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def load_folder(folder: str, outcomes: dict | None = None) -> dict:
     """`analysis.json` with `online.json` mounted at `online.`.
 
     The sidecar is mounted rather than merged because that is what it is:
@@ -56,6 +68,8 @@ def load_folder(folder: str) -> dict:
             doc.setdefault("declared", {}).update(json.load(fh))
     doc["mtx"] = {"analysis_path": os.path.abspath(folder),
                   "folder": os.path.basename(folder)}
+    sha = dig(doc, "file.sha256")
+    doc["outcome"] = (outcomes or {}).get(sha) or {}
     return doc
 
 

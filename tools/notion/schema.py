@@ -169,8 +169,15 @@ def credit(role: str) -> Callable[[dict], Any]:
 
 
 def is_single(doc: dict) -> Any:
-    """Album cut or standalone release -- the corpus's natural contrast set."""
-    rt = dig(doc, "online.musicbrainz.release_group_primary_type")
+    """Album cut or standalone release -- the corpus's natural contrast set.
+
+    Roughly 1,100 of 1,321 tracks here are album cuts by artists whose singles
+    are also in the corpus.  Same artist, same era, same producers, same
+    mastering chain, very different outcomes: every confound that normally
+    wrecks this comparison is held constant by construction, and what varies
+    is the song and the mix.
+    """
+    rt = dig(doc, "online.musicbrainz.release_group.primary_type")
     if isinstance(rt, str) and rt:
         return rt.lower() == "single"
     total = dig(doc, "tags.named.totaltracks")
@@ -462,13 +469,27 @@ _group("lyrics", [
 # an `observed_at`.  These two are caches of its latest row and carry the
 # timestamp that says how old they are.
 _group("outcome", [
+    # Settled facts: immutable once a record's chart run is over, so they
+    # belong on the row.  Filled from declared.json by hand.
     P("Billboard peak", "number", "declared.outcome.billboard_peak"),
     P("Weeks on chart", "number", "declared.outcome.weeks_on_chart"),
     P("Certification", "select", "declared.outcome.certification"),
+    # Caches of the newest Observations row, each next to the date that says
+    # how old it is.  Never treat one as current without reading that date.
     P("Latest Deezer rank", "number", "online.popularity.deezer_rank"),
     P("Latest playcount", "number", "online.popularity.lastfm_playcount"),
     P("Latest listeners", "number", "online.popularity.lastfm_listeners"),
     P("Last observed", "date", "online.queried_utc"),
+    # Derived by tools/notion/outcome.py: position within the same artist's
+    # catalogue, which is what holds fame and catalogue age constant.
+    P("Playcount z in artist", "number", "outcome.playcount_z_within_artist"),
+    P("Percentile in artist", "number", "outcome.percentile_within_artist", "%"),
+    P("Percentile in corpus", "number", "outcome.percentile_in_corpus", "%"),
+    P("vs artist median", "number", "outcome.playcount_vs_artist_median_db", "dB"),
+    P("Outcome tercile", "select", "outcome.outcome_tercile"),
+    P("Release type", "select", "outcome.release_type"),
+    P("Artist catalogue size", "number", "outcome.artist_track_count"),
+    P("Outcome basis", "rich_text", "outcome.reason"),
 ])
 
 _group("provenance", [

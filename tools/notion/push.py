@@ -33,7 +33,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 from client import Notion, NotionError            # noqa: E402
 from rows import (OBSERVATION_SCHEMA, body_blocks, database_schema,  # noqa: E402
-                  load_folder, observations_for, properties_for)
+                  load_folder, load_outcomes, observations_for,
+                  properties_for)
 from schema import PROPERTIES, TRAIT_VERSION, dig  # noqa: E402
 
 from mtx.cli import _enrich_targets               # noqa: E402
@@ -172,6 +173,11 @@ def main() -> int:
     if args.limit:
         folders = folders[:args.limit]
 
+    outcomes = load_outcomes(args.root)
+    if not outcomes:
+        log("note: no outcome.json; the within-artist outcome columns will "
+            "be empty. Run tools/notion/outcome.py first.")
+
     state = State(args.state or os.path.join(args.root, ".notion_state.json"))
     api = Notion(args.token, dry_run=args.dry_run, log=log)
     tracks_db, obs_db = ensure_databases(api, args.parent, state, args.dry_run)
@@ -185,7 +191,7 @@ def main() -> int:
     for i, folder in enumerate(folders, 1):
         name = os.path.basename(folder)
         try:
-            doc = load_folder(folder)
+            doc = load_folder(folder, outcomes)
         except (OSError, ValueError) as exc:
             log(f"[{i}/{len(folders)}] {name}: cannot read analysis: {exc}")
             failed += 1
