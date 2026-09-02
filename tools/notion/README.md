@@ -109,6 +109,35 @@ in the document:
 
 ---
 
+## What Notion does to categorical values
+
+Three constraints, all found the hard way, all worth knowing before you design
+a column:
+
+**Commas are rejected outright** — in `select` *and* `multi_select` option
+names, tested in both. `Tyler, The Creator` cannot be stored as itself in a
+facet; the loader substitutes a semicolon. The exact string lives in
+`Artist canonical` (rich text has no such limit) and the real join key is
+`Artist MBID`.
+
+**Option names are case-insensitive, and the first casing wins permanently.**
+Writing `Angine De Poitrine` to a column that already has the option
+`Angine de Poitrine` silently reuses the existing one. Renaming the option by
+id does not work either. The only route is to delete the option from the
+database schema — which clears it from every page holding it — and then write
+the value again so it is recreated with the casing you want.
+
+The consequence is that **correcting the source data is not sufficient**. A
+column whose first write was dirty stays dirty until the option is removed.
+
+**Options are never garbage-collected.** An option survives in the dropdown
+for ever once created, even after the last page stops using it. Re-pushing
+1,321 clean rows left all 264 broken artist values sitting in the filter menu,
+still looking like categories and still matching nothing. `--prune-options`
+writes back only the options in use.
+
+---
+
 ## Traits are tri-state, never boolean
 
 `Traits` is a multi-select carrying `four-on-the-floor` when the trait is
