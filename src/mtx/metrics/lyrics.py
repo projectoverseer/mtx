@@ -457,8 +457,10 @@ def analyse(tags: dict[str, Any], declared: dict[str, Any] | None,
     if isinstance(declared_text, str) and declared_text.strip():
         text, source = declared_text, "declared"
     else:
+        tag_keys = [str(k).lower() for k in PARAMS["lyrics"]["tag_keys"]]
         for key, value in allt.items():
-            if "lyric" in str(key).lower() and isinstance(value, str) and value.strip():
+            if (str(key).strip().lower() in tag_keys
+                    and isinstance(value, str) and value.strip()):
                 text, source = value, "file:tag"
                 break
 

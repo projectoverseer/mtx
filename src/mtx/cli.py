@@ -181,17 +181,27 @@ def cmd_join(args: argparse.Namespace) -> int:
 
 
 def _enrich_targets(path: str) -> list[str]:
-    """The analysed folders under `path`: itself, or its immediate children."""
+    """Every analysed folder at or under `path`, at any depth.
+
+    `mtx scan` mirrors the library tree, so an analysed track sits at
+    `<out>/Artist/Album/Track/analysis.json` -- three levels below the root
+    the user naturally passes here.  Walking only the immediate children
+    would report "no analysis.json" on a fully scanned library, so the walk
+    is recursive.  A folder holding an `analysis.json` is a leaf: nothing
+    below it is searched, and cache directories are skipped.
+    """
     if os.path.isfile(path):
         return [os.path.dirname(os.path.abspath(path)) or "."]
     if os.path.isfile(os.path.join(path, "analysis.json")):
         return [path]
     out = []
-    for name in sorted(os.listdir(path)):
-        sub = os.path.join(path, name)
-        if os.path.isdir(sub) and os.path.isfile(os.path.join(sub, "analysis.json")):
-            out.append(sub)
-    return out
+    for root, dirs, files in os.walk(path):
+        dirs[:] = sorted(d for d in dirs
+                         if not d.startswith(".") and d != "stems")
+        if "analysis.json" in files:
+            out.append(root)
+            dirs[:] = []          # an analysed folder is a leaf
+    return sorted(out)
 
 
 def cmd_enrich(args: argparse.Namespace) -> int:

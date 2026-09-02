@@ -404,6 +404,14 @@ PARAMS: dict[str, Any] = {
     },
     "lyrics": {
         "sources_in_priority_order": ["declared", "file:tag", "transcript"],
+        # Matched exactly against the lower-cased tag key, never as a
+        # substring: "composerlyricist" contains "lyric" and is a credit, not
+        # a lyric.  Apple-style tagging puts that key on most commercial
+        # files, so a substring test silently measures a list of songwriter
+        # names as though it were the song's words.
+        "tag_keys": ["lyrics", "lyric", "unsyncedlyrics", "unsynced lyrics",
+                     "unsyncedlyric", "uslt", "sylt", "©lyr", "lyr",
+                     "lyrics:description", "wm/lyrics"],
         "transcript": {
             "backends": ["whisperx", "whisper_timestamped", "faster_whisper"],
             "note": "optional; a transcript is an inference and is never merged "
