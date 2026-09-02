@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -35,6 +36,13 @@ MIN_INTERVAL = {
     "api.listenbrainz.org": 0.25,
 }
 DEFAULT_INTERVAL = 0.5
+
+# Per-host pacing state, shared by every Client in the process so that a
+# thread pool cannot multiply the request rate by its worker count.
+# `setdefault` on a plain dict is atomic under the GIL, which is all the
+# protection the lock registry itself needs.
+_HOST_LOCKS: dict[str, "threading.Lock"] = {}
+_HOST_LAST_CALL: dict[str, float] = {}
 
 # 429 and 503 are the two "come back later" answers these APIs use.
 RETRY_STATUS = (429, 500, 502, 503, 504)
@@ -99,11 +107,24 @@ class Client:
     # -- fetch ---------------------------------------------------------------
 
     def _wait(self, host: str) -> None:
+        """Hold the per-host interval, across every client in this process.
+
+        The pacing is a promise to the *host*, not a property of one client
+        object, so the last-call clock is module-level and guarded by a lock.
+        A caller that enriches a corpus with a thread pool would otherwise get
+        one clock per client and issue N requests a second to MusicBrainz,
+        which answers 503 and is entitled to.
+
+        Held for the whole sleep, so two threads cannot both read the same
+        clock, both decide they may go, and both fire together.
+        """
         interval = MIN_INTERVAL.get(host, DEFAULT_INTERVAL)
-        elapsed = time.monotonic() - self._last_call.get(host, 0.0)
-        if elapsed < interval:
-            time.sleep(interval - elapsed)
-        self._last_call[host] = time.monotonic()
+        with _HOST_LOCKS.setdefault(host, threading.Lock()):
+            elapsed = time.monotonic() - _HOST_LAST_CALL.get(host, 0.0)
+            if elapsed < interval:
+                time.sleep(interval - elapsed)
+            _HOST_LAST_CALL[host] = time.monotonic()
+            self._last_call[host] = _HOST_LAST_CALL[host]
 
     def get_json(self, url: str, headers: dict[str, str] | None = None
                  ) -> tuple[Any | None, str | None]:
