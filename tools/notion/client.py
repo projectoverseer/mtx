@@ -105,11 +105,16 @@ class Notion:
                     raise NotionError(exc.code, body, path) from None
                 self._log(f"{exc.code} on {path}; retry {attempt}/{MAX_ATTEMPTS} in {delay:.1f}s")
                 time.sleep(delay)
-            except urllib.error.URLError as exc:
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                # A socket read timeout raises TimeoutError, which is not a
+                # URLError -- so it used to escape the retry loop and fail a
+                # page outright.  One page in 1,305 did exactly that, and the
+                # cost was the whole archive step being held back.
                 if attempt == MAX_ATTEMPTS:
                     raise
                 delay = min(2 ** attempt, 30) + random.random()
-                self._log(f"network error ({exc.reason}); retry {attempt}/{MAX_ATTEMPTS} in {delay:.1f}s")
+                reason = getattr(exc, "reason", None) or exc
+                self._log(f"network error ({reason}); retry {attempt}/{MAX_ATTEMPTS} in {delay:.1f}s")
                 time.sleep(delay)
         raise NotionError(0, "exhausted retries", path)
 

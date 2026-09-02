@@ -306,7 +306,12 @@ def main() -> int:
     # Only after a successful push: an archived database is recoverable from
     # the Notion trash, but retiring the old one before the new one exists
     # would leave nothing to read in between.
-    if args.archive_db and not args.dry_run and pushed and not failed:
+    # The gate is "the corpus is fully present and nothing failed this run",
+    # not "this run wrote something": a re-run that finds everything already
+    # pushed is exactly when archiving is safest, and requiring `pushed` meant
+    # the retry that fixed the last failure could never trigger it.
+    complete = (pushed + skipped) == len(folders) and not failed
+    if args.archive_db and not args.dry_run and complete:
         existing = api.find_databases(args.parent)
         for title in args.archive_db:
             db_id = existing.get(title)
@@ -318,9 +323,10 @@ def main() -> int:
             else:
                 api.request("PATCH", f"/databases/{db_id}", {"archived": True})
                 log(f"archived {title!r} ({db_id})")
-    elif args.archive_db and failed:
-        log(f"archive skipped: {failed} page(s) failed, so the old database "
-            f"stays where it is")
+    elif args.archive_db:
+        log(f"archive skipped: {failed} failed and "
+            f"{pushed + skipped}/{len(folders)} present, so the old "
+            f"database stays where it is")
 
     log(f"done: {pushed} pushed, {skipped} already present, {failed} failed, "
         f"{obs_rows} observation rows, {api.requests} API requests")
