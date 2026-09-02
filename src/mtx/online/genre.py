@@ -59,6 +59,15 @@ ALIAS = {
     "trip-hop": "trip hop", "lofi": "lo-fi", "lo fi": "lo-fi",
     "nu disco": "nu-disco", "post punk": "post-punk", "post rock": "post-rock",
     "2 step": "2-step", "2step": "2-step", "g funk": "g-funk",
+    "singer song writer": "singer-songwriter",
+    "singer & songwriter": "singer-songwriter",
+    "singer and songwriter": "singer-songwriter",
+    "break up": "breakup",
+    # Latin-script is the vocabulary this table speaks; a Cyrillic vote for
+    # the same genre is the same vote and has to land on the same option.
+    "\u043f\u043e\u043f": "pop", "\u0440\u043e\u043a": "rock",
+    "\u043c\u0435\u0436\u0434\u0443\u043d\u0430\u0440\u043e\u0434\u043d\u0430\u044f "
+    "\u043f\u043e\u043f \u043c\u0443\u0437\u044b\u043a\u0430": "pop",
     "kpop": "k-pop", "k pop": "k-pop", "j-pop": "j-pop", "jpop": "j-pop",
     "j pop": "j-pop", "lo fi": "lo-fi", "nu disco": "nu-disco",
     "post punk": "post-punk", "post rock": "post-rock",
@@ -119,7 +128,8 @@ TAG_NOISE = re.compile(
     # language, and a number with a unit is never a description of a sound.
     r"^\d+\s*[-\u2013]\s*\d+\b|^\d+\s*\+|\bwochen?\b|\bmonate?\b|"
     # Review sites, star ratings, and a listener's own filing system.
-    r"charts?\b|\.(de|com|net|org|co\.uk)\b|^ph[ _]|\bstars?\b|^my |^i |"
+    r"charts?\b|\bbest of\b|\bsession\d|\btrack\d|\bvol\.? ?\d|"
+    r"\.(de|com|net|org|co\.uk)\b|^ph[ _]|\bstars?\b|^my |^i |"
     r"\balbums?\b|\bcheck out\b|\bradio\b|^under \d|^top \d|"
     # Nothing but punctuation: "<3" and friends.
     r"^[^\w\s]+$",
@@ -190,7 +200,13 @@ def _votes(items: Iterable[Any]) -> list[tuple[str, float]]:
     return out
 
 
-def collect(by_source: dict[str, Iterable[Any]], top: int = 12) -> dict[str, Any]:
+def _squash(name: str) -> str:
+    """`Billie Eilish` and `billieeilish` are one string once squashed."""
+    return re.sub(r"[^a-z0-9]", "", str(name).lower())
+
+
+def collect(by_source: dict[str, Iterable[Any]], top: int = 12,
+            exclude: Iterable[str] | None = None) -> dict[str, Any]:
     """Merge every source's labels into one ranked, sourced list.
 
     Within a source the votes are scaled against that source's own top vote,
@@ -204,6 +220,11 @@ def collect(by_source: dict[str, Iterable[Any]], top: int = 12) -> dict[str, Any
     scores: dict[str, float] = {}
     sources: dict[str, list[str]] = {}
     raw: dict[str, list[dict[str, Any]]] = {}
+    # Listeners tag a record with the artist who made it, and a proper name in
+    # a genre list is a category matching one artist that describes nothing.
+    # Compared squashed, so "billieeilish" is caught as well as "Billie Eilish".
+    banned = {_squash(x) for x in (exclude or []) if x}
+    banned.discard("")
 
     for source, items in by_source.items():
         votes = _votes(items)
@@ -213,6 +234,8 @@ def collect(by_source: dict[str, Iterable[Any]], top: int = 12) -> dict[str, Any
         peak_vote = max((v for _n, v in votes), default=0.0) or 1.0
         trust = SOURCE_WEIGHT.get(source, 0.5)
         for name, vote in votes:
+            if _squash(name) in banned:
+                continue
             share = min(vote / peak_vote, 1.0)
             scores[name] = scores.get(name, 0.0) + share * trust
             sources.setdefault(name, [])
@@ -270,13 +293,14 @@ def collect_tags(by_source: dict[str, Iterable[Any]], top: int = 20,
     # Listeners tag a record with the artist who made it.  True, and useless as
     # a description -- and it drops a proper name into a mood vocabulary, where
     # it then looks like every other value in the column.
-    banned = {normalise(x) for x in (exclude or []) if x}
+    banned = {_squash(x) for x in (exclude or []) if x}
     banned.discard("")
     for source, items in by_source.items():
         votes = _votes(items)
         peak_vote = max((v for _n, v in votes), default=0.0) or 1.0
         for name, vote in votes:
-            if umbrella(name) or TAG_NOISE.search(name) or name in banned:
+            if (umbrella(name) or TAG_NOISE.search(name)
+                    or _squash(name) in banned):
                 continue  # a genre, a shelf label, or the artist's own name
             scores[name] = scores.get(name, 0.0) + min(vote / peak_vote, 1.0)
             sources.setdefault(name, [])

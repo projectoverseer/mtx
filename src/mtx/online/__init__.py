@@ -254,12 +254,13 @@ def enrich(analysis: dict[str, Any], cache_dir: str | None = None,
         "discogs:genre": dg.get("genres"),
         "file:tag": [local["genre_tag"]] if local.get("genre_tag") else None,
     }
-    out["genres"] = genre.collect({k: v for k, v in genre_sources.items() if v})
-    # Every name attached to this record, so that "billie eilish" cannot end
-    # up in a mood vocabulary alongside "nocturnal" and "party".
     artist_names = [local.get("artist") or ""]
     artist_names += [a.get("name") for a in (mb.get("artists") or [])
                      if isinstance(a, dict)]
+    out["genres"] = genre.collect(
+        {k: v for k, v in genre_sources.items() if v}, exclude=artist_names)
+    # Every name attached to this record, so that "billie eilish" cannot end
+    # up in a mood vocabulary alongside "nocturnal" and "party".
     artist_names += [p.get("name") for p in
                      ((out.get("credits") or {}).get("main artist") or [])
                      if isinstance(p, dict)]
