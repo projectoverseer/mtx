@@ -25,7 +25,9 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -120,6 +122,38 @@ def ensure_databases(api: Notion, parent: str, state: State,
     return tracks, observations
 
 
+def source_sha(folder: str) -> str | None:
+    """The track's sha256 from `mtx_source.json` -- 895 bytes, not 3 MB."""
+    try:
+        with open(os.path.join(folder, "mtx_source.json"), encoding="utf-8") as fh:
+            return ((json.load(fh).get("source") or {}).get("sha256")) or None
+    except (OSError, ValueError):
+        return None
+
+
+def reconcile(api: Notion, db_id: str, state: State) -> int:
+    """Rebuild the pushed-set from Notion itself, by sha256.
+
+    The state file is an optimisation, not the record.  If it is lost, stale,
+    or was last written 25 tracks before an interruption, a resumed run would
+    create duplicate pages for everything it had forgotten -- and a duplicate
+    is far more annoying to clean up than a re-push is to wait for.  So the
+    live database is asked once at startup and believed over the file.
+    """
+    known = dict(state.data.get("tracks") or {})
+    found = 0
+    for page in api.query(db_id):
+        prop = (page.get("properties") or {}).get("sha256") or {}
+        rich = prop.get("rich_text") or []
+        sha = rich[0]["text"]["content"] if rich else ""
+        if sha:
+            known[sha] = page["id"]
+            found += 1
+    state.data["tracks"] = known
+    state.save()
+    return found
+
+
 # --------------------------------------------------------------------------
 # push
 # --------------------------------------------------------------------------
@@ -155,6 +189,9 @@ def main() -> int:
                     help="write payloads to --dump-dir and send nothing")
     ap.add_argument("--dump-dir", default="notion_payloads")
     ap.add_argument("--limit", type=int, help="only the first N folders")
+    ap.add_argument("-j", "--workers", type=int, default=6,
+                    help=("parallel pages (default 6). Pushing is latency-bound, "
+                          "not throttle-bound, so this is most of the speed"))
     ap.add_argument("--state", help="resume file (default <root>/.notion_state.json)")
     ap.add_argument("--no-body", action="store_true",
                     help="properties only; skip the full row and section blocks")
@@ -185,57 +222,84 @@ def main() -> int:
     api = Notion(args.token, dry_run=args.dry_run, log=log)
     tracks_db, obs_db = ensure_databases(api, args.parent, state, args.dry_run)
 
-    log(f"{len(folders)} folder(s) | {len(PROPERTIES)} properties | "
-        f"traits {TRAIT_VERSION} | {'DRY RUN' if args.dry_run else 'live'}")
+    if not args.dry_run:
+        found = reconcile(api, tracks_db, state)
+        log(f"reconciled {found} existing page(s) from Notion")
 
-    pushed = skipped = failed = obs_rows = 0
+    log(f"{len(folders)} folder(s) | {len(PROPERTIES)} properties | "
+        f"traits {TRAIT_VERSION} | {args.workers} workers | "
+        f"{'DRY RUN' if args.dry_run else 'live'}")
+
+    # Decide what to skip from `mtx_source.json` (895 bytes), never by loading
+    # the analysis.  Reading all 1,321 documents up front to look at one field
+    # would cost nine minutes before the first page is written and hold every
+    # parsed document in memory at once; the worker loads its own.
+    todo = [f for f in folders
+            if args.force or not state.data["tracks"].get(source_sha(f) or f)]
+    skipped = len(folders) - len(todo)
+
+    counts = {"pushed": 0, "failed": 0, "obs": 0}
+    guard = threading.Lock()
     started = time.monotonic()
 
-    for i, folder in enumerate(folders, 1):
+    def work(folder):
         name = os.path.basename(folder)
         try:
             doc = load_folder(folder, outcomes)
+            sha = dig(doc, "file.sha256") or folder
         except (OSError, ValueError) as exc:
-            log(f"[{i}/{len(folders)}] {name}: cannot read analysis: {exc}")
-            failed += 1
-            continue
-
-        sha = dig(doc, "file.sha256") or folder
-        known = (state.data["tracks"] or {}).get(sha)
-        if known and not args.force:
-            skipped += 1
-            continue
-
+            return folder, None, 0, f"{name}: cannot read analysis: {exc}"
         try:
             if args.dry_run:
-                dump(args.dump_dir, f"{i:04d}_{name}", {
+                dump(args.dump_dir, name, {
                     "properties": properties_for(doc),
-                    "blocks": len(body_blocks(doc)) if not args.no_body else 0,
+                    "blocks": 0 if args.no_body else len(body_blocks(doc)),
                     "observations": observations_for(doc),
                 })
-                page_id = "dry-run"
-            else:
-                page_id = push_track(api, tracks_db, doc,
-                                     known if args.force else None,
-                                     not args.no_body)
-                if not args.skip_observations:
-                    for row in observations_for(doc):
-                        api.create_page(obs_db, row)
-                        obs_rows += 1
-            state.data["tracks"][sha] = page_id
-            pushed += 1
+                return sha, "dry-run", 0, None
+            page_id = push_track(api, tracks_db, doc,
+                                 (state.data["tracks"] or {}).get(sha) if args.force else None,
+                                 not args.no_body)
+            rows = 0
+            if not args.skip_observations:
+                for row in observations_for(doc):
+                    api.create_page(obs_db, row)
+                    rows += 1
+            return sha, page_id, rows, None
         except NotionError as exc:
-            log(f"[{i}/{len(folders)}] {name}: {exc}")
-            failed += 1
-            continue
+            return sha, None, 0, f"{name}: {exc}"
+        except Exception as exc:               # one bad page must not end the run
+            return sha, None, 0, f"{name}: {type(exc).__name__}: {exc}"
 
-        if i % 25 == 0 or i == len(folders):
-            rate = i / max(time.monotonic() - started, 1e-6)
-            left = (len(folders) - i) / rate if rate else 0
-            log(f"[{i}/{len(folders)}] {pushed} pushed, {skipped} skipped, "
-                f"{failed} failed, {obs_rows} observations "
-                f"| {rate * 60:.0f}/min, ~{left / 60:.0f} min left")
-            state.save()
+    if todo:
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = [pool.submit(work, folder) for folder in todo]
+            try:
+                for n, fut in enumerate(as_completed(futures), 1):
+                    sha, page_id, rows, err = fut.result()
+                    with guard:
+                        if err:
+                            counts["failed"] += 1
+                            log(f"  {err}")
+                        else:
+                            state.data["tracks"][sha] = page_id
+                            counts["pushed"] += 1
+                            counts["obs"] += rows
+                        if n % 25 == 0 or n == len(todo):
+                            rate = n / max(time.monotonic() - started, 1e-6)
+                            left = (len(todo) - n) / rate if rate else 0
+                            log(f"[{n}/{len(todo)}] {counts['pushed']} pushed, "
+                                f"{skipped} already there, {counts['failed']} failed, "
+                                f"{counts['obs']} observations "
+                                f"| {rate * 60:.0f}/min, ~{left / 60:.0f} min left")
+                            state.save()
+            except KeyboardInterrupt:
+                log("interrupted; re-run to continue (pages are reconciled by sha256)")
+                pool.shutdown(wait=False, cancel_futures=True)
+                state.save()
+                return 130
+
+    pushed, failed, obs_rows = counts["pushed"], counts["failed"], counts["obs"]
 
     state.save()
 

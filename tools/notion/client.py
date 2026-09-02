@@ -16,6 +16,7 @@ import json
 import os
 import random
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -46,6 +47,7 @@ class Notion:
         self.dry_run = dry_run
         self.requests = 0
         self._last = 0.0
+        self._lock = threading.Lock()
         self._log = log or (lambda m: print(f"[notion] {m}", file=sys.stderr, flush=True))
         if not self.token and not dry_run:
             raise SystemExit(
@@ -54,10 +56,23 @@ class Notion:
 
     # ------------------------------------------------------------------
     def _throttle(self) -> None:
-        wait = MIN_INTERVAL_S - (time.monotonic() - self._last)
-        if wait > 0:
-            time.sleep(wait)
-        self._last = time.monotonic()
+        """Pace requests, correctly when several threads share this client.
+
+        Notion's limit is per integration, not per thread, so the clock is
+        held under a lock for the whole sleep -- otherwise two threads read
+        the same timestamp, both conclude they may go, and the rate doubles.
+
+        Pushing is latency-bound rather than throttle-bound: a page create
+        carrying 100 blocks takes well over a second server-side, while the
+        throttle only asks for 0.36 s. Serially that wastes most of the
+        allowance, which is why `push.py` runs a pool and why this has to be
+        thread-safe.
+        """
+        with self._lock:
+            wait = MIN_INTERVAL_S - (time.monotonic() - self._last)
+            if wait > 0:
+                time.sleep(wait)
+            self._last = time.monotonic()
 
     def request(self, method: str, path: str, payload: dict | None = None) -> dict:
         if self.dry_run:
@@ -72,7 +87,8 @@ class Notion:
             req.add_header("Content-Type", "application/json")
             try:
                 with urllib.request.urlopen(req, timeout=60) as resp:
-                    self.requests += 1
+                    with self._lock:
+                        self.requests += 1
                     return json.loads(resp.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", "replace")
