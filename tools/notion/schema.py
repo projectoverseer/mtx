@@ -262,6 +262,14 @@ def all_artist_mbids(doc: dict) -> list[str]:
             if isinstance(a, dict) and a.get("mbid")]
 
 
+def release_precision(doc: dict) -> Any:
+    """`day` / `month` / `year` -- how much of the release date is real."""
+    raw = str(dig(doc, "online.cross_checks.release_date.earliest") or "").strip()
+    if not raw:
+        return None
+    return {4: "year", 7: "month"}.get(len(raw), "day")
+
+
 LYRIC_MIN_WORDS = 20
 LYRIC_MIN_LINES = 4
 
@@ -541,14 +549,6 @@ _group("provenance", [
     P("Analysis path", "rich_text", "mtx.analysis_path"),
     P("Traits", "multi_select", lambda d: _trait_names(d)),
 ])
-
-
-def release_precision(doc: dict) -> Any:
-    """`day` / `month` / `year` -- how much of the release date is real."""
-    raw = str(dig(doc, "online.cross_checks.release_date.earliest") or "").strip()
-    if not raw:
-        return None
-    return {4: "year", 7: "month"}.get(len(raw), "day")
 
 
 def _year(value: Any) -> Any:

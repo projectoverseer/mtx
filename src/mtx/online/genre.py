@@ -62,7 +62,9 @@ ALIAS = {
     "singer song writer": "singer-songwriter",
     "singer & songwriter": "singer-songwriter",
     "singer and songwriter": "singer-songwriter",
-    "break up": "breakup",
+    "break up": "breakup", "trapsoul": "trap soul",
+    "children s music": "children's music", "childrens music": "children's music",
+    "r b": "r&b", "discoth que": "discothèque",
     # Latin-script is the vocabulary this table speaks; a Cyrillic vote for
     # the same genre is the same vote and has to land on the same option.
     "\u043f\u043e\u043f": "pop", "\u0440\u043e\u043a": "rock",
@@ -234,7 +236,11 @@ def collect(by_source: dict[str, Iterable[Any]], top: int = 12,
         peak_vote = max((v for _n, v in votes), default=0.0) or 1.0
         trust = SOURCE_WEIGHT.get(source, 0.5)
         for name, vote in votes:
-            if _squash(name) in banned:
+            # The tag noise filter belongs here too.  It only ever ran on the
+            # descriptive tags, so a shelf label that `umbrella()` failed to
+            # classify fell through into the genre list instead -- which is
+            # how "best of 2026" became a genre.
+            if _squash(name) in banned or TAG_NOISE.search(name):
                 continue
             share = min(vote / peak_vote, 1.0)
             scores[name] = scores.get(name, 0.0) + share * trust
