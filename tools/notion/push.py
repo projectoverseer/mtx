@@ -138,6 +138,41 @@ def source_sha(folder: str) -> str | None:
         return None
 
 
+def observation_keys(api: Notion, db_id: str) -> set[tuple[str, str, str]]:
+    """`(sha256, metric, day)` for every observation already logged.
+
+    Append-only is a rule about *corrections* -- a later reading never edits an
+    earlier one -- not a licence to write the same reading twice.  Re-pushing a
+    corpus after fixing a column re-sends the same snapshot, and without this
+    every row is duplicated: one forced re-push turned 3,785 observations into
+    7,573.  A reading is identified by its track, its metric and the day it was
+    taken, so a genuine later snapshot still lands as a new row.
+    """
+    keys: set[tuple[str, str, str]] = set()
+    for page in api.query(db_id):
+        props = page.get("properties") or {}
+        rich = (props.get("Track sha256") or {}).get("rich_text") or []
+        sha = rich[0]["text"]["content"] if rich else ""
+        metric = ((props.get("Metric") or {}).get("select") or {}).get("name") or ""
+        day = (((props.get("Observed at") or {}).get("date") or {})
+               .get("start") or "")[:10]
+        if sha and metric:
+            keys.add((sha, metric, day))
+    return keys
+
+
+def observation_key(row: dict) -> tuple[str, str, str]:
+    def text(name):
+        rt = (row.get(name) or {}).get("rich_text") or []
+        return rt[0]["text"]["content"] if rt else ""
+
+    def select(name):
+        return ((row.get(name) or {}).get("select") or {}).get("name") or ""
+
+    day = ((row.get("Observed at") or {}).get("date") or {}).get("start", "")[:10]
+    return (text("Track sha256"), select("Metric"), day)
+
+
 def reconcile(api: Notion, db_id: str, state: State) -> int:
     """Rebuild the pushed-set from Notion itself, by sha256.
 
@@ -277,9 +312,13 @@ def main() -> int:
     api = Notion(args.token, dry_run=args.dry_run, log=log)
     tracks_db, obs_db = ensure_databases(api, args.parent, state, args.dry_run)
 
+    seen_observations: set[tuple[str, str, str]] = set()
     if not args.dry_run:
         found = reconcile(api, tracks_db, state)
         log(f"reconciled {found} existing page(s) from Notion")
+        if not args.skip_observations:
+            seen_observations = observation_keys(api, obs_db)
+            log(f"{len(seen_observations)} observation(s) already logged")
 
     log(f"{len(folders)} folder(s) | {len(PROPERTIES)} properties | "
         f"traits {TRAIT_VERSION} | {args.workers} workers | "
@@ -318,6 +357,11 @@ def main() -> int:
             rows = 0
             if not args.skip_observations:
                 for row in observations_for(doc):
+                    key = observation_key(row)
+                    with guard:
+                        if key in seen_observations:
+                            continue
+                        seen_observations.add(key)
                     api.create_page(obs_db, row)
                     rows += 1
             return sha, page_id, rows, None
