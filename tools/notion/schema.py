@@ -338,6 +338,10 @@ _group("identity", [
     P("Artist MBIDs", "multi_select", all_artist_mbids),
     P("Album", "rich_text", "tags.named.album"),
     P("Release date", "date", "online.cross_checks.release_date.earliest"),
+    # 365 of 1,321 releases are known only to the year, and a Notion date has
+    # to be a real day -- so those are stored as 1 January and would otherwise
+    # be indistinguishable from a record that actually came out on 1 January.
+    P("Release date precision", "select", release_precision),
     P("Year", "number", lambda d: _year(dig(d, "online.cross_checks.release_date.earliest")
                                         or dig(d, "tags.named.date"))),
     P("ISRC", "rich_text", "online.identity.isrc"),
@@ -519,6 +523,11 @@ _group("outcome", [
     P("Release type", "select", "outcome.release_type"),
     P("Artist catalogue size", "number", "outcome.artist_track_count"),
     P("Outcome basis", "rich_text", "outcome.reason"),
+    # Eight recordings appear twice, as two different masters of one
+    # performance.  Counted twice they double-vote in every percentile, so a
+    # query wanting a deduplicated corpus filters `Recording primary`.
+    P("Recording duplicates", "number", "outcome.recording_duplicates"),
+    P("Recording primary", "checkbox", "outcome.recording_primary"),
 ])
 
 _group("provenance", [
@@ -532,6 +541,14 @@ _group("provenance", [
     P("Analysis path", "rich_text", "mtx.analysis_path"),
     P("Traits", "multi_select", lambda d: _trait_names(d)),
 ])
+
+
+def release_precision(doc: dict) -> Any:
+    """`day` / `month` / `year` -- how much of the release date is real."""
+    raw = str(dig(doc, "online.cross_checks.release_date.earliest") or "").strip()
+    if not raw:
+        return None
+    return {4: "year", 7: "month"}.get(len(raw), "day")
 
 
 def _year(value: Any) -> Any:

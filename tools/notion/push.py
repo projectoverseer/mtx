@@ -154,6 +154,51 @@ def reconcile(api: Notion, db_id: str, state: State) -> int:
     return found
 
 
+
+def prune_options(api: Notion, db_id: str, log_fn=log) -> dict[str, int]:
+    """Drop select and multi-select options no page uses any more.
+
+    Notion keeps an option in the dropdown for ever once it has existed, even
+    after the last page stops using it.  So correcting the data is not enough:
+    re-pushing 1,321 tracks with a clean artist column leaves the 264 broken
+    values sitting in the filter menu, where they still look like categories
+    and still return nothing.  The options array on the database is
+    authoritative, so writing back only the ones in use removes the rest.
+
+    Run this only after a push that succeeded.  An option removed here is
+    removed from any page still holding it.
+    """
+    used: dict[str, set[str]] = {}
+    for page in api.query(db_id):
+        for name, value in (page.get("properties") or {}).items():
+            kind = value.get("type")
+            if kind == "select" and value.get("select"):
+                used.setdefault(name, set()).add(value["select"]["name"])
+            elif kind == "multi_select":
+                for opt in value.get("multi_select") or []:
+                    used.setdefault(name, set()).add(opt["name"])
+
+    db = api.request("GET", f"/databases/{db_id}")
+    removed: dict[str, int] = {}
+    payload: dict = {}
+    for name, spec in (db.get("properties") or {}).items():
+        kind = spec.get("type")
+        if kind not in ("select", "multi_select"):
+            continue
+        options = spec[kind].get("options") or []
+        keep = [o for o in options if o["name"] in used.get(name, set())]
+        if len(keep) != len(options):
+            removed[name] = len(options) - len(keep)
+            payload[name] = {kind: {"options": [{"name": o["name"],
+                                                 "color": o.get("color", "default")}
+                                                for o in keep]}}
+    if payload:
+        api.update_database(db_id, payload)
+        for name, count in sorted(removed.items(), key=lambda kv: -kv[1]):
+            log_fn(f"  pruned {count} unused option(s) from {name!r}")
+    return removed
+
+
 # --------------------------------------------------------------------------
 # push
 # --------------------------------------------------------------------------
@@ -198,6 +243,9 @@ def main() -> int:
     ap.add_argument("--skip-observations", action="store_true")
     ap.add_argument("--force", action="store_true",
                     help="re-push tracks already recorded in the state file")
+    ap.add_argument("--prune-options", action="store_true",
+                    help=("after a clean push, drop select options no page "
+                          "uses; Notion keeps them for ever otherwise"))
     ap.add_argument("--archive-db", metavar="TITLE", action="append",
                     help=("archive a database of this title under --parent "
                           "once the push succeeds; repeatable"))
@@ -311,6 +359,10 @@ def main() -> int:
     # pushed is exactly when archiving is safest, and requiring `pushed` meant
     # the retry that fixed the last failure could never trigger it.
     complete = (pushed + skipped) == len(folders) and not failed
+    if args.prune_options and not args.dry_run and complete:
+        for db_id, label in ((tracks_db, TRACKS_DB), (obs_db, OBSERVATIONS_DB)):
+            log(f"pruning unused options in {label}")
+            prune_options(api, db_id)
     if args.archive_db and not args.dry_run and complete:
         existing = api.find_databases(args.parent)
         for title in args.archive_db:

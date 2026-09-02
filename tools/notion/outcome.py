@@ -102,6 +102,8 @@ def collect(root: str) -> list[dict]:
         rg = ((online.get("musicbrainz") or {}).get("release_group") or {})
         rows.append({
             "sha256": sha,
+            "recording_mbid": (online.get("identity") or {}).get("recording_mbid"),
+            "isrc": (online.get("identity") or {}).get("isrc"),
             "folder": folder,
             "artist": catalogue_artist(root, folder, row),
             "credited_artist": row.get("Artist") or "",
@@ -110,6 +112,8 @@ def collect(root: str) -> list[dict]:
             "listeners": pop.get("lastfm_listeners"),
             "deezer_rank": pop.get("deezer_rank"),
             "release_type": rg.get("primary_type"),
+            "duration_s": (((online.get("cross_checks") or {}).get("duration")
+                            or {}).get("local_s")),
             "observed_at": online.get("queried_utc"),
         })
     return rows
@@ -141,7 +145,46 @@ def _percentile_rank(value: float, values: list[float]) -> float:
     return round(100.0 * (below + 0.5 * equal) / len(values), 2)
 
 
+def mark_duplicates(rows: list[dict]) -> int:
+    """Flag rows that are the same recording as another row.
+
+    Eight recordings appear twice in this corpus -- a single and its album,
+    usually -- with different sha256s, because they are different masters of
+    one performance.  Worth keeping: two masters of the same recording is the
+    only A/B in the library where the song is held constant.  But they are one
+    recording, and counted twice they double-vote in every percentile and in
+    the artist's own median.
+
+    `recording_duplicates` is how many rows share the recording, so a query
+    can ask for 1 and get a deduplicated corpus. `recording_primary` marks
+    one row per group -- the longest, which is the album cut rather than a
+    radio edit -- so the other queries can keep exactly one.
+    """
+    groups: dict[str, list[dict]] = {}
+    for r in rows:
+        key = r.get("recording_mbid") or r.get("isrc")
+        if key:
+            groups.setdefault(key, []).append(r)
+    dupes = 0
+    for key, members in groups.items():
+        n = len(members)
+        if n > 1:
+            dupes += n
+        # Longest first: the album cut over the radio edit.  Ties break on
+        # sha256 so the choice is stable between runs.
+        members.sort(key=lambda r: (-(r.get("duration_s") or 0), r["sha256"]))
+        for i, r in enumerate(members):
+            r["recording_duplicates"] = n
+            r["recording_primary"] = (i == 0)
+            r["recording_key"] = key
+    for r in rows:
+        r.setdefault("recording_duplicates", 1)
+        r.setdefault("recording_primary", True)
+    return dupes
+
+
 def derive(rows: list[dict]) -> dict:
+    mark_duplicates(rows)
     by_artist: dict[str, list[dict]] = {}
     for r in rows:
         by_artist.setdefault(r["artist"], []).append(r)
@@ -165,6 +208,9 @@ def derive(rows: list[dict]) -> dict:
             value = logs[r["sha256"]]
             entry: dict = {
                 "artist": artist,
+                "recording_duplicates": r.get("recording_duplicates", 1),
+                "recording_primary": r.get("recording_primary", True),
+                "recording_key": r.get("recording_key"),
                 "artist_track_count": len(tracks),
                 "artist_tracks_with_playcount": len(usable),
                 "playcount": r["playcount"],
@@ -247,6 +293,10 @@ def main() -> int:
     log(f"{cov['tracks']} tracks, {cov['artists']} artists, "
         f"{cov['with_z']} with a within-artist position")
     singles = sum(1 for t in result["tracks"].values() if t.get("is_single"))
+    dupes = sum(1 for t in result["tracks"].values()
+                if (t.get("recording_duplicates") or 1) > 1)
+    log(f"{dupes} row(s) share a recording with another row "
+        f"(filter recording_primary to deduplicate)")
     log(f"{singles} single(s), "
         f"{sum(1 for t in result['tracks'].values() if t.get('is_single') is False)} "
         f"album cut(s) -- the contrast set")
