@@ -19,26 +19,52 @@ the lyric shape test that works around a corpus written before the
 
 ## The order to run things in
 
+Do not run these by hand. `tools/pipeline.py` runs them in this order, skips
+what is already done, and refuses to push a corpus the audit failed:
+
 ```bash
-# 1. Enrich. Parallel; ~1 hour for 1,321 tracks against ~3.5 sequential.
-set LASTFM_API_KEY=...
-python tools/enrich_fast.py "E:\Music\_mtx_out" -j 8 --providers all
-
-# 2. Derive the outcome variable from what enrichment returned.
-python tools/notion/outcome.py "E:\Music\_mtx_out"
-
-# 3. Push.
-set NOTION_TOKEN=...
-python tools/notion/push.py "E:\Music\_mtx_out" --parent <page_id>
+python tools/pipeline.py                    # everything
+python tools/pipeline.py --from enrich      # audio already measured
+python tools/pipeline.py --only audit       # just check
 ```
 
-Step 2 must follow step 1 and precede step 3: `outcome.py` reads `online.json`
-and writes `outcome.json`, and `push.py` reads both. Skip it and the
-within-artist columns are simply empty — the loader says so rather than
-inventing them.
+The order is not arbitrary. Each stage needs what the one before it wrote:
 
-Re-run steps 1–3 with `--refresh` on the enrich to take a fresh popularity
-snapshot. That appends to the Observations log; it does not correct it.
+| stage | reads | writes | needs |
+| --- | --- | --- | --- |
+| `mtx scan` | the FLACs | `analysis.json` | — |
+| `tools/enrich_fast.py` | `analysis.json` | `online.json` | scan |
+| `tools/transcribe.py` | `analysis.json`, the FLAC | amends `analysis.json` | scan |
+| `tools/identity.py` | `online.json` | `artists.json` | enrich |
+| `tools/notion/outcome.py` | `online.json` | `outcome.json` | enrich |
+| `mtx cohort` | `analysis.json`, `online.json` | `cohort.json` | enrich |
+| `tools/audit.py` | all of it | `audit.json` | — |
+| `tools/notion/push.py` | all of it | Notion | everything above |
+
+Skip `outcome.py` and the within-artist columns are simply empty — the loader
+says so rather than inventing them. Skip `identity.py` and the `Artist` column
+falls back to whatever the library folder happened to be named. Skip `cohort`
+and every percentile column is empty, which is most of what makes the table
+answer a question rather than report a number.
+
+## The audit is a gate, not a report
+
+```bash
+python tools/audit.py <root>            # 4 seconds
+python tools/audit.py <root> --notion   # and the live tables
+python tools/audit.py <root> --deep     # + every analysis.json, minutes
+```
+
+It exits non-zero on an `error`, and `pipeline.py` stops there rather than
+publishing. Every check exists because the defect it looks for was found in
+data that had already been published and looked fine: a track credited to the
+wrong artist at match score 1.00, a song dated from a bootleg compilation, 264
+artist values for 55 artists, `best of 2016` filed as a genre. None of them
+raised. The corpus is the evidence base, and evidence that is confidently
+wrong is worse than evidence that is missing.
+
+Re-run the pipeline with `--refresh` to take a fresh popularity snapshot.
+That appends to the Observations log; it does not correct it.
 
 ## Run it
 
@@ -197,6 +223,12 @@ stop moving, so they belong on the row. Fill them from `declared.json`.
 | `push.py` | CLI, database creation, resume state, `--archive-db` |
 | `outcome.py` | within-artist playcount z, terciles, single-vs-album cut |
 | `../enrich_fast.py` | parallel `mtx enrich` over a corpus, ~3.2x faster |
+| `../pipeline.py` | every stage, in order, gated by the audit |
+| `../audit.py` | 25 checks over the corpus and the live tables; exits non-zero |
+| `../identity.py` | one canonical artist name and MBID per library folder |
+| `../transcribe.py` | add a lyric to analyses that already exist |
+| `../vocab.py` | the genre vocabulary, with the size of each cohort |
+| `../declare.py` | the `declared.json` an unreleased mix needs to join a cohort |
 
 No third-party dependency. `mtx`'s `online/` subpackage is stdlib-only for the
 same reason, and a loader that needs a dependency tree to move JSON would be a
@@ -213,9 +245,11 @@ poor advertisement for a tool whose point is reproducible local measurement.
    waiting on one host at a time.
 2. **Set `LASTFM_API_KEY`.** It is free, and it is the only provider that
    returns playcount. Without it the Observations log gets Deezer rank only.
-3. **Re-scan for lyrics.** Analyses written before the `lyrics.py` fix carry a
-   songwriter credit where the lyric should be. The loader's shape test hides
-   the damage; only re-running `mtx scan` clears it.
+3. **Transcribe.** Analyses written before the `lyrics.py` fix carry a
+   songwriter credit where the lyric should be, and `audit.py --deep` counts
+   them. The loader's shape test hides the damage in Notion; clearing it on
+   disk means `tools/transcribe.py`, which replaces the block in place for
+   thirty seconds a track rather than the eleven minutes a re-scan costs.
 4. **Dry-run first.** `--dry-run --limit 5`, then read a payload. It costs
    nothing and it is the cheapest way to catch a schema mistake before 1,321
    pages carry it.
