@@ -361,6 +361,16 @@ def _whisper_devices(P: dict[str, Any]) -> list[tuple[str, str]]:
     try:
         import torch                                   # noqa: PLC0415
         if torch.cuda.is_available():
+            # ctranslate2 loads `cublas64_12.dll` itself, and on Windows it
+            # will not find the copy torch ships unless that directory is on
+            # the loader path.  Without this the GPU is present, reported
+            # available, and fails at the first encode.
+            lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+            if hasattr(os, "add_dll_directory") and os.path.isdir(lib):
+                try:
+                    os.add_dll_directory(lib)
+                except OSError:
+                    pass
             return [("cuda", "float16"), ("cpu", "int8")]
     except Exception:
         pass
@@ -398,7 +408,11 @@ def transcribe(vocal_path: str, collector: Collector) -> dict[str, Any]:
                 "reason": "no transcription backend is installed",
                 "backends": list(P["backends"]),
                 "install": "pip install whisper-timestamped  # or faster-whisper"}
-    name = str(P.get("model") or "base")
+    # A model name is downloaded from HuggingFace on first use, which is a
+    # network dependency in the middle of an otherwise offline analysis.  On a
+    # connection that resets -- as this one does -- a local directory is the
+    # difference between a corpus that can be transcribed and one that cannot.
+    name = str(os.environ.get("MTX_WHISPER_MODEL") or P.get("model") or "base")
     for device, compute in _whisper_devices(P):
         try:
             model = WhisperModel(name, device=device, compute_type=compute)
@@ -411,17 +425,29 @@ def transcribe(vocal_path: str, collector: Collector) -> dict[str, Any]:
         return {"available": False,
                 "reason": "faster_whisper would not load on any device"}
     try:
-        segments, info = model.transcribe(vocal_path, word_timestamps=True,
-                                          vad_filter=bool(P.get("vad", True)))
+        segments, info = model.transcribe(
+            vocal_path, word_timestamps=True,
+            vad_filter=bool(P.get("vad", False)),
+            condition_on_previous_text=False)
         words, chunks = [], []
         for seg in segments:
             chunks.append(seg.text)
             for w in (seg.words or []):
                 words.append({"word": w.word, "start_s": float(w.start),
                               "end_s": float(w.end)})
+        # One segment is one sung phrase, and a sung phrase is a lyric line.
+        # Joined without the break the whole song is a single line, and every
+        # line-based measurement -- rhyme scheme, repeated-line share,
+        # syllables per line, readability -- quietly becomes meaningless while
+        # still reporting a number.
+        text = "\n".join(c.strip() for c in chunks if c.strip())
         return {"available": True, "backend": "faster_whisper", "model": name,
                 "device": device, "compute_type": compute,
-                "text": "".join(chunks).strip(), "language": info.language,
+                "text": text, "language": info.language,
+                "lines": len(chunks),
+                "line_note": "one line per transcribed segment, which is one "
+                             "sung phrase; a transcript carries no line breaks "
+                             "of its own",
                 "words": words, "source": "transcript",
                 "caveat": "a transcription of a separated vocal stem: an "
                           "inference, which mishears, and never a lyric sheet"}

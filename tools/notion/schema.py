@@ -525,8 +525,47 @@ _group("mix", [
 _group("lyrics", [
     P("Has real lyric", "checkbox", lyric_is_real),
     P("Lyric source", "select", "headline.lyric_source"),
+    P("Lyric is inference", "checkbox", "lyrics.is_inference"),
     P("Lyric words", "number", "headline.lyric_word_count"),
     P("Lyric language", "select", "lyrics.language.language"),
+    # The writing, which is the half of a record this corpus could say nothing
+    # about until transcription worked.  All of it is null on a track with no
+    # lyric, which is the correct reading of "not measured".
+    P("Lyric lines", "number", "lyrics.statistics.lines"),
+    P("Words per line", "number", "lyrics.statistics.words_per_line"),
+    P("Syllables per line", "number", "lyrics.statistics.syllables.per_line_mean"),
+    P("Unique words", "number", "lyrics.statistics.unique_words"),
+    P("Type-token ratio", "number", "lyrics.statistics.type_token_ratio"),
+    # How much of the lyric is the same line again.  The single most direct
+    # measurement of hook-versus-verse writing in the dump.
+    P("Repeated line %", "number", "lyrics.statistics.repeated_line_pct", "%"),
+    P("Lyric compression", "number", "lyrics.statistics.compression_ratio"),
+    P("Hook phrase", "rich_text",
+      lambda d: (dig(d, "lyrics.statistics.most_repeated_ngram", {}) or {}).get("text")),
+    P("Hook repeats", "number",
+      lambda d: (dig(d, "lyrics.statistics.most_repeated_ngram", {}) or {}).get("occurrences")),
+    P("Longest repeated phrase", "rich_text",
+      lambda d: (dig(d, "lyrics.statistics.longest_repeated_ngram", {}) or {}).get("text")),
+    P("Title sung", "number",
+      lambda d: (dig(d, "lyrics.statistics.title_in_lyric", {}) or {}).get("occurrences")),
+    P("Title first sung", "number", "lyrics.alignment.title_first_sung_s", "s"),
+    P("First word at", "number", "lyrics.alignment.first_word_s", "s"),
+    P("Voiced time", "number", "lyrics.alignment.voiced_time_s", "s"),
+    # Syllables per second of voicing: a delivery rate, comparable across a
+    # cohort in a way no text statistic is.
+    P("Delivery rate", "number",
+      "lyrics.alignment.delivery_rate.syllables_per_second", "syl/s"),
+    P("Syllables per beat", "number",
+      "lyrics.alignment.delivery_rate.syllables_per_beat"),
+    P("Rhyme density", "number", "lyrics.rhyme.density_per_line", "per line"),
+    P("Perfect rhymes", "number", "lyrics.rhyme.perfect"),
+    P("Slant rhymes", "number", "lyrics.rhyme.slant"),
+    P("Rhyme scheme", "rich_text", "lyrics.rhyme.scheme"),
+    P("Readability", "number", "lyrics.statistics.readability_flesch"),
+    P("First-person share", "number",
+      "lyrics.statistics.pronoun_share.first_singular"),
+    P("Second-person share", "number", "lyrics.statistics.pronoun_share.second"),
+    P("Explicit terms", "number", "lyrics.statistics.explicit_terms.count"),
 ])
 
 # Time-varying values never land here -- they go to the Observations log with

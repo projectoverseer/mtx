@@ -27,3 +27,7 @@ ci_signal.flac
 
 # Machine-specific CPU baseline recorded by tools/bench_cpu.py
 tools/.cpu_baseline.json
+
+# Model weights fetched at runtime; see .models/README.md
+.models/*
+!.models/README.md

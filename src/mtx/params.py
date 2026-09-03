@@ -419,7 +419,11 @@ PARAMS: dict[str, Any] = {
             # lines often enough to change a rhyme count.
             "model": "small",
             "device": "auto",
-            "vad": True,
+            # Silero's voice-activity filter is trained on speech and rejects
+            # a sung vocal over a full mix: on `Heat Waves` it cut a 366-word
+            # transcript down to five.  It helps on an isolated vocal stem and
+            # destroys a mix transcript, so it is off.
+            "vad": False,
             "note": "optional; a transcript is an inference and is never merged "
                     "into a declared or tagged lyric",
         },
