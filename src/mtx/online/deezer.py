@@ -85,6 +85,7 @@ def lookup(client: Client, local: dict[str, Any]) -> dict[str, Any]:
                                   for c in (track.get("contributors") or []))}
     result["match"] = match.score_candidate(local, remote, by_isrc=by_isrc)
     result["available"] = True
+    result["fetched_utc"] = client.last_fetched_utc
 
     bpm = track.get("bpm")
     result["track"] = {

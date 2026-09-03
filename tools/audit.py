@@ -87,6 +87,15 @@ def dig(doc: Any, path: str, default: Any = None) -> Any:
     return cur if cur is not None else default
 
 
+def _days_between(a: str, b: str) -> int | None:
+    try:
+        import datetime                                # noqa: PLC0415
+        return abs((datetime.date.fromisoformat(b)
+                    - datetime.date.fromisoformat(a)).days)
+    except (ValueError, TypeError):
+        return None
+
+
 def year_of(value: Any) -> int | None:
     text = str(value or "").strip()[:4]
     return int(text) if text.isdigit() else None
@@ -361,6 +370,24 @@ def check_match(rep: Report, tracks: list[dict[str, Any]]) -> None:
         "online.json exists but will not parse -- almost always a run killed "
         "part-way through a write",
         "delete the file and re-enrich that folder")
+
+    stale = rep.check(
+        "observation.stale_stamp", "warn",
+        "the popularity figures were read more than a week before this "
+        "enrichment ran, so an observation logged now would carry an old "
+        "number under today's date",
+        "re-enrich with --refresh to take a genuinely fresh reading; without "
+        "it the Observations log gains a row that only looks new")
+
+    for t in tracks:
+        online = t.get("online") or {}
+        read, ran = (online.get("popularity_observed_utc"),
+                     online.get("queried_utc"))
+        if read and ran and str(read)[:10] != str(ran)[:10]:
+            days = _days_between(str(read)[:10], str(ran)[:10])
+            if days is not None and days > 7:
+                stale.hit(t["rel"], read=str(read)[:10], enriched=str(ran)[:10],
+                          days=days)
 
     for t in tracks:
         if t.get("online_unreadable"):

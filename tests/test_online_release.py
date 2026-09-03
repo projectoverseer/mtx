@@ -238,6 +238,8 @@ def test_lastfm_refuses_a_row_credited_to_somebody_else(monkeypatch, tmp_path):
     calls = []
 
     class FakeClient:
+        last_fetched_utc = "2026-09-03T00:00:00Z"
+
         def get_json(self, url, headers=None):
             calls.append(url)
             if "Someone+Else" in url or "Someone%20Else" in url:
@@ -258,6 +260,8 @@ def test_lastfm_falls_back_to_the_name_musicbrainz_resolved(monkeypatch):
     monkeypatch.setenv("LASTFM_API_KEY", "x")
 
     class FakeClient:
+        last_fetched_utc = "2026-09-03T00:00:00Z"
+
         def get_json(self, url, headers=None):
             if "K-391" in url or "K%2D391" in url:
                 return {"track": {"name": "Play", "artist": {"name": "K-391"},

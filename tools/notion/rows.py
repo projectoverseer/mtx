@@ -440,7 +440,13 @@ def observations_for(doc: dict) -> list[dict]:
     same.  Nor can it be recovered later: these are current-value endpoints
     with no history, so a figure not captured this month is gone.
     """
-    observed = dig(doc, "online.queried_utc")
+    # When the providers were read, falling back to when enrich ran for
+    # analyses written before that was recorded.  Not the same thing: a run
+    # answered entirely from the HTTP cache re-reports numbers that were true
+    # whenever they were fetched, and stamping them with today's date turns a
+    # cached value into a fake fresh reading.
+    observed = (dig(doc, "online.popularity_observed_utc")
+                or dig(doc, "online.queried_utc"))
     if not observed:
         return []
     sha = dig(doc, "file.sha256") or ""

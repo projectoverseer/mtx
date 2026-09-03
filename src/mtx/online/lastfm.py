@@ -110,6 +110,7 @@ def lookup(client: Client, local: dict[str, Any]) -> dict[str, Any]:
         result["matched_by"] = how
         break
     result["attempts"] = tried
+    result["fetched_utc"] = client.last_fetched_utc
     if track:
         result["available"] = True
         result["track"] = {

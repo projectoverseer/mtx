@@ -358,6 +358,14 @@ def enrich(analysis: dict[str, Any], cache_dir: str | None = None,
               (out.get(p) or {} for p in providers)
               if isinstance(r, dict) and isinstance(r.get("match"), dict)]
     out["match_confidence"] = round(sum(scores) / len(scores), 4) if scores else 0.0
+    # When the play counts were actually read, which on a cached run is not
+    # when this run happened.  An observation dated today carrying yesterday's
+    # number is worse than no observation: it looks like a fresh reading, and
+    # a daily pipeline would mint one every morning forever.
+    stamps = [(out.get(p) or {}).get("fetched_utc")
+              for p in ("lastfm", "deezer")]
+    stamps = [s for s in stamps if s]
+    out["popularity_observed_utc"] = min(stamps) if stamps else None
     out["cache"] = dict(client.stats)
     out["elapsed_seconds"] = round(time.time() - t0, 3)
     return out

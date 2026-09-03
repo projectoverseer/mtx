@@ -67,6 +67,8 @@ class Client:
         self.log = log or (lambda _m: None)
         self.offline = offline
         self.refresh = refresh
+        # The `fetched_utc` of the most recent response, cache hit or not.
+        self.last_fetched_utc: str | None = None
         self.timeout = timeout
         self.max_retries = max_retries
         self._last_call: dict[str, float] = {}
@@ -133,6 +135,10 @@ class Client:
             cached = self._read_cache(url)
             if cached is not None:
                 self.stats["hit"] += 1
+                # When the provider actually said this, not when we asked the
+                # cache.  A play count is a reading, and a reading carries the
+                # moment it was taken or it is not a reading.
+                self.last_fetched_utc = cached.get("fetched_utc")
                 return cached.get("body"), cached.get("error")
         if self.offline:
             self.stats["skipped"] += 1
@@ -152,8 +158,9 @@ class Client:
                     raw = resp.read()
                 body = json.loads(raw.decode("utf-8", "replace")) if raw else None
                 self.stats["miss"] += 1
+                self.last_fetched_utc = _utc()
                 self._write_cache(url, {"url": url, "body": body, "error": None,
-                                        "fetched_utc": _utc()})
+                                        "fetched_utc": self.last_fetched_utc})
                 return body, None
             except urllib.error.HTTPError as exc:
                 if exc.code == 404:
