@@ -614,13 +614,27 @@ _group("outcome", [
     P("Recording primary", "checkbox", "outcome.recording_primary"),
 ])
 
+def _metric(doc: dict, key: str, field: str) -> Any:
+    """One field of one cohort metric.
+
+    Not via `dig`: the metric keys are themselves dotted -- `cohort.json` keys
+    them `"headline.lufs_i"` as a single string -- so walking the path splits
+    the key in half and finds nothing.  Reading it that way silently emptied
+    twenty percentile columns while `Typicality`, which has a plain path, kept
+    working and made the table look fine.
+    """
+    metrics = dig(doc, "cohort.metrics", {}) or {}
+    entry = metrics.get(key)
+    return entry.get(field) if isinstance(entry, dict) else None
+
+
 def _pct(key: str):
     """Where this track sits in its cohort, on one metric, as a percentile."""
-    return lambda d: dig(d, f"cohort.metrics.{key}.cohort_percentile")
+    return lambda d: _metric(d, key, "cohort_percentile")
 
 
 def _cohort_median(key: str):
-    return lambda d: dig(d, f"cohort.metrics.{key}.cohort_median")
+    return lambda d: _metric(d, key, "cohort_median")
 
 
 def references(doc: dict) -> Any:

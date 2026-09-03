@@ -84,7 +84,9 @@ python tools/pipeline.py --transcribe       # see "Lyrics" below
 
 ## The gaps
 
-### 1. `mtx cohort` — percentiles. **Closed.**
+### 1. `mtx cohort` — percentiles. **Closed, and it has now run.**
+
+1,321 tracks, 55 artists, **779 cohorts**, in 2m27s.
 
 **What it is.** A corpus-level command that reads every analysis and writes a
 separate `cohort.json` of *relative* positions. It never touches the per-track
@@ -122,7 +124,24 @@ vote, not only the winner. Filed under its winner alone, a club record sits in
 `electronic` (116 tracks) and never in `house` (199) — and `house` is the
 cohort somebody mixing a club record is asking about.
 
-**Cost:** minutes per run, no network, no keys. It is in the pipeline.
+It also got about twenty times faster on the way. `load_analysis` was reading
+every part file — 17 MB a track, 18 GB for the corpus — to find 36 scalars.
+It now takes the sections the caller names and leaves the two big timeline
+arrays on disk, which is the difference between a 45-minute daily step and a
+two-minute one.
+
+Worked example, which is your original question answered from the corpus:
+
+| cohort | n | LUFS-I median | true peak | PSR min | PLR |
+| --- | --- | --- | --- | --- | --- |
+| `house` | 78 | **−8.91** (p10 −11.29, p90 −7.13) | +0.75 dBTP | 6.71 dB | 9.49 dB |
+| `dance-pop` | 113 | −7.91 | +0.95 dBTP | 6.09 dB | 8.88 dB |
+| `electronic` | 172 | −9.05 | +0.39 dBTP | 6.60 dB | 9.71 dB |
+
+Sliced by era as well: `house | 2021-2025` holds 50 records. And every track
+carries its five nearest neighbours as a precomputed A/B list.
+
+**Cost:** ~2.5 minutes per run, no network, no keys. It is in the pipeline.
 
 **You do:** nothing.
 
@@ -184,12 +203,26 @@ this is the single biggest addition available.
   defaulting to `small` — the smallest that reliably hears a sung lyric over a
   mix.
 
-**One thing still blocking it:** the model download from HuggingFace failed
-repeatedly from this machine today — `WinError 10054`, connection reset,
-including through `curl`, while the HuggingFace API itself answered `200`. So
-I could not benchmark it and cannot give you a real per-track number. Expect
-roughly 30–90 s/track on the GPU for `small`, so **12–30 hours** for the
-backfill and ~20 minutes a day afterwards.
+**It works now, and here are the real numbers.** Whisper `small` on your
+GTX 1650: **30 s for a 239 s track**, about 8x realtime. So **≈13 hours** for
+the 1,321-track backfill, resumable at any point, and ~10 minutes a day after
+that. On `Heat Waves` it produced 366 words over 51 lines — 37.3% of them
+repeats, 9.3 syllables a line, rhyme density 1.35 with 20 perfect and 49
+slant, delivery 2.76 syllables/second, first word at 0:03.1.
+
+Two things had to be worked around, both recorded in `.models/README.md`:
+
+- The HuggingFace download from this machine resets constantly — `WinError
+  10054`, through `huggingface_hub` *and* `curl`, while the HF API itself
+  answers `200`. The 483 MB `model.bin` came down first try; the small JSON
+  files each took several attempts. The weights now live in
+  `.models/faster-whisper-small`, pointed at by `MTX_WHISPER_MODEL` in
+  `mtx.env`. If you ever need to re-fetch, try
+  `HF_ENDPOINT=https://hf-mirror.com`.
+- Backfilling via `mtx scan --force` would re-run demucs and cost **240
+  hours**. `tools/transcribe.py` patches the `lyrics` block into an existing
+  `analysis.json` instead, recording the amendment under `run.amendments`, so
+  the job is the 13 hours transcription actually costs.
 
 **There is also a live defect here.** 63 of 80 sampled tracks have a "lyric"
 that is one line of 15–141 characters, labelled `source: "file:tag"`. They are
@@ -200,10 +233,9 @@ song's words with a source attached. `audit.py --deep` now reports them, and
 the Notion schema suppresses them with a shape test, but the fix on disk is
 either a re-scan or a transcript.
 
-**You do:** get the HuggingFace download working (a VPN, or set
-`HF_ENDPOINT=https://hf-mirror.com`), then run
-`python tools/pipeline.py --transcribe --from scan --force` overnight. Or hand
-me a green light and I will retry the download.
+**You do:** nothing to set it up — it is running. Stop it any time with
+Ctrl-C; it is resumable and skips what it has done. To publish the lyric
+columns once it finishes: `python tools/pipeline.py --from identity`.
 
 ---
 
