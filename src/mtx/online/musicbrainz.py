@@ -338,10 +338,14 @@ def lookup(client: Client, local: dict[str, Any]) -> dict[str, Any]:
         agreement = match.artist_score(local["artist"], credited)
         result["artist_agreement"] = round(agreement, 4)
         if agreement < 0.5:
+            # Deliberately not phrased as "the match is wrong".  Across this
+            # corpus most of these are a feature credit the tag omits, or a
+            # tag holding a writer's name -- `Giorgio by Moroder` is tagged
+            # `Thomas Bangalter`.  It says the two sources disagree, which is
+            # a fact, and leaves which one is wrong to whoever looks.
             result["errors"].append(
-                f"credited artist {credited!r} does not match the file's "
-                f"{local['artist']!r}: the matched recording may be a "
-                "different artist's entry under the same ISRC")
+                f"credited artist {credited!r} disagrees with the file's "
+                f"{local['artist']!r}; the match rests on duration and title")
 
     # Which of a recording's releases is *the* release is the single most
     # consequential choice in this module: it decides the release date, the
