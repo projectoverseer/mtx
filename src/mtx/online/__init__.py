@@ -236,6 +236,18 @@ def enrich(analysis: dict[str, Any], cache_dir: str | None = None,
             out["errors"].append(f"{name}: {err}")
         log(f"{name}: {'ok' if res.get('available') else 'no match'}"
             f" ({res.get('requests', 0)} request(s))")
+        if name == "musicbrainz" and res.get("available"):
+            # The providers that run after this one search by name, and the
+            # name in the file's tags is often "A / B (ft. C)" with a typo in
+            # C.  MusicBrainz has already resolved it; handing that on turns a
+            # miss into a hit without a single extra request.
+            rec = res.get("recording") or {}
+            artists = [a.get("name") for a in (res.get("artists") or [])
+                       if isinstance(a, dict) and a.get("name")]
+            if artists:
+                local["resolved_artist"] = artists[0]
+            if rec.get("title"):
+                local["resolved_title"] = rec["title"]
 
     # -- genre vote ----------------------------------------------------------
 
@@ -287,14 +299,23 @@ def enrich(analysis: dict[str, Any], cache_dir: str | None = None,
         "file_tag": local.get("date") or None,
         "musicbrainz_release": (mb.get("release") or {}).get("date"),
         "musicbrainz_first": (mb.get("release_group") or {}).get("first_release_date"),
+        # The earliest release group the recording appears on anywhere, which
+        # is when the *song* came out rather than when this package did.
+        "musicbrainz_song": mb.get("first_release_date"),
         "deezer": dz_track.get("release_date"),
         "itunes": ((out.get("itunes") or {}).get("track") or {}).get("release_date"),
     }
-    known = sorted(d for d in dates.values() if d)
+    known = [d for d in dates.values() if d]
+    earliest = match.earliest_date(known)
     out["cross_checks"]["release_date"] = {
         "sources": dates,
-        "earliest": known[0] if known else None,
-        "agree": len({d[:10] for d in known}) <= 1 if known else None,
+        "earliest": earliest,
+        # `2020` and `2020-06-29` are one claim at two resolutions.  Taking a
+        # plain string minimum kept the vague one and threw the day away, which
+        # is why 365 of 1,321 releases were dated only to the year.
+        "precision": {4: "year", 7: "month"}.get(len(earliest or ""), "day")
+        if earliest else None,
+        "agree": len({str(d)[:4] for d in known}) <= 1 if known else None,
     }
 
     # -- rolled up -----------------------------------------------------------

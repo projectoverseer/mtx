@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from . import match
 from .http import Client, build_url
 
 BASE = "http://ws.audioscrobbler.com/2.0/"
@@ -60,13 +61,55 @@ def lookup(client: Client, local: dict[str, Any]) -> dict[str, Any]:
         result["errors"].append("need both artist and title")
         return result
 
-    url = build_url(BASE, method="track.getInfo", api_key=key, artist=artist,
-                    track=title, autocorrect=1, format="json")
-    body, err = client.get_json(url)
-    result["requests"] += 1
-    if err:
-        result["errors"].append(f"track.getInfo: {err}")
-    track = (body or {}).get("track") or {}
+    # Last.fm indexes one artist per track and no packaging.  A tag reading
+    # "Ariana Grande (ft. Pharell Willians)" -- misspelling and all -- matches
+    # nothing as written, which is why 91 of 1,321 tracks had no play count
+    # while the same query with the lead artist alone returns it immediately.
+    # Multi-artist strings missed at 27.6%, single-artist ones at 1.2%.
+    attempts: list[tuple[str, str, str]] = []
+    if local.get("resolved_artist") and local.get("resolved_title"):
+        # What MusicBrainz called it, first: it is already resolved to one
+        # artist entity, spelt the way a database spells things rather than
+        # the way a shop's tag writer did.
+        attempts.append(("musicbrainz", local["resolved_artist"],
+                         local["resolved_title"]))
+    lead, clean = match.primary_artist(artist), match.search_title(title)
+    if lead and clean:
+        attempts.append(("primary", lead, clean))
+    attempts.append(("tag", artist, title))
+
+    track: dict[str, Any] = {}
+    tried: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for how, use_artist, use_title in attempts:
+        if (use_artist, use_title) in seen:
+            continue                    # the tag was already clean
+        seen.add((use_artist, use_title))
+        url = build_url(BASE, method="track.getInfo", api_key=key,
+                        artist=use_artist, track=use_title, autocorrect=1,
+                        format="json")
+        body, err = client.get_json(url)
+        result["requests"] += 1
+        tried.append(how)
+        if err:
+            result["errors"].append(f"track.getInfo({how}): {err}")
+            continue
+        got = (body or {}).get("track") or {}
+        if not got:
+            continue
+        # Last.fm's autocorrect answers almost any string with *something*.  A
+        # row credited to a different artist is a different record, and it
+        # arrives carrying a play count that looks exactly like a measurement:
+        # `blazed` under a mistyped credit returned a track with 2 plays.
+        credited = (got.get("artist") or {}).get("name") or ""
+        if credited and match.artist_score(use_artist, credited) < 0.5:
+            result["errors"].append(
+                f"track.getInfo({how}): returned {credited!r}, not {use_artist!r}")
+            continue
+        track, artist = got, use_artist
+        result["matched_by"] = how
+        break
+    result["attempts"] = tried
     if track:
         result["available"] = True
         result["track"] = {
@@ -84,9 +127,10 @@ def lookup(client: Client, local: dict[str, Any]) -> dict[str, Any]:
         if wiki:
             result["wiki_summary"] = wiki
     else:
-        result["errors"].append((body or {}).get("message") or "track not found")
+        result["errors"].append(f"track not found after {len(tried)} attempt(s)")
 
-    url = build_url(BASE, method="artist.getInfo", api_key=key, artist=artist,
+    url = build_url(BASE, method="artist.getInfo", api_key=key,
+                    artist=match.primary_artist(artist) or artist,
                     autocorrect=1, format="json")
     body, err = client.get_json(url)
     result["requests"] += 1
