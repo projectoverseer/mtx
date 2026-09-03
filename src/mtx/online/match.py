@@ -80,6 +80,28 @@ def earliest_date(values) -> str | None:
     return min(precise or same_year, key=pad_date)
 
 
+def consensus_date(values) -> tuple[str | None, int, int]:
+    """The date the sources agree on, not the earliest one of them offers.
+
+    Taking the minimum lets a single wrong row rewrite history: five providers
+    put `Efecto` on 2022-05-06 and iTunes returned 2018-12-24, so the corpus
+    dated it 2018.  Sources vote by year, the year with the most votes wins,
+    and ties go to the earlier year -- a reissue should not outvote an
+    original just by being catalogued more often.
+
+    Returns `(date, votes, total)` so a caller can see how thin the agreement
+    was rather than only what it concluded.
+    """
+    dates = [str(v).strip() for v in (values or []) if v]
+    if not dates:
+        return None, 0, 0
+    years: dict[str, list[str]] = {}
+    for d in dates:
+        years.setdefault(pad_date(d)[:4], []).append(d)
+    best = min(years, key=lambda y: (-len(years[y]), y))
+    return earliest_date(years[best]), len(years[best]), len(dates)
+
+
 def fold(text: str) -> str:
     """Lowercase, strip accents and punctuation: a key for loose comparison."""
     if not text:

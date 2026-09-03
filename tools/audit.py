@@ -317,14 +317,19 @@ def check_release(rep: Report, tracks: list[dict[str, Any]]) -> None:
         if mb.get("releases_truncated_at"):
             truncated.hit(t["rel"], total=mb.get("releases_total"))
 
-        earliest = dig(t["online"], "cross_checks.release_date.earliest")
+        checks = dig(t["online"], "cross_checks.release_date", {}) or {}
+        package = checks.get("consensus") or checks.get("earliest")
         tag = dig(t["online"], "query.date")
-        if not earliest:
+        if not package:
             nodate.hit(t["rel"])
         else:
-            a, b = year_of(earliest), year_of(tag)
+            # Against the *package* date, not the song's.  A 2015 soundtrack
+            # legitimately carries a 2003 recording, and flagging that as a
+            # conflict buries the real ones under 90 correct rows.
+            a, b = year_of(package), year_of(tag)
             if a and b and abs(a - b) > DATE_DRIFT_YEARS:
-                drift.hit(t["rel"], resolved=earliest, file_tag=tag)
+                drift.hit(t["rel"], package=package, file_tag=tag,
+                          song=checks.get("song_first_release"))
 
 
 def check_match(rep: Report, tracks: list[dict[str, Any]]) -> None:

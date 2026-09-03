@@ -41,6 +41,7 @@ import json
 import math
 import os
 import re
+from collections.abc import Iterable
 from typing import Any
 
 # Notion refuses an upload over 5 MB.  The default part size sits below that
@@ -357,22 +358,51 @@ def _merge(root: dict[str, Any], path: list[str], sl, value) -> None:
         node[leaf] = value
 
 
-def load_analysis(path: str) -> dict[str, Any]:
+def _wanted(part_path: list[str], want: frozenset[str] | None) -> bool:
+    """Does this part hold anything under one of the requested prefixes?
+
+    A part is merged when its path and a wanted prefix lie on the same branch
+    in either direction: the part `["processing"]` carries `processing.pumping`
+    and is needed for it, while `["processing", "multiband_timeline",
+    "rms_db"]` does not and is not.
+    """
+    if want is None:
+        return True
+    here = ".".join(str(p) for p in (part_path or []))
+    if not here:
+        return True
+    for prefix in want:
+        if here == prefix or here.startswith(prefix + ".") or                 prefix.startswith(here + "."):
+            return True
+    return False
+
+
+def load_analysis(path: str, want: Iterable[str] | None = None) -> dict[str, Any]:
     """Read an analysis back, whether it was written whole or split.
 
     `path` is the index (`analysis.json`); an unsplit file is simply returned.
     A missing part is an error rather than a silently short document.
+
+    `want` names the dotted sections the caller actually reads, and parts on
+    other branches are then skipped.  This is not a micro-optimisation: on this
+    corpus the index is 3 MB and the parts add 14 more, almost all of it two
+    timeline arrays.  `mtx cohort` reads about forty scalars and was parsing
+    18 GB of JSON to find them.  Omit it and everything is loaded, which is
+    what `mtx join` needs and what every existing caller gets.
     """
     with open(path, encoding="utf-8") as f:
         doc = json.load(f)
     split = doc.pop("split", None)
     if not split:
         return doc
+    keep = frozenset(want) if want is not None else None
     base = os.path.dirname(os.path.abspath(path))
     for key in list(doc):
         if isinstance(doc[key], dict) and doc[key].get("mtx_moved"):
             del doc[key]
     for entry in split.get("parts", []):
+        if not _wanted(entry.get("path") or [], keep):
+            continue
         part_path = os.path.join(base, entry["file"])
         if not os.path.isfile(part_path):
             raise FileNotFoundError(

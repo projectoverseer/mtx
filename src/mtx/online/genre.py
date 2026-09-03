@@ -132,7 +132,9 @@ TAG_NOISE = re.compile(
     # Review sites, star ratings, and a listener's own filing system.
     r"charts?\b|\bbest of\b|\bsession\d|\btrack\d|\bvol\.? ?\d|"
     r"\.(de|com|net|org|co\.uk)\b|^ph[ _]|\bstars?\b|^my |^i |"
-    r"\balbums?\b|\bcheck out\b|\bradio\b|^under \d|^top \d|"
+    # `^top \d` missed "eurohit top 40": a chart is a chart wherever the words
+    # naming it happen to sit in the string.
+    r"\balbums?\b|\bcheck out\b|\bradio\b|^under \d|\btop \d|\bhit(s)? \d|"
     # Nothing but punctuation: "<3" and friends.
     r"^[^\w\s]+$",
     re.IGNORECASE)

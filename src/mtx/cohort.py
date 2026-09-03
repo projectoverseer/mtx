@@ -59,7 +59,9 @@ METRICS: tuple[tuple[str, str], ...] = (
     ("headline.section_count", "Section count"),
     ("stereo.mono_sum_damage.broadband_loss_db", "Mono-sum loss (dB)"),
     ("dynamics.flat_top.total_flat_samples", "Flat-top samples"),
-    ("processing.pumping.depth_db", "Pumping depth (dB)"),
+    # `processing.pumping` is what params calls it and not what the analysis
+    # writes; the metric read nothing on every track in the corpus.
+    ("processing.bus_compression.dip_depth_db", "Bus-compression dip (dB)"),
     ("harmony.harmonic_rhythm.changes_per_bar", "Chord changes per bar"),
     ("harmony.vocabulary.distinct_chords", "Distinct chords"),
     ("harmony.degrees.diatonic_time_pct", "Diatonic time (%)"),
@@ -100,6 +102,16 @@ def _sidecar(folder: str, name: str) -> dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+# The branches of a split analysis this command actually reads.  Everything
+# else stays on disk: the two timeline arrays it skips are 14 of the 17 MB a
+# track occupies, and reading them to find forty scalars turned a corpus pass
+# into an 18 GB one.  Derived from METRICS rather than typed out, so a metric
+# added above cannot silently start reading nothing.
+WANTED_SECTIONS: frozenset[str] = frozenset(
+    [key.rsplit(".", 1)[0] for key, _label in METRICS]
+    + ["file", "tags", "embedding", "structure", "run"])
 
 
 def _year(value: Any) -> int | None:
@@ -154,10 +166,17 @@ def labels_for(res: dict[str, Any], folder: str,
         checks = o.get("cross_checks") if isinstance(o.get("cross_checks"), dict) else {}
         rel = mb.get("release") if isinstance(mb.get("release"), dict) else {}
         group = mb.get("release_group") if isinstance(mb.get("release_group"), dict) else {}
-        year = _year((checks.get("release_date") or {}).get("earliest")
+        # Ordered by which question a cohort asks.  An era cohort is about the
+        # song, so its own first release leads; the package's date is the
+        # fallback, and the earliest any single source offers comes last
+        # because one wrong provider can drag it decades.
+        checked = checks.get("release_date") or {}
+        year = _year(checked.get("song_first_release")
                      or mb.get("first_release_date")
+                     or checked.get("consensus")
                      or group.get("first_release_date")
-                     or rel.get("date"))
+                     or rel.get("date")
+                     or checked.get("earliest"))
         if year is not None:
             year_source = "online"
     if year is None:
@@ -313,7 +332,7 @@ def build(root: str, neighbours: int = 5, log=None) -> dict[str, Any]:
     embeddings: list[np.ndarray | None] = []
     for p in paths:
         try:
-            res = load_analysis(p)
+            res = load_analysis(p, want=WANTED_SECTIONS)
         except (OSError, ValueError) as exc:
             if log:
                 log(f"  skipped {p}: {exc}")

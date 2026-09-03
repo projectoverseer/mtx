@@ -281,7 +281,8 @@ def release_precision(doc: dict) -> Any:
     recorded = dig(doc, "online.cross_checks.release_date.precision")
     if recorded:
         return str(recorded)
-    raw = str(dig(doc, "online.cross_checks.release_date.earliest") or "").strip()
+    raw = str(dig(doc, "online.cross_checks.release_date.consensus")
+              or dig(doc, "online.cross_checks.release_date.earliest") or "").strip()
     if not raw:
         return None
     return {4: "year", 7: "month"}.get(len(raw), "day")
@@ -368,13 +369,26 @@ _group("identity", [
     P("Artists all", "multi_select", all_artists),
     P("Artist MBIDs", "multi_select", all_artist_mbids),
     P("Album", "rich_text", "tags.named.album"),
-    P("Release date", "date", "online.cross_checks.release_date.earliest"),
+    # When this *release* came out, by majority of the sources.  Not the
+    # earliest any of them offers: one provider returning a wrong year used to
+    # redate the record on its own -- `Efecto` was dated 2018 because iTunes
+    # said so and the other five said 2022.
+    P("Release date", "date", "online.cross_checks.release_date.consensus"),
+    # When the *song* first appeared anywhere, which is a different question:
+    # a 2015 documentary soundtrack carries recordings from 2003, and the era
+    # a record belongs to is the song's, not the package's.
+    P("Song first released", "date",
+      "online.cross_checks.release_date.song_first_release"),
+    P("Date sources agreeing", "number",
+      "online.cross_checks.release_date.consensus_votes"),
     # 365 of 1,321 releases are known only to the year, and a Notion date has
     # to be a real day -- so those are stored as 1 January and would otherwise
     # be indistinguishable from a record that actually came out on 1 January.
     P("Release date precision", "select", release_precision),
-    P("Year", "number", lambda d: _year(dig(d, "online.cross_checks.release_date.earliest")
-                                        or dig(d, "tags.named.date"))),
+    P("Year", "number",
+      lambda d: _year(dig(d, "online.cross_checks.release_date.song_first_release")
+                      or dig(d, "online.cross_checks.release_date.consensus")
+                      or dig(d, "tags.named.date"))),
     P("ISRC", "rich_text", "online.identity.isrc"),
     P("Recording MBID", "rich_text", "online.identity.recording_mbid"),
     P("Label", "rich_text", "online.identity.label"),
@@ -620,8 +634,12 @@ def references(doc: dict) -> Any:
     rows = got.get("list") or []
     if not rows:
         return None
-    named = [f"{r.get('artist')} - {r.get('title')}" for r in rows[:6]
-             if r.get("title")]
+    # `mtx cohort` groups on the library folder deliberately -- it must not
+    # depend on a file `tools/` writes -- so the names it hands back are folder
+    # names.  Resolve them here, or the reference list reads "TIESTO".
+    names = dig(doc, "mtx.artist_names", {}) or {}
+    named = [f"{names.get(r.get('artist'), r.get('artist'))} - {r.get('title')}"
+             for r in rows[:6] if r.get("title")]
     return "; ".join(named) or None
 
 

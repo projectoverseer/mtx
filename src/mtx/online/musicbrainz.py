@@ -157,11 +157,16 @@ def _song_first_release(releases: list[dict[str, Any]]) -> str | None:
     A 2011 remaster of a 1979 record is correctly dated 2011 as a *release*
     and belongs in the 1979 cohort as a *song*.
     """
+    # Compilations are excluded, not deprioritised.  A compilation's own
+    # first-release-date is when that *series* started, which has nothing to do
+    # with this song: `Skyfall` appears on `Best of Bond… James Bond`, a
+    # release group first issued in 1992, and was dated twenty years early.
     dates = [str(rg.get("first-release-date"))
              for rel in releases
              if (rel.get("status") or "Official") != "Bootleg"
              for rg in [rel.get("release-group") or {}]
-             if rg.get("first-release-date")]
+             if rg.get("first-release-date")
+             and not (REPACKAGE & set(rg.get("secondary-types") or []))]
     if not dates:
         return None
     return match.earliest_date(dates)

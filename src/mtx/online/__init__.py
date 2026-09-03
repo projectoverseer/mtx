@@ -307,14 +307,26 @@ def enrich(analysis: dict[str, Any], cache_dir: str | None = None,
     }
     known = [d for d in dates.values() if d]
     earliest = match.earliest_date(known)
+    agreed, votes, total = match.consensus_date(known)
     out["cross_checks"]["release_date"] = {
         "sources": dates,
+        # When this release came out, by majority.  One provider returning a
+        # wrong year must not be able to redate the record on its own.
+        "consensus": agreed,
+        "consensus_votes": votes,
+        "sources_with_a_date": total,
+        # The earliest any source offers, kept because a reissue and an
+        # original genuinely differ and the gap is the finding.
         "earliest": earliest,
+        # When the *song* first appeared anywhere, which is a different
+        # question from when this package did: a 2015 documentary soundtrack
+        # carries recordings from 2003.
+        "song_first_release": mb.get("first_release_date"),
         # `2020` and `2020-06-29` are one claim at two resolutions.  Taking a
         # plain string minimum kept the vague one and threw the day away, which
         # is why 365 of 1,321 releases were dated only to the year.
-        "precision": {4: "year", 7: "month"}.get(len(earliest or ""), "day")
-        if earliest else None,
+        "precision": {4: "year", 7: "month"}.get(len(agreed or ""), "day")
+        if agreed else None,
         "agree": len({str(d)[:4] for d in known}) <= 1 if known else None,
     }
 

@@ -108,7 +108,12 @@ def load_folder(folder: str, outcomes: dict | None = None,
     doc["mtx"] = {"analysis_path": os.path.abspath(folder),
                   "folder": os.path.basename(folder),
                   "catalogue_artist": catalogue,
-                  "artist": (identities or {}).get(catalogue) or {}}
+                  "artist": (identities or {}).get(catalogue) or {},
+                  # The whole map, because the A/B reference list names *other*
+                  # tracks by their library folder, and "TIESTO - All Nighter"
+                  # is the folder talking rather than the artist.
+                  "artist_names": {k: (v or {}).get("notion_name") or k
+                                   for k, v in (identities or {}).items()}}
     sha = dig(doc, "file.sha256")
     doc["outcome"] = (outcomes or {}).get(sha) or {}
     # Mounted, not merged, for the same reason `online` is: a percentile is a
