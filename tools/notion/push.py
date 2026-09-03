@@ -296,7 +296,15 @@ def main() -> int:
     args = ap.parse_args()
 
     if not args.dry_run and not args.parent:
-        ap.error("--parent is required unless --dry-run")
+        # Only needed to *create* the databases.  Once the state file knows
+        # their ids the parent page is irrelevant, and demanding it turned
+        # every routine re-push -- including the pipeline's -- into a usage
+        # error, after the audit had already passed.
+        known = State(args.state or os.path.join(args.root,
+                                                 ".notion_state.json"))
+        if not (known.data.get("databases") or {}).get("tracks"):
+            ap.error("--parent is required the first time, to say which page "
+                     "the databases should be created under")
 
     folders = _enrich_targets(args.root)
     if not folders:
