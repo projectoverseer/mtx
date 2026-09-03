@@ -57,7 +57,37 @@ def folders(root: str) -> list[str]:
 
 
 def already_done(doc: dict) -> bool:
-    return (doc.get("lyrics") or {}).get("source") == "transcript"
+    lyrics = doc.get("lyrics") or {}
+    if lyrics.get("source") == "transcript":
+        return True
+    # A transcript that heard nothing is still an answer about this track, and
+    # re-running it every night would cost thirty seconds each time to learn
+    # the same thing.
+    return bool((lyrics.get("transcript") or {}).get("rejected_as_lyric"))
+
+
+# How far below the mix a separated vocal has to sit before the track counts
+# as instrumental.  Sung tracks in this corpus cluster around -5 LU; the one
+# score cue in a 70-track sample was -33.5.
+INSTRUMENTAL_LU = -25.0
+
+
+def vocal_level(folder: str) -> float | None:
+    """How loud the separated vocal is against the mix, in LU.
+
+    Whisper hallucinates on music with no voice in it -- confidently, in
+    fluent sentences -- and the result would land in the corpus as a lyric
+    with a source attached.  The separation already measured whether there is
+    a voice here, so ask it before spending thirty seconds inventing one.
+    """
+    from mtx.split import load_analysis                # noqa: PLC0415
+    try:
+        doc = load_analysis(os.path.join(folder, "analysis.json"))
+    except (OSError, ValueError):
+        return None
+    vocals = ((doc.get("stems") or {}).get("stems") or {}).get("vocals") or {}
+    level = (vocals.get("level_vs_mix") or {}).get("lufs_delta")
+    return float(level) if isinstance(level, (int, float)) else None
 
 
 def source_path(doc: dict) -> str | None:
@@ -79,6 +109,10 @@ def transcribe_one(folder: str, force: bool) -> tuple[str, str]:
     audio = source_path(doc)
     if not audio:
         return "skip", "source audio is not where the analysis says it is"
+    level = vocal_level(folder)
+    if level is not None and level < INSTRUMENTAL_LU:
+        return "skip", (f"instrumental: the vocal stem is {level:.1f} LU below "
+                        f"the mix, and a transcript here would be invention")
 
     collector = Collector()
     got = m_lyrics.analyse(
@@ -125,6 +159,11 @@ def transcribe_one(folder: str, force: bool) -> tuple[str, str]:
             os.remove(tmp)
         return "error", f"could not write: {exc}"
 
+    if transcript.get("rejected_as_lyric"):
+        # Written all the same: the empty transcript is the finding, and
+        # recording it stops the next run spending thirty seconds re-learning
+        # that this track has no words in it.
+        return "thin", transcript["rejected_as_lyric"]
     words = (got.get("statistics") or {}).get("words") or 0
     lines = (got.get("statistics") or {}).get("lines") or 0
     return "ok", f"{words} words over {lines} line(s), from the {transcript.get('input')}"
@@ -152,7 +191,7 @@ def main() -> int:
 
     # Serial on purpose.  One GPU holds one model, and a second worker would
     # queue behind it while doubling the VRAM.
-    counts = {"ok": 0, "skip": 0, "fail": 0, "error": 0}
+    counts = {"ok": 0, "thin": 0, "skip": 0, "fail": 0, "error": 0}
     started = time.time()
     for i, folder in enumerate(todo, 1):
         if args.limit and counts["ok"] >= args.limit:
@@ -167,9 +206,9 @@ def main() -> int:
             left = (len(todo) - i) / max(rate, 1e-9) / 60.0
             log(f"  {counts['ok']} done, {rate * 60:.1f}/min, "
                 f"~{left:.0f} min left")
-    log(f"done: {counts['ok']} transcribed, {counts['skip']} skipped, "
-        f"{counts['fail']} no transcript, {counts['error']} error(s), "
-        f"in {(time.time() - started) / 60:.1f} min")
+    log(f"done: {counts['ok']} transcribed, {counts['thin']} with no words "
+        f"heard, {counts['skip']} skipped, {counts['fail']} no transcript, "
+        f"{counts['error']} error(s), in {(time.time() - started) / 60:.1f} min")
     return 1 if counts["error"] and not counts["ok"] else 0
 
 

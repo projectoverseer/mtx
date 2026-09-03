@@ -555,7 +555,20 @@ def analyse(tags: dict[str, Any], declared: dict[str, Any] | None,
                     "vocal: an inference on top of an inference, and it "
                     "mishears more than a stem transcript does")
         if text is None and transcript.get("available"):
-            text, source = transcript.get("text"), "transcript"
+            heard = len(WORD.findall(transcript.get("text") or ""))
+            floor = int(PARAMS["lyrics"]["transcript"].get("min_words") or 0)
+            if heard >= floor:
+                text, source = transcript.get("text"), "transcript"
+            else:
+                # A transcript is an inference, and an inference of four words
+                # over a four-minute record is not a short lyric -- it is an
+                # instrumental, or a vocal the separation could not hear.  Kept
+                # in `transcript` as the evidence it is, and refused as a
+                # lyric, because a `lyrics.available: true` carrying one word
+                # would poison every average it lands in.
+                transcript["rejected_as_lyric"] = (
+                    f"{heard} word(s) heard, below the {floor} a transcript "
+                    "needs before it is treated as this record's lyric")
 
     out: dict[str, Any] = {
         "source": source,

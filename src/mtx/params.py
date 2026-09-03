@@ -424,6 +424,10 @@ PARAMS: dict[str, Any] = {
             # transcript down to five.  It helps on an isolated vocal stem and
             # destroys a mix transcript, so it is off.
             "vad": False,
+            # Below this a transcript is not a short lyric, it is an
+            # instrumental or a vocal the model could not hear.  Kept as
+            # evidence, refused as the record's lyric.
+            "min_words": 20,
             "note": "optional; a transcript is an inference and is never merged "
                     "into a declared or tagged lyric",
         },
