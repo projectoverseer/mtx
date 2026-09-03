@@ -80,6 +80,31 @@ python tools/pipeline.py --dry-run          # print the commands
 python tools/pipeline.py --transcribe       # see "Lyrics" below
 ```
 
+### Watching one while it runs
+
+The long stages print one line per track, which is a fine record and a poor
+progress report: nothing in the scroll says how far along it is, how fast it
+is going, or -- the one that actually matters overnight -- whether it is still
+moving at all. A stalled job and a slow job look identical in a `tail`.
+
+```powershell
+.\tools\watch.ps1                 # live, refreshes every 10s
+.\tools\watch.ps1 -Once           # one snapshot, then exit
+.\tools\watch.ps1 -Failures       # what did not work, instead of what just did
+.\tools\watch.ps1 -Log $env:TEMP\scan.log -Interval 30
+```
+
+It reads the log and nothing else, so Ctrl-C stops the watching and never the
+job, and running six of them costs nothing. `-Once` exits 0 when it found a
+job to report on and 1 when there was no log, so it works in a script as well
+as on screen.
+
+Redirect a long run's output somewhere it can find:
+
+```powershell
+python tools/transcribe.py "E:/Music/_mtx_out" 2>&1 | Tee-Object $env:TEMP\transcribe.log
+```
+
 ---
 
 ## The gaps

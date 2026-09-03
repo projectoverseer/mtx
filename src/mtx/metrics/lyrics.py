@@ -26,6 +26,7 @@ first and declines rather than producing a meaningless number.
 
 from __future__ import annotations
 
+import gc
 import os
 import re
 import unicodedata
@@ -413,47 +414,65 @@ def transcribe(vocal_path: str, collector: Collector) -> dict[str, Any]:
     # connection that resets -- as this one does -- a local directory is the
     # difference between a corpus that can be transcribed and one that cannot.
     name = str(os.environ.get("MTX_WHISPER_MODEL") or P.get("model") or "base")
-    for device, compute in _whisper_devices(P):
+    # Load *and* decode inside one attempt per device.  A card loads the model
+    # happily and then runs out of memory part way through a long track -- 16
+    # of the first 486 tracks on a 4 GB card -- so a fallback that only covers
+    # construction abandons exactly those tracks, while the slow path that
+    # would have transcribed them sits unused.
+    failures: list[str] = []
+    plan = _whisper_devices(P)
+    for device, compute in plan:
+        model = None
         try:
             model = WhisperModel(name, device=device, compute_type=compute)
+            return _decode(model, vocal_path, name, device, compute, P)
         except Exception as exc:
+            failures.append(f"{device}: {exc!r}")
             collector.warn("lyrics.transcript",
                            f"faster_whisper on {device}: {exc!r}")
-            continue
-        break
-    else:
-        return {"available": False,
-                "reason": "faster_whisper would not load on any device"}
-    try:
-        segments, info = model.transcribe(
-            vocal_path, word_timestamps=True,
-            vad_filter=bool(P.get("vad", False)),
-            condition_on_previous_text=False)
-        words, chunks = [], []
-        for seg in segments:
-            chunks.append(seg.text)
-            for w in (seg.words or []):
-                words.append({"word": w.word, "start_s": float(w.start),
-                              "end_s": float(w.end)})
-        # One segment is one sung phrase, and a sung phrase is a lyric line.
-        # Joined without the break the whole song is a single line, and every
-        # line-based measurement -- rhyme scheme, repeated-line share,
-        # syllables per line, readability -- quietly becomes meaningless while
-        # still reporting a number.
-        text = "\n".join(c.strip() for c in chunks if c.strip())
-        return {"available": True, "backend": "faster_whisper", "model": name,
-                "device": device, "compute_type": compute,
-                "text": text, "language": info.language,
-                "lines": len(chunks),
-                "line_note": "one line per transcribed segment, which is one "
-                             "sung phrase; a transcript carries no line breaks "
-                             "of its own",
-                "words": words, "source": "transcript",
-                "caveat": "a transcription of a separated vocal stem: an "
-                          "inference, which mishears, and never a lyric sheet"}
-    except Exception as exc:
-        collector.warn("lyrics.transcript", f"faster_whisper failed: {exc!r}")
-        return {"available": False, "reason": repr(exc)}
+        finally:
+            # The failed model is still holding the memory that the next
+            # attempt is falling back *because of*.  Dropping it here is what
+            # makes the retry worth making.
+            if model is not None:
+                del model
+                gc.collect()
+    return {"available": False,
+            "reason": "; ".join(failures) or "no device would run the model",
+            "attempted": [d for d, _c in plan]}
+
+
+def _decode(model: Any, vocal_path: str, name: str, device: str, compute: str,
+            P: dict[str, Any]) -> dict[str, Any]:
+    """Run one loaded model over one file.  Raises, so the caller can retry."""
+    # `transcribe` hands back a lazy generator: the decoding, and any failure
+    # it runs into, happens as this loop pulls from it -- not on the call.
+    segments, info = model.transcribe(
+        vocal_path, word_timestamps=True,
+        vad_filter=bool(P.get("vad", False)),
+        condition_on_previous_text=False)
+    words, chunks = [], []
+    for seg in segments:
+        chunks.append(seg.text)
+        for w in (seg.words or []):
+            words.append({"word": w.word, "start_s": float(w.start),
+                          "end_s": float(w.end)})
+    # One segment is one sung phrase, and a sung phrase is a lyric line.
+    # Joined without the break the whole song is a single line, and every
+    # line-based measurement -- rhyme scheme, repeated-line share,
+    # syllables per line, readability -- quietly becomes meaningless while
+    # still reporting a number.
+    text = "\n".join(c.strip() for c in chunks if c.strip())
+    return {"available": True, "backend": "faster_whisper", "model": name,
+            "device": device, "compute_type": compute,
+            "text": text, "language": info.language,
+            "lines": len(chunks),
+            "line_note": "one line per transcribed segment, which is one "
+                         "sung phrase; a transcript carries no line breaks "
+                         "of its own",
+            "words": words, "source": "transcript",
+            "caveat": "a transcription of a separated vocal stem: an "
+                      "inference, which mishears, and never a lyric sheet"}
 
 
 def _alignment(transcript: dict[str, Any], tempo: dict[str, Any] | None,

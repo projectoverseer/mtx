@@ -1,0 +1,135 @@
+"""The transcription backend's fallback, which used to cover half a failure.
+
+A GPU does not fail transcription at load time.  It loads the model, reports
+itself healthy, and then runs out of memory part way through decoding a long
+track -- because `WhisperModel.transcribe` returns a lazy generator and the
+work happens as the caller iterates it, well after any constructor has
+returned.
+
+The original fallback wrapped only the constructor, so a card that loaded the
+model and then died had no second attempt: those tracks came back
+`available: False` with a CPU sitting idle that would have transcribed them in
+four minutes.  It cost 16 of the first 486 tracks of a corpus run -- 3.3%,
+concentrated on the long ones, which is to say the album tracks rather than
+the singles.
+
+These tests use a stub backend rather than a real model: the behaviour under
+test is which device gets tried after which failure, and that needs no GPU,
+no weights, and no audio.
+"""
+
+from __future__ import annotations
+
+import sys
+import types
+
+import pytest
+
+from mtx.metrics import lyrics as m_lyrics
+from mtx.util import Collector
+
+
+class _Segment:
+    def __init__(self, text, words):
+        self.text = text
+        self.words = words
+
+
+class _Word:
+    def __init__(self, word, start, end):
+        self.word, self.start, self.end = word, start, end
+
+
+class _Info:
+    language = "en"
+
+
+class _StubModel:
+    """A whisper model that fails where it is told to."""
+
+    made: list[str] = []
+
+    def __init__(self, name, device, compute_type):
+        self.device, self.compute = device, compute_type
+        type(self).made.append(device)
+        if device in self.fail_on_load:
+            raise RuntimeError(f"{device} would not load")
+
+    def transcribe(self, path, **kw):
+        if self.device in self.fail_on_decode:
+            # Lazily, exactly like the real one: the generator is what raises.
+            def boom():
+                yield _Segment("first line", [_Word("first", 0.0, 0.4)])
+                raise RuntimeError("CUDA failed with error out of memory")
+            return boom(), _Info()
+        return iter([
+            _Segment(" one two ", [_Word("one", 0.0, 0.4), _Word("two", 0.4, 0.8)]),
+            _Segment(" three ", [_Word("three", 0.9, 1.2)]),
+        ]), _Info()
+
+
+@pytest.fixture
+def stub(monkeypatch):
+    """Install a fake `faster_whisper`, and no `whisper_timestamped`."""
+    _StubModel.made = []
+    _StubModel.fail_on_load = frozenset()
+    _StubModel.fail_on_decode = frozenset()
+    module = types.ModuleType("faster_whisper")
+    module.WhisperModel = _StubModel
+    monkeypatch.setitem(sys.modules, "faster_whisper", module)
+    monkeypatch.setitem(sys.modules, "whisper_timestamped", None)
+    monkeypatch.setattr(m_lyrics, "_whisper_devices",
+                        lambda _p: [("cuda", "float16"), ("cpu", "int8")])
+    return _StubModel
+
+
+def test_a_decode_failure_falls_back_to_the_next_device(stub):
+    """The bug: the GPU loaded, then died mid-track, and that was the end."""
+    stub.fail_on_decode = frozenset({"cuda"})
+    got = m_lyrics.transcribe("nowhere.wav", Collector())
+
+    assert got["available"] is True, "a working CPU should have caught this"
+    assert got["device"] == "cpu"
+    assert stub.made == ["cuda", "cpu"], "both devices should have been tried"
+    assert got["text"] == "one two\nthree"
+
+
+def test_a_load_failure_still_falls_back(stub):
+    """The case the old code did handle, which must keep working."""
+    stub.fail_on_load = frozenset({"cuda"})
+    got = m_lyrics.transcribe("nowhere.wav", Collector())
+
+    assert got["available"] is True
+    assert got["device"] == "cpu"
+    assert stub.made == ["cuda", "cpu"]
+
+
+def test_the_first_device_is_used_when_it_works(stub):
+    """No fallback when there is nothing to fall back from."""
+    got = m_lyrics.transcribe("nowhere.wav", Collector())
+
+    assert got["device"] == "cuda"
+    assert stub.made == ["cuda"], "the CPU should not have been touched"
+
+
+def test_failing_everywhere_reports_every_reason(stub):
+    """A transcript that cannot be made says why, per device, not just 'no'."""
+    stub.fail_on_decode = frozenset({"cuda", "cpu"})
+    collector = Collector()
+    got = m_lyrics.transcribe("nowhere.wav", collector)
+
+    assert got["available"] is False
+    assert got["attempted"] == ["cuda", "cpu"]
+    assert "cuda:" in got["reason"] and "cpu:" in got["reason"]
+    assert "out of memory" in got["reason"]
+    # Every attempt is a warning on the record, not only the last one.
+    assert len([w for w in collector.warnings
+                if "faster_whisper" in str(w)]) == 2
+
+
+def test_segments_stay_one_line_each(stub):
+    """Line-based lyric measurement depends on this and reads as fine without it."""
+    got = m_lyrics.transcribe("nowhere.wav", Collector())
+
+    assert got["text"].splitlines() == ["one two", "three"]
+    assert got["lines"] == 2
