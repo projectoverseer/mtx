@@ -465,6 +465,13 @@ PARAMS: dict[str, Any] = {
         "min_cohort_size": 12,
         "min_corpus_for_statistics": 200,
         "max_single_artist_share": 0.15,
+        # A record belongs to every genre that got a real vote, not only to the
+        # one that won.  Filed under its winner alone, a club record sits in
+        # `electronic` (116 tracks) and never in `house` (199), which is the
+        # cohort someone mixing a club record actually wants.  The floor keeps
+        # a single stray tag from inventing membership.
+        "secondary_genre_confidence": 0.34,
+        "max_genres_per_track": 6,
         "percentile_rule": "share of the cohort strictly below the value, plus "
                            "half the ties",
         "label_priority": ["declared", "online", "file:tag"],

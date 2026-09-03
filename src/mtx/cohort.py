@@ -113,7 +113,8 @@ def _year(value: Any) -> int | None:
     return None
 
 
-def labels_for(res: dict[str, Any], folder: str) -> dict[str, Any]:
+def labels_for(res: dict[str, Any], folder: str,
+               catalogue: str | None = None) -> dict[str, Any]:
     """Genre and year for one track, with where each came from.
 
     Declared beats online beats the file tag, and the origin travels with the
@@ -130,9 +131,13 @@ def labels_for(res: dict[str, Any], folder: str) -> dict[str, Any]:
     if d_cohort.get("genre") or declared.get("genre"):
         genre, source = (d_cohort.get("genre") or declared.get("genre")), "declared"
     elif isinstance(o, dict):
-        voted = (o.get("genre") or {}) if isinstance(o.get("genre"), dict) else {}
-        if voted.get("umbrella") or voted.get("genre"):
-            genre, source = (voted.get("umbrella") or voted.get("genre")), "online"
+        # `online.json` writes the vote under `genres`, plural.  Reading
+        # `genre` found nothing on every enriched track in the corpus, so
+        # every cohort silently fell through to the shop's own genre tag --
+        # which is the string the vote exists to replace.
+        voted = o.get("genres") if isinstance(o.get("genres"), dict) else {}
+        if voted.get("umbrella") or voted.get("primary"):
+            genre, source = (voted.get("umbrella") or voted.get("primary")), "online"
     if genre is None and tags.get("genre"):
         genre, source = tags["genre"], "file:tag"
 
@@ -141,8 +146,18 @@ def labels_for(res: dict[str, Any], folder: str) -> dict[str, Any]:
         year = _year(d_cohort.get("year") or declared.get("release_year"))
         year_source = "declared"
     if year is None and isinstance(o, dict):
-        rel = (o.get("release") or {}) if isinstance(o.get("release"), dict) else {}
-        year = _year(rel.get("date") or rel.get("first_release_date"))
+        # Same defect as the genre: `release` is nested under the provider that
+        # said it, and the resolved answer is the cross-check.  Ordered from
+        # "when the song came out" to "when this pressing came out", because an
+        # era cohort is about the song.
+        mb = o.get("musicbrainz") if isinstance(o.get("musicbrainz"), dict) else {}
+        checks = o.get("cross_checks") if isinstance(o.get("cross_checks"), dict) else {}
+        rel = mb.get("release") if isinstance(mb.get("release"), dict) else {}
+        group = mb.get("release_group") if isinstance(mb.get("release_group"), dict) else {}
+        year = _year((checks.get("release_date") or {}).get("earliest")
+                     or mb.get("first_release_date")
+                     or group.get("first_release_date")
+                     or rel.get("date"))
         if year is not None:
             year_source = "online"
     if year is None:
@@ -150,12 +165,48 @@ def labels_for(res: dict[str, Any], folder: str) -> dict[str, Any]:
         if year is not None:
             year_source = "file:tag"
 
-    artist = (declared.get("artist") or tags.get("artist")
+    # The library folder, when the caller knows it.  The hygiene report counts
+    # distinct artists, and on the tag "Tyler, The Creator" and "Tyler, The
+    # Creator / Daniel Caesar" count as two -- which understates dominance,
+    # the one thing the report exists to state.
+    artist = (declared.get("artist") or catalogue or tags.get("artist")
               or tags.get("albumartist") or "(unknown artist)")
     title = declared.get("title") or tags.get("title") or os.path.basename(folder)
     return {"artist": str(artist), "title": str(title),
             "genre": (str(genre).strip().lower() if genre else None),
-            "genre_source": source, "year": year, "year_source": year_source}
+            "genre_source": source, "year": year, "year_source": year_source,
+            "genres": _voted_genres(o, genre, d_cohort, declared)}
+
+
+def _voted_genres(online: Any, primary: Any, d_cohort: dict,
+                  declared: dict) -> list[str]:
+    """Every genre this record credibly belongs to, not only the winner.
+
+    The vote already ranks them with a confidence, and a record is genuinely
+    several things at once: filed under its winner alone a club track lands in
+    `electronic` and never in `house`, and `house` is the cohort somebody
+    mixing a club track is asking about.
+    """
+    P = PARAMS["cohort"]
+    out: list[str] = []
+    for value in (primary, d_cohort.get("genre"), declared.get("genre")):
+        if value and str(value).strip().lower() not in out:
+            out.append(str(value).strip().lower())
+    for extra in (d_cohort.get("genres") or declared.get("genres") or []):
+        if str(extra).strip().lower() not in out:
+            out.append(str(extra).strip().lower())
+    if isinstance(online, dict):
+        voted = online.get("genres") if isinstance(online.get("genres"), dict) else {}
+        for entry in (voted.get("ranked") or []):
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "").strip().lower()
+            confidence = entry.get("confidence")
+            if (name and name not in out
+                    and isinstance(confidence, (int, float))
+                    and confidence >= float(P["secondary_genre_confidence"])):
+                out.append(name)
+    return out[:int(P["max_genres_per_track"])]
 
 
 def _percentile_of(value: float, pool: list[float]) -> float | None:
@@ -268,7 +319,9 @@ def build(root: str, neighbours: int = 5, log=None) -> dict[str, Any]:
                 log(f"  skipped {p}: {exc}")
             continue
         folder = os.path.dirname(os.path.abspath(p))
-        lab = labels_for(res, folder)
+        rel_parts = os.path.relpath(folder, os.path.abspath(root)).split(os.sep)
+        catalogue = rel_parts[0] if rel_parts[0] not in (".", "..") else None
+        lab = labels_for(res, folder, catalogue)
         lab["folder"] = os.path.basename(folder)
         lab["analysis_path"] = os.path.abspath(p)
         lab["sha256"] = (res.get("file") or {}).get("sha256")
@@ -286,13 +339,16 @@ def build(root: str, neighbours: int = 5, log=None) -> dict[str, Any]:
     win = int(P["year_window"])
     cohorts: dict[str, list[int]] = {"all": list(range(len(rows)))}
     for i, r in enumerate(rows):
-        keys = []
-        if r["genre"]:
-            keys.append(f"genre={r['genre']}")
-        if r["year"] is not None:
-            keys.append(f"year={r['year'] - win}-{r['year'] + win}")
-        if r["genre"] and r["year"] is not None:
-            keys.append(f"genre={r['genre']}|year={r['year'] - win}-{r['year'] + win}")
+        window = (f"year={r['year'] - win}-{r['year'] + win}"
+                  if r["year"] is not None else None)
+        names = r.get("genres") or ([r["genre"]] if r["genre"] else [])
+        # Most specific first, and within a tier the record's own strongest
+        # genre first, so the ladder below falls back in a defensible order
+        # rather than in whatever order the keys happened to be appended.
+        keys = [f"genre={n}|{window}" for n in names if window]
+        keys += [f"genre={n}" for n in names]
+        if window:
+            keys.append(window)
         r["cohort_keys"] = keys
     # Year cohorts are windows, so membership is by overlap, not by equality.
     for i, r in enumerate(rows):
@@ -315,7 +371,11 @@ def build(root: str, neighbours: int = 5, log=None) -> dict[str, Any]:
             for j, other in enumerate(rows):
                 if other["year"] is None or not (int(lo) <= other["year"] <= int(hi)):
                     continue
-                if genre is not None and other["genre"] != genre:
+                # Membership is "voted for this genre", not "won it": the same
+                # rule the un-windowed keys use, or a track would appear in
+                # `genre=house` and vanish from `genre=house|year=2022-2026`.
+                if genre is not None and genre not in (
+                        other.get("genres") or [other.get("genre")]):
                     continue
                 if j not in members:
                     members.append(j)
@@ -330,7 +390,7 @@ def build(root: str, neighbours: int = 5, log=None) -> dict[str, Any]:
         # otherwise have every percentile and every z-score come back null,
         # which is the one case where the answer matters most: a new mix is
         # exactly the track nothing else in the folder shares a label with.
-        ladder = list(reversed(r["cohort_keys"])) + ["all"]
+        ladder = list(r["cohort_keys"]) + ["all"]
         primary = "all"
         for cand in ladder:
             if len(cohorts.get(cand, [])) >= floor:
@@ -344,8 +404,11 @@ def build(root: str, neighbours: int = 5, log=None) -> dict[str, Any]:
                     break
         r["primary_cohort"] = primary
         r["primary_cohort_size"] = len(cohorts.get(primary, cohorts["all"]))
+        # `cohort_keys` is ordered most specific first, so the ideal answer is
+        # the head of the list.  Anything else means the ladder fell back and
+        # the percentile is against a broader pool than the labels asked for.
         r["primary_cohort_is_fallback"] = bool(
-            r["cohort_keys"] and primary != r["cohort_keys"][-1])
+            r["cohort_keys"] and primary != r["cohort_keys"][0])
         r["cohort_choice_rule"] = (
             f"the most specific cohort holding at least {floor} tracks, falling "
             "back to a broader one and finally to the whole corpus")

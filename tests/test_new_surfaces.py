@@ -180,11 +180,18 @@ def test_cohort_labels_prefer_declared_then_online_then_tag(tmp_path):
     assert (got["genre"], got["genre_source"]) == ("rock", "file:tag")
     assert (got["year"], got["year_source"]) == (1994, "file:tag")
 
+    # The shape `mtx enrich` actually writes -- `genres` plural, and the date
+    # under the provider that said it.  This test used to invent a flatter
+    # sidecar, so it passed while the reader looked for keys nothing produced
+    # and every cohort in the corpus quietly fell back to the shop's tag.
     (folder / "online.json").write_text(json.dumps(
-        {"genre": {"umbrella": "Grunge"}, "release": {"date": "1994-09-27"}}),
+        {"genres": {"primary": "grunge", "umbrella": "Grunge"},
+         "musicbrainz": {"release": {"date": "1994-09-27"}},
+         "cross_checks": {"release_date": {"earliest": "1994-09-27"}}}),
         encoding="utf-8")
     got = labels_for(res, str(folder))
     assert (got["genre"], got["genre_source"]) == ("grunge", "online")
+    assert (got["year"], got["year_source"]) == (1994, "online")
 
     (folder / "declared.json").write_text(json.dumps(
         {"cohort": {"genre": "Alt-Pop", "year": 2026}}), encoding="utf-8")
