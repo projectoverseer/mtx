@@ -35,7 +35,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 from client import Notion, NotionError            # noqa: E402
 from rows import (OBSERVATION_SCHEMA, body_blocks, database_schema,  # noqa: E402
-                  load_folder, load_outcomes, observations_for,
+                  load_cohorts, load_folder, load_identities,
+                  load_outcomes,
+                  observations_for,
                   properties_for)
 from schema import PROPERTIES, TRAIT_VERSION, dig  # noqa: E402
 
@@ -304,6 +306,8 @@ def main() -> int:
         folders = folders[:args.limit]
 
     outcomes = load_outcomes(args.root)
+    identities = load_identities(args.root)
+    cohorts = load_cohorts(args.root)
     if not outcomes:
         log("note: no outcome.json; the within-artist outcome columns will "
             "be empty. Run tools/notion/outcome.py first.")
@@ -339,7 +343,8 @@ def main() -> int:
     def work(folder):
         name = os.path.basename(folder)
         try:
-            doc = load_folder(folder, outcomes, args.root)
+            doc = load_folder(folder, outcomes, args.root, identities,
+                              cohorts)
             sha = dig(doc, "file.sha256") or folder
         except (OSError, ValueError) as exc:
             return folder, None, 0, f"{name}: cannot read analysis: {exc}"

@@ -47,8 +47,34 @@ def load_outcomes(root: str) -> dict:
         return {}
 
 
+def load_cohorts(root: str) -> dict:
+    """`{sha256: track entry}` from `mtx cohort`, or empty when it has not run.
+
+    Keyed on the sha256 rather than the path, so moving a folder does not
+    detach a track from its own percentiles.
+    """
+    path = os.path.join(root, "cohort.json")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return {t["sha256"]: t for t in (doc.get("tracks") or [])
+            if isinstance(t, dict) and t.get("sha256")}
+
+
+def load_identities(root: str) -> dict:
+    """`{folder: resolved artist}` from `tools/identity.py`, or empty."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    import identity                                  # noqa: PLC0415
+    return identity.load(root)
+
+
 def load_folder(folder: str, outcomes: dict | None = None,
-                root: str | None = None) -> dict:
+                root: str | None = None, identities: dict | None = None,
+                cohorts: dict | None = None) -> dict:
     """`analysis.json` with `online.json` mounted at `online.`.
 
     The sidecar is mounted rather than merged because that is what it is:
@@ -81,9 +107,14 @@ def load_folder(folder: str, outcomes: dict | None = None,
             catalogue = head
     doc["mtx"] = {"analysis_path": os.path.abspath(folder),
                   "folder": os.path.basename(folder),
-                  "catalogue_artist": catalogue}
+                  "catalogue_artist": catalogue,
+                  "artist": (identities or {}).get(catalogue) or {}}
     sha = dig(doc, "file.sha256")
     doc["outcome"] = (outcomes or {}).get(sha) or {}
+    # Mounted, not merged, for the same reason `online` is: a percentile is a
+    # statement about the folder this track sits in, and `mtx analyze` promises
+    # its own output does not change because a neighbour arrived.
+    doc["cohort"] = (cohorts or {}).get(sha) or {}
     return doc
 
 

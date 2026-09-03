@@ -177,6 +177,13 @@ def is_single(doc: dict) -> Any:
     wrecks this comparison is held constant by construction, and what varies
     is the song and the mix.
     """
+    # Asked of the whole packaging history, not of the one release this copy
+    # came from.  `Scar Tissue` was a single and an album cut; reading the type
+    # of the chosen release called it neither, because the release chosen was a
+    # bootleg compilation.
+    issued = dig(doc, "online.musicbrainz.issued_as_single")
+    if isinstance(issued, bool):
+        return issued
     rt = dig(doc, "online.musicbrainz.release_group.primary_type")
     if isinstance(rt, str) and rt:
         return rt.lower() == "single"
@@ -214,6 +221,13 @@ def catalogue_artist(doc: dict) -> str:
     Falls back to the album artist, then the track artist, when a folder is
     loaded without a root.
     """
+    # `tools/identity.py` resolves the folder to the name MusicBrainz uses,
+    # because a folder is whatever someone typed and "Red Hot Chilli Peppers"
+    # is a join key no other dataset in the world shares.  The grouping is
+    # still the folder -- resolution renames the group, it never merges two.
+    resolved = dig(doc, "mtx.artist.notion_name")
+    if resolved:
+        return str(resolved)
     name = dig(doc, "mtx.catalogue_artist")
     if name:
         return str(name)
@@ -264,6 +278,9 @@ def all_artist_mbids(doc: dict) -> list[str]:
 
 def release_precision(doc: dict) -> Any:
     """`day` / `month` / `year` -- how much of the release date is real."""
+    recorded = dig(doc, "online.cross_checks.release_date.precision")
+    if recorded:
+        return str(recorded)
     raw = str(dig(doc, "online.cross_checks.release_date.earliest") or "").strip()
     if not raw:
         return None
@@ -339,9 +356,15 @@ _group("identity", [
     # is kept losslessly in `Artist canonical`, and the join key a machine
     # should actually use is `Artist MBID`.
     P("Artist", "select", catalogue_artist),
+    # The exact name, commas and all, for anything that is not a Notion select.
     P("Artist canonical", "rich_text",
-      lambda d: (all_artists(d) or [catalogue_artist(d)])[0] or None),
-    P("Artist MBID", "rich_text", artist_mbid),
+      lambda d: (dig(d, "mtx.artist.name")
+                 or (all_artists(d) or [catalogue_artist(d)])[0] or None)),
+    # The catalogue's own MBID, which is stable across the folder.  `Artist
+    # MBIDs` below is per-track and holds whoever this track was credited to,
+    # so a Silk Sonic cut in the Bruno Mars folder carries both.
+    P("Artist MBID", "rich_text",
+      lambda d: dig(d, "mtx.artist.mbid") or artist_mbid(d)),
     P("Artists all", "multi_select", all_artists),
     P("Artist MBIDs", "multi_select", all_artist_mbids),
     P("Album", "rich_text", "tags.named.album"),
@@ -536,6 +559,69 @@ _group("outcome", [
     # query wanting a deduplicated corpus filters `Recording primary`.
     P("Recording duplicates", "number", "outcome.recording_duplicates"),
     P("Recording primary", "checkbox", "outcome.recording_primary"),
+])
+
+def _pct(key: str):
+    """Where this track sits in its cohort, on one metric, as a percentile."""
+    return lambda d: dig(d, f"cohort.metrics.{key}.cohort_percentile")
+
+
+def _cohort_median(key: str):
+    return lambda d: dig(d, f"cohort.metrics.{key}.cohort_median")
+
+
+def references(doc: dict) -> Any:
+    """The nearest records in the corpus -- the A/B list, precomputed.
+
+    "Master to -8 LUFS" is advice.  "These five released records are closest to
+    yours on every measured axis, and here is where you differ from them" is
+    evidence, and it is the form the question actually gets asked in.
+    """
+    got = dig(doc, "cohort.neighbours", {}) or {}
+    rows = got.get("list") or []
+    if not rows:
+        return None
+    named = [f"{r.get('artist')} - {r.get('title')}" for r in rows[:6]
+             if r.get("title")]
+    return "; ".join(named) or None
+
+
+_group("cohort", [
+    # Written by `mtx cohort` into its own file and mounted here.  An absolute
+    # number is not actionable: -9.45 LUFS is a fact, and "the 31st percentile
+    # of house records since 2022" is an answer.
+    P("Cohort", "select", "cohort.primary_cohort"),
+    P("Cohort size", "number", "cohort.primary_cohort_size"),
+    # True when the labelled cohort was too small and a broader pool was used,
+    # so every percentile on this row is against something less specific than
+    # the Cohort column suggests.
+    P("Cohort is fallback", "checkbox", "cohort.primary_cohort_is_fallback"),
+    P("Cohort genres", "multi_select", lambda d: dig(d, "cohort.genres", []) or []),
+    P("Typicality (mean |z|)", "number", "cohort.typicality.mean_abs_z"),
+    P("A/B references", "rich_text", references),
+    P("References basis", "rich_text", "cohort.neighbours.basis"),
+
+    P("LUFS-I pct", "number", _pct("headline.lufs_i"), "%"),
+    P("LUFS-I cohort median", "number", _cohort_median("headline.lufs_i"), "LUFS"),
+    P("True peak pct", "number", _pct("headline.true_peak_dbtp_16x"), "%"),
+    P("PLR pct", "number", _pct("headline.plr_db"), "%"),
+    P("PSR min pct", "number", _pct("headline.psr_min_db"), "%"),
+    P("PSR min cohort median", "number", _cohort_median("headline.psr_min_db"), "dB"),
+    P("PSR median pct", "number", _pct("headline.psr_median_db"), "%"),
+    P("DR14 pct", "number", _pct("headline.dr14"), "%"),
+    P("LRA pct", "number", _pct("headline.lra_lu"), "%"),
+    P("Crest pct", "number", _pct("headline.crest_loudest_10s_db"), "%"),
+    P("Tilt pct", "number", _pct("headline.spectral_tilt_db_per_oct"), "%"),
+    P("Tilt cohort median", "number",
+      _cohort_median("headline.spectral_tilt_db_per_oct"), "dB/oct"),
+    P("Air band pct", "number", _pct("headline.air_band_pct"), "%"),
+    P("Sub band pct", "number", _pct("headline.sub_band_pct"), "%"),
+    P("Side minus mid pct", "number", _pct("headline.side_minus_mid_db"), "%"),
+    P("Correlation pct", "number", _pct("headline.correlation_mean"), "%"),
+    P("HF cutoff pct", "number", _pct("headline.hf_cutoff_hz"), "%"),
+    P("Tempo pct", "number", _pct("headline.tempo_bpm"), "%"),
+    P("Duration pct", "number", _pct("headline.duration_s"), "%"),
+    P("Section count pct", "number", _pct("headline.section_count"), "%"),
 ])
 
 _group("provenance", [
