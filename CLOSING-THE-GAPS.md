@@ -317,9 +317,12 @@ for the tracks you care about. Low priority.
 | | Before today | Now |
 | --- | --- | --- |
 | Discogs matched | 0 / 1321 | **896**, remaining 425 mostly digital-only |
-| Missing playcounts | 91 | fixed at the source — see below |
-| Mastering engineer known | 337 | 446 |
-| Release chosen from a truncated list | 465 | 0 |
+| Missing playcounts | 91 | **2** |
+| Release chosen from a truncated list | 465 | **0** |
+| Release chosen from a bootleg | 24 | **0** |
+| Dated to the day | 956 | **1,318** |
+| Dated only to the year | 365 | **0** |
+| Known singles (the contrast set) | 172 | **381** vs 935 album cuts |
 
 The 91 missing play counts were one bug with three faces.
 `primary_artist("Ariana Grande (ft. Pharell Willians)")` returned the whole
