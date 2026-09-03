@@ -414,6 +414,12 @@ PARAMS: dict[str, Any] = {
                      "lyrics:description", "wm/lyrics"],
         "transcript": {
             "backends": ["whisperx", "whisper_timestamped", "faster_whisper"],
+            # `small` is the smallest model that reliably hears a sung lyric
+            # over a mix; `base` is roughly twice as fast and mishears chorus
+            # lines often enough to change a rhyme count.
+            "model": "small",
+            "device": "auto",
+            "vad": True,
             "note": "optional; a transcript is an inference and is never merged "
                     "into a declared or tagged lyric",
         },

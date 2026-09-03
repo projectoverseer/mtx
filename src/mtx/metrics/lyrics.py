@@ -26,6 +26,7 @@ first and declines rather than producing a meaningless number.
 
 from __future__ import annotations
 
+import os
 import re
 import unicodedata
 import zlib
@@ -344,6 +345,28 @@ def _lexicon_block(name: str) -> dict[str, Any]:
             "path": path}
 
 
+def _whisper_devices(P: dict[str, Any]) -> list[tuple[str, str]]:
+    """Where to run, best first, falling back rather than failing.
+
+    A GPU turns a transcription pass over a 1,300-track corpus from days into
+    hours, and the CPU path has to stay because not every machine has one.
+    `float16` is the only compute type worth trying on a consumer card; on CPU
+    `int8` is several times faster than `float32` and the difference in a sung
+    transcript is not measurable next to the mishearing that dominates it.
+    """
+    want = str(P.get("device") or "auto")
+    plans = {"cuda": [("cuda", "float16")], "cpu": [("cpu", "int8")]}
+    if want in plans:
+        return plans[want]
+    try:
+        import torch                                   # noqa: PLC0415
+        if torch.cuda.is_available():
+            return [("cuda", "float16"), ("cpu", "int8")]
+    except Exception:
+        pass
+    return [("cpu", "int8")]
+
+
 def transcribe(vocal_path: str, collector: Collector) -> dict[str, Any]:
     """A time-aligned transcript from the vocal stem, if a backend is installed."""
     P = PARAMS["lyrics"]["transcript"]
@@ -375,16 +398,29 @@ def transcribe(vocal_path: str, collector: Collector) -> dict[str, Any]:
                 "reason": "no transcription backend is installed",
                 "backends": list(P["backends"]),
                 "install": "pip install whisper-timestamped  # or faster-whisper"}
+    name = str(P.get("model") or "base")
+    for device, compute in _whisper_devices(P):
+        try:
+            model = WhisperModel(name, device=device, compute_type=compute)
+        except Exception as exc:
+            collector.warn("lyrics.transcript",
+                           f"faster_whisper on {device}: {exc!r}")
+            continue
+        break
+    else:
+        return {"available": False,
+                "reason": "faster_whisper would not load on any device"}
     try:
-        model = WhisperModel("base", device="cpu", compute_type="int8")
-        segments, info = model.transcribe(vocal_path, word_timestamps=True)
+        segments, info = model.transcribe(vocal_path, word_timestamps=True,
+                                          vad_filter=bool(P.get("vad", True)))
         words, chunks = [], []
         for seg in segments:
             chunks.append(seg.text)
             for w in (seg.words or []):
                 words.append({"word": w.word, "start_s": float(w.start),
                               "end_s": float(w.end)})
-        return {"available": True, "backend": "faster_whisper", "model": "base",
+        return {"available": True, "backend": "faster_whisper", "model": name,
+                "device": device, "compute_type": compute,
                 "text": "".join(chunks).strip(), "language": info.language,
                 "words": words, "source": "transcript",
                 "caveat": "a transcription of a separated vocal stem: an "
@@ -443,7 +479,8 @@ def _alignment(transcript: dict[str, Any], tempo: dict[str, Any] | None,
 
 def analyse(tags: dict[str, Any], declared: dict[str, Any] | None,
             stems: dict[str, Any] | None, structure: dict[str, Any] | None,
-            collector: Collector, want_transcript: bool = False) -> dict[str, Any]:
+            collector: Collector, want_transcript: bool = False,
+            mix_path: str | None = None) -> dict[str, Any]:
     """Pick a lyric source, then measure the text and (if aligned) its timing."""
     from ..declared import declared_value
 
@@ -470,12 +507,27 @@ def analyse(tags: dict[str, Any], declared: dict[str, Any] | None,
                                             "over the vocal stem"}
     if want_transcript:
         vocal = ((stems or {}).get("stems") or {}).get("vocals") or {}
-        vpath = vocal.get("path")
+        vpath, on = vocal.get("path"), "vocal stem"
+        if not vpath and mix_path and os.path.isfile(mix_path):
+            # Separating the vocal first is better, and it costs a demucs pass
+            # per track.  Refusing outright means a corpus whose stems were
+            # pruned can never be transcribed at all, so the full mix is
+            # allowed -- labelled, because a transcript off a full mix mishears
+            # more, and the difference has to be visible to whoever reads it.
+            vpath, on = mix_path, "full mix"
         if not vpath:
             transcript = {"available": False,
-                          "reason": "no vocals stem; transcription needs --stems"}
+                          "reason": "no vocals stem and no source file; "
+                                    "transcription needs --stems or a readable "
+                                    "input"}
         else:
             transcript = transcribe(vpath, collector)
+            transcript["input"] = on
+            if on == "full mix":
+                transcript["caveat"] = (
+                    "transcribed from the full mix rather than a separated "
+                    "vocal: an inference on top of an inference, and it "
+                    "mishears more than a stem transcript does")
         if text is None and transcript.get("available"):
             text, source = transcript.get("text"), "transcript"
 

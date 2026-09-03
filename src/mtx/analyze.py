@@ -291,7 +291,8 @@ def analyze_file(path: str, profile: str = "full", want_stems: bool = False,
     step("lyrics")
     res["lyrics"] = m_lyrics.analyse(res.get("tags") or {}, res["declared"],
                                      res["stems"], res["structure"], collector,
-                                     want_transcript=want_transcript)
+                                     want_transcript=want_transcript,
+                                     mix_path=path)
 
     step("embedding")
     res["embedding"] = m_embedding.analyse(
