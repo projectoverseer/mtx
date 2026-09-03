@@ -90,6 +90,54 @@ class State:
 # --------------------------------------------------------------------------
 
 
+class Lock:
+    """Refuse to run while another push is running against the same corpus.
+
+    Two concurrent pushes each read the set of observations already logged,
+    each conclude the other's rows are not there yet, and each write the whole
+    snapshot: 3,957 duplicate readings from one accidental double-launch.
+    Nothing errored -- both runs reported success -- and the log quietly held
+    two of everything.
+
+    A stale lock from a killed run is taken over rather than treated as fatal:
+    the failure this guards against is concurrency, and a crash leaves no
+    concurrency behind.
+    """
+
+    STALE_AFTER_S = 3600.0
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.held = False
+
+    def acquire(self) -> None:
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, encoding="utf-8") as fh:
+                    other = json.load(fh)
+            except (OSError, ValueError):
+                other = {}
+            age = time.time() - float(other.get("started", 0) or 0)
+            if age < self.STALE_AFTER_S:
+                raise SystemExit(
+                    f"another push started {age / 60:.0f} min ago is still "
+                    f"holding {self.path} (pid {other.get('pid')}).  Two at "
+                    f"once duplicate every observation row.  Wait for it, or "
+                    f"delete that file if you know it died.")
+            log(f"taking over a stale lock from pid {other.get('pid')}")
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump({"pid": os.getpid(), "started": time.time()}, fh)
+        self.held = True
+
+    def release(self) -> None:
+        if self.held:
+            try:
+                os.remove(self.path)
+            except OSError:
+                pass
+            self.held = False
+
+
 def ensure_databases(api: Notion, parent: str, state: State,
                      dry_run: bool) -> tuple[str, str]:
     if dry_run:
@@ -306,6 +354,16 @@ def main() -> int:
             ap.error("--parent is required the first time, to say which page "
                      "the databases should be created under")
 
+    lock = Lock(os.path.join(args.root, ".notion_push.lock"))
+    if not args.dry_run:
+        lock.acquire()
+    try:
+        return _run(args)
+    finally:
+        lock.release()
+
+
+def _run(args) -> int:
     folders = _enrich_targets(args.root)
     if not folders:
         log(f"error: no analysis.json under {args.root}")
