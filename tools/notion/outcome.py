@@ -99,7 +99,8 @@ def collect(root: str) -> list[dict]:
             continue
         sha = ((row.get("_source") or {}).get("sha256") or "")
         pop = online.get("popularity") or {}
-        rg = ((online.get("musicbrainz") or {}).get("release_group") or {})
+        mb = online.get("musicbrainz") or {}
+        rg = (mb.get("release_group") or {})
         rows.append({
             "sha256": sha,
             "recording_mbid": (online.get("identity") or {}).get("recording_mbid"),
@@ -112,6 +113,12 @@ def collect(root: str) -> list[dict]:
             "listeners": pop.get("lastfm_listeners"),
             "deezer_rank": pop.get("deezer_rank"),
             "release_type": rg.get("primary_type"),
+            # The type of the one release this copy came from answers "what
+            # package is this", not "was this song a single".  A track can be
+            # an album cut and a single at once, and `Scar Tissue` is both;
+            # asking the packaging history instead moved the corpus from 172
+            # known singles to 379.
+            "issued_as_single": mb.get("issued_as_single"),
             "duration_s": (((online.get("cross_checks") or {}).get("duration")
                             or {}).get("local_s")),
             "observed_at": online.get("queried_utc"),
@@ -216,8 +223,10 @@ def derive(rows: list[dict]) -> dict:
                 "playcount": r["playcount"],
                 "observed_at": r["observed_at"],
                 "release_type": r["release_type"],
-                "is_single": (None if not r["release_type"]
-                              else r["release_type"].lower() == "single"),
+                "is_single": (r["issued_as_single"]
+                              if isinstance(r.get("issued_as_single"), bool)
+                              else (None if not r["release_type"]
+                                    else r["release_type"].lower() == "single")),
             }
             if value is None:
                 entry["reason"] = ("no playcount for this track; "
