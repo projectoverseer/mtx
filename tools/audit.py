@@ -531,6 +531,54 @@ def check_measurement(rep: Report, tracks: list[dict[str, Any]]) -> None:
     rep.fact("analysis_tool_versions", dict(tool_seen))
 
 
+def check_deep(rep: Report, tracks: list[dict[str, Any]]) -> None:
+    """Checks that need the full analysis, so they cost minutes not seconds.
+
+    Off by default and worth running weekly.  The defect this exists for is the
+    quietest kind there is: a field that is populated, labelled with a source,
+    and holding the wrong thing.
+    """
+    credit = rep.check(
+        "lyrics.credit_not_lyric", "error",
+        "the lyric field holds a songwriter credit rather than a lyric -- one "
+        "line, a handful of words, `source: file:tag`.  A substring match on "
+        "the tag key meant `composerlyricist` was read as a lyric, and Apple "
+        "puts that key on most commercial files",
+        "the matcher is fixed, but these analyses predate the fix: re-scan "
+        "with `mtx scan --force`, or transcribe, or declare the text")
+    empty = rep.check(
+        "lyrics.absent", "info",
+        "no lyric from any source, so nothing about the writing is measurable "
+        "on this track: no rhyme scheme, no repetition, no delivery rate",
+        "run the pipeline with --transcribe, or paste the sheet into "
+        "declared.json")
+    warned = rep.check(
+        "analysis.warnings", "info",
+        "the analysis recorded a warning about itself",
+        "read the warnings block; most are benign, none are invented")
+
+    for t in tracks:
+        path = os.path.join(t["folder"], "analysis.json")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        for warning in (doc.get("warnings") or [])[:1]:
+            warned.hit(t["rel"], warning=str(warning)[:120])
+        lyrics = doc.get("lyrics") or {}
+        if not lyrics.get("available"):
+            empty.hit(t["rel"])
+            continue
+        stats = lyrics.get("statistics") or {}
+        lines = (stats.get("lines") or {}).get("count")
+        chars = (stats.get("characters") or {}).get("count")
+        if (lyrics.get("source") == "file:tag"
+                and isinstance(lines, int) and lines <= 2
+                and isinstance(chars, int) and chars < 200):
+            credit.hit(t["rel"], lines=lines, characters=chars)
+
+
 def check_hygiene(rep: Report, tracks: list[dict[str, Any]]) -> None:
     """Properties of the corpus as a sample, not of any one row."""
     dominance = rep.check(
@@ -678,7 +726,7 @@ def check_notion(rep: Report, root: str) -> None:
 # --------------------------------------------------------------------------
 
 
-def run(root: str, notion: bool = False) -> Report:
+def run(root: str, notion: bool = False, deep: bool = False) -> Report:
     rep = Report()
     tracks = load_corpus(root)
     if not tracks:
@@ -690,6 +738,8 @@ def run(root: str, notion: bool = False) -> Report:
     check_vocabulary(rep, tracks)
     check_measurement(rep, tracks)
     check_hygiene(rep, tracks)
+    if deep:
+        check_deep(rep, tracks)
     if notion:
         check_notion(rep, root)
     return rep
@@ -726,6 +776,9 @@ def render(rep: Report, verbose: bool = False) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("root")
+    ap.add_argument("--deep", action="store_true",
+                    help="also read every analysis.json: catches a lyric field "
+                         "holding a songwriter credit.  Minutes, not seconds")
     ap.add_argument("--notion", action="store_true",
                     help="also check the live database this corpus pushes to")
     ap.add_argument("--json", metavar="PATH",
@@ -736,7 +789,7 @@ def main() -> int:
     args = ap.parse_args()
 
     try:
-        rep = run(args.root, notion=args.notion)
+        rep = run(args.root, notion=args.notion, deep=args.deep)
     except ValueError as exc:
         log(f"error: {exc}")
         return 2
