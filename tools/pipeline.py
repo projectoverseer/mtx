@@ -11,8 +11,9 @@ it is whether the stages are ever run in the wrong order or quietly skipped.
 So they live here, in order, with the reason each one has to come after the
 last:
 
-    scan      measure the audio                    (no network, hours)
-    enrich    look the tracks up                   (network, minutes)
+    scan       measure the audio                   (no network, hours)
+    enrich     look the tracks up                  (network, minutes)
+    transcribe add a lyric to existing analyses    (GPU, opt in: --transcribe)
     identity  resolve one name per artist folder   -- needs enrich
     outcome   normalise plays within each artist   -- needs enrich + identity
     cohort    percentiles within genre and era     -- needs enrich
@@ -108,6 +109,9 @@ def stages() -> list[Stage]:
                          "-j", str(a.net_jobs), "--providers", "all",
                          *(["--force"] if a.force else []),
                          *(["--refresh"] if a.refresh else [])]),
+        Stage("transcribe", "add a lyric to analyses that already exist",
+              lambda a: [python(), os.path.join(HERE, "transcribe.py"), a.root,
+                         *(["--force"] if a.force else [])]),
         Stage("identity", "one canonical name and MBID per artist folder",
               lambda a: [python(), os.path.join(HERE, "identity.py"), a.root]),
         Stage("outcome", "position within the artist's own catalogue",
@@ -170,7 +174,9 @@ def main() -> int:
                     help="ignore the HTTP cache and re-fetch")
     ap.add_argument("--prune", action="store_true",
                     help="drop Notion select options nothing uses any more")
-    ap.add_argument("--transcribe", action="store_true")
+    ap.add_argument("--transcribe", action="store_true",
+                    help="run the transcribe stage, and ask `scan` for a "
+                         "transcript on tracks it measures fresh")
     ap.add_argument("--embed", action="store_true")
     ap.add_argument("--strict", action="store_true",
                     help="let audit warnings stop the run too")
@@ -200,6 +206,10 @@ def main() -> int:
     elif args.start:
         chosen = all_stages[names.index(args.start):]
     chosen = [s for s in chosen if s.name not in args.skip]
+    if not args.transcribe and not (args.only and "transcribe" in args.only):
+        # Thirty seconds a track on a GPU and several minutes on a CPU, so it
+        # is opt-in rather than part of a daily run by default.
+        chosen = [s for s in chosen if s.name != "transcribe"]
 
     missing = sorted({key for s in chosen for key in NEEDS.get(s.name, ())
                       if not os.environ.get(key)})
