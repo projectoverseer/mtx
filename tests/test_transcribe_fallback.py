@@ -7,11 +7,13 @@ work happens as the caller iterates it, well after any constructor has
 returned.
 
 The original fallback wrapped only the constructor, so a card that loaded the
-model and then died had no second attempt: those tracks came back
-`available: False` with a CPU sitting idle that would have transcribed them in
-four minutes.  It cost 16 of the first 486 tracks of a corpus run -- 3.3%,
-concentrated on the long ones, which is to say the album tracks rather than
-the singles.
+model and then died had no second attempt.  It cost 78 of 1,321 tracks over a
+full corpus run -- 6%, every one of them long, which is to say album tracks
+rather than singles: a slant in the lyric data and not merely a hole in it.
+
+The second half of the fix is which rung catches them.  An out-of-memory is a
+memory problem, not a broken card, so the first retry is a cheaper compute
+type on the same GPU; the CPU stays as the last resort it should be.
 
 These tests use a stub backend rather than a real model: the behaviour under
 test is which device gets tried after which failure, and that needs no GPU,
@@ -51,12 +53,13 @@ class _StubModel:
 
     def __init__(self, name, device, compute_type):
         self.device, self.compute = device, compute_type
-        type(self).made.append(device)
-        if device in self.fail_on_load:
+        type(self).made.append(f"{device}/{compute_type}")
+        if device in self.fail_on_load or compute_type in self.fail_on_load:
             raise RuntimeError(f"{device} would not load")
 
     def transcribe(self, path, **kw):
-        if self.device in self.fail_on_decode:
+        if (self.device in self.fail_on_decode
+                or self.compute in self.fail_on_decode):
             # Lazily, exactly like the real one: the generator is what raises.
             def boom():
                 yield _Segment("first line", [_Word("first", 0.0, 0.4)])
@@ -90,7 +93,8 @@ def test_a_decode_failure_falls_back_to_the_next_device(stub):
 
     assert got["available"] is True, "a working CPU should have caught this"
     assert got["device"] == "cpu"
-    assert stub.made == ["cuda", "cpu"], "both devices should have been tried"
+    assert stub.made == ["cuda/float16", "cpu/int8"], \
+        "both devices should have been tried"
     assert got["text"] == "one two\nthree"
 
 
@@ -101,7 +105,7 @@ def test_a_load_failure_still_falls_back(stub):
 
     assert got["available"] is True
     assert got["device"] == "cpu"
-    assert stub.made == ["cuda", "cpu"]
+    assert stub.made == ["cuda/float16", "cpu/int8"]
 
 
 def test_the_first_device_is_used_when_it_works(stub):
@@ -109,7 +113,7 @@ def test_the_first_device_is_used_when_it_works(stub):
     got = m_lyrics.transcribe("nowhere.wav", Collector())
 
     assert got["device"] == "cuda"
-    assert stub.made == ["cuda"], "the CPU should not have been touched"
+    assert stub.made == ["cuda/float16"], "the CPU should not have been touched"
 
 
 def test_failing_everywhere_reports_every_reason(stub):
@@ -119,7 +123,7 @@ def test_failing_everywhere_reports_every_reason(stub):
     got = m_lyrics.transcribe("nowhere.wav", collector)
 
     assert got["available"] is False
-    assert got["attempted"] == ["cuda", "cpu"]
+    assert got["attempted"] == ["cuda/float16", "cpu/int8"]
     assert "cuda:" in got["reason"] and "cpu:" in got["reason"]
     assert "out of memory" in got["reason"]
     # Every attempt is a warning on the record, not only the last one.
@@ -133,3 +137,38 @@ def test_segments_stay_one_line_each(stub):
 
     assert got["text"].splitlines() == ["one two", "three"]
     assert got["lines"] == 2
+
+
+def test_the_real_plan_retries_on_the_gpu_before_giving_up_on_it(monkeypatch):
+    """An OOM is a memory problem, not a broken card.
+
+    `float16` weights plus a long track's activations do not fit in 4 GB, but
+    the same weights as `int8_float16` do -- so the retry that matters is a
+    cheaper compute type on the same GPU, seconds of work, not a CPU pass that
+    costs minutes a track.  Falling straight to CPU turned 6% of the corpus
+    into an overnight job of its own.
+    """
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    import torch  # noqa: PLC0415
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    plan = m_lyrics._whisper_devices({"device": "auto"})
+
+    assert plan[0] == ("cuda", "float16"), "the fast path stays first"
+    assert plan[1] == ("cuda", "int8_float16"), "the cheap GPU rung is second"
+    assert plan[-1][0] == "cpu", "the CPU remains the last resort"
+
+
+def test_an_out_of_memory_lands_on_the_second_gpu_rung(stub, monkeypatch):
+    """The 78 tracks this was built for: they must not reach the CPU."""
+    monkeypatch.setattr(m_lyrics, "_whisper_devices",
+                        lambda _p: [("cuda", "float16"),
+                                    ("cuda", "int8_float16"),
+                                    ("cpu", "int8")])
+    stub.fail_on_decode = frozenset({"float16"})     # not int8_float16
+    got = m_lyrics.transcribe("nowhere.wav", Collector())
+
+    assert got["available"] is True
+    assert got["device"] == "cuda"
+    assert got["compute_type"] == "int8_float16"
+    assert "cpu/int8" not in stub.made, "the CPU pass was not needed"

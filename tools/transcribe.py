@@ -57,13 +57,29 @@ def folders(root: str) -> list[str]:
 
 
 def already_done(doc: dict) -> bool:
+    """Has this folder been transcribed?  Not: is the transcript being used.
+
+    The distinction cost 95 tracks a pointless re-run on every pass.  A track
+    whose file tags carry a real lyric sheet keeps `lyrics.source` at
+    `file:tag`, because a sheet written by the label beats a transcription of
+    a separated stem and should win.  The transcript is still made, still
+    stored, and still what the alignment and prosody measurements read -- but
+    a check that asked "is the transcript the chosen source" saw `file:tag`,
+    concluded nothing had been done, and spent thirty seconds re-deriving a
+    transcript identical to the one already on disk.  Every run.  Forever.
+
+    So ask whether a transcript exists, not whether it won.
+    """
     lyrics = doc.get("lyrics") or {}
     if lyrics.get("source") == "transcript":
+        return True
+    transcript = lyrics.get("transcript") or {}
+    if transcript.get("available") and transcript.get("source") == "transcript":
         return True
     # A transcript that heard nothing is still an answer about this track, and
     # re-running it every night would cost thirty seconds each time to learn
     # the same thing.
-    return bool((lyrics.get("transcript") or {}).get("rejected_as_lyric"))
+    return bool(transcript.get("rejected_as_lyric"))
 
 
 # How far below the mix a separated vocal has to sit before the track counts
@@ -95,6 +111,57 @@ def source_path(doc: dict) -> str | None:
     return path if path and os.path.isfile(path) else None
 
 
+def _save(folder: str, path: str, doc: dict, whole: bool) -> None:
+    """Persist the amended analysis, keeping whatever shape it arrived in.
+
+    The common case rewrites only the index, atomically.  When `lyrics` has
+    been moved out to a part, the document has to be re-split instead --
+    `write_analysis` recomputes which sections move, rewrites the manifest and
+    deletes the parts the new layout does not use, so the folder ends up equal
+    to the result rather than to the union of two of them.
+    """
+    if whole:
+        from mtx.split import write_analysis           # noqa: PLC0415
+        write_analysis(doc, folder)
+        return
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(doc, fh, indent=1, sort_keys=True, ensure_ascii=False,
+                      allow_nan=False)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
+def _record_attempt(folder: str, path: str, doc: dict, whole: bool,
+                    reason: str, transcript: dict) -> None:
+    """Note that transcription was tried here and did not work.
+
+    Deliberately not enough to count as done: `available` stays false and no
+    rejection is recorded, so the next run picks the track up again.  What it
+    adds is the reason and the devices that were tried, which is what turns
+    "this track has no lyrics" into "this track failed on a 4 GB card at
+    05:12" -- one of those is a finding about the music and the other is a
+    finding about the run.
+    """
+    lyrics = doc.setdefault("lyrics", {})
+    if not isinstance(lyrics, dict):
+        return
+    note = lyrics.setdefault("transcript", {})
+    if not isinstance(note, dict):
+        return
+    note["available"] = False
+    note["reason"] = reason
+    note["attempted_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if transcript.get("attempted"):
+        note["attempted_devices"] = transcript["attempted"]
+    _save(folder, path, doc, whole)
+
+
 def transcribe_one(folder: str, force: bool) -> tuple[str, str]:
     """Returns (status, detail).  Never raises: one bad file is not a run."""
     path = os.path.join(folder, "analysis.json")
@@ -103,6 +170,19 @@ def transcribe_one(folder: str, force: bool) -> tuple[str, str]:
             doc = json.load(fh)
     except (OSError, ValueError) as exc:
         return "error", f"unreadable analysis: {exc}"
+
+    # Reading the *index* rather than the merged document is deliberate: it
+    # keeps the `split` manifest and the part files untouched, so writing back
+    # rewrites one 3 MB index instead of re-emitting 17 MB of timelines.  It
+    # only holds while `lyrics` actually lives in the index.  A long enough
+    # transcript could push it out to a part, and then an inline write is
+    # shadowed on the next read by the part that still holds the old value --
+    # a silent revert, with the log still saying `ok`.
+    moved_lyrics = bool(isinstance(doc.get("lyrics"), dict)
+                        and doc["lyrics"].get("mtx_moved"))
+    if moved_lyrics:
+        from mtx.split import load_analysis            # noqa: PLC0415
+        doc = load_analysis(path)
 
     if already_done(doc) and not force:
         return "skip", "already transcribed"
@@ -121,7 +201,17 @@ def transcribe_one(folder: str, force: bool) -> tuple[str, str]:
 
     transcript = got.get("transcript") or {}
     if not transcript.get("available"):
-        return "fail", str(transcript.get("reason") or "no transcript")
+        reason = str(transcript.get("reason") or "no transcript")
+        # Record the attempt.  A failure that writes nothing leaves an
+        # analysis byte-identical to one nobody ever asked to transcribe, so
+        # 78 tracks killed by an out-of-memory sat behind a clean audit
+        # looking like tracks with no words in them.  The distinction is the
+        # difference between "buy a lyric sheet" and "re-run the job".
+        try:
+            _record_attempt(folder, path, doc, moved_lyrics, reason, transcript)
+        except (OSError, ValueError):
+            pass                        # the transcript matters, the note does not
+        return "fail", reason
 
     doc["lyrics"] = got
     headline = doc.setdefault("headline", {})
@@ -147,16 +237,9 @@ def transcribe_one(folder: str, force: bool) -> tuple[str, str]:
     })
     run["amendments"] = amendments
 
-    tmp = path + ".tmp"
     try:
-        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump(doc, fh, indent=1, sort_keys=True, ensure_ascii=False,
-                      allow_nan=False)
-            fh.write("\n")
-        os.replace(tmp, path)
+        _save(folder, path, doc, moved_lyrics)
     except (OSError, ValueError) as exc:
-        if os.path.exists(tmp):
-            os.remove(tmp)
         return "error", f"could not write: {exc}"
 
     if transcript.get("rejected_as_lyric"):

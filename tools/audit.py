@@ -48,6 +48,7 @@ sys.path.insert(0, os.path.join(HERE, "notion"))
 sys.path.insert(0, os.path.join(HERE, "..", "src"))
 
 import identity                                        # noqa: E402
+from mtx.split import load_analysis                    # noqa: E402
 
 AUDIT_VERSION = "1.0.0"
 
@@ -563,6 +564,31 @@ def check_measurement(rep: Report, tracks: list[dict[str, Any]]) -> None:
     rep.fact("analysis_tool_versions", dict(tool_seen))
 
 
+def _count(stats: dict[str, Any], key: str) -> int | None:
+    """Read a count that is written as a bare number.
+
+    `lyrics.statistics.lines` is an `int`.  This check read it as
+    `{"count": n}` -- a shape the battery has never emitted -- so every
+    `--deep` run died on `'int' object has no attribute 'get'` before
+    reaching a single track, and the check it guards has never once run
+    against the corpus.  Nothing reported it, because a crash in a mode
+    nobody runs looks exactly like a mode nobody runs.
+
+    Both shapes are accepted here rather than only the real one: the wrong
+    guess cost more than the branch does, and a sibling metric may yet be
+    written the other way.
+    """
+    value = stats.get(key)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, dict):
+        inner = value.get("count")
+        return inner if isinstance(inner, int) and not isinstance(inner, bool) else None
+    return None
+
+
 def check_deep(rep: Report, tracks: list[dict[str, Any]]) -> None:
     """Checks that need the full analysis, so they cost minutes not seconds.
 
@@ -588,26 +614,52 @@ def check_deep(rep: Report, tracks: list[dict[str, Any]]) -> None:
         "analysis.warnings", "info",
         "the analysis recorded a warning about itself",
         "read the warnings block; most are benign, none are invented")
+    broke = rep.check(
+        "lyrics.transcript_failed", "warn",
+        "transcription was attempted on this track and failed, so the gap is "
+        "a broken run rather than a track with nothing to hear.  78 tracks "
+        "sat like this behind a clean audit: every one had died with a CUDA "
+        "out-of-memory part way through decoding, and because a failure "
+        "writes nothing, the analysis looked exactly like one never asked for",
+        "re-run `python tools/transcribe.py <root>`; failures write nothing, "
+        "so they are picked up automatically.  If they fail again the reason "
+        "is on each row")
 
     for t in tracks:
         path = os.path.join(t["folder"], "analysis.json")
         try:
-            with open(path, encoding="utf-8") as fh:
-                doc = json.load(fh)
-        except (OSError, ValueError):
+            # `load_analysis`, not `json.load`: the index alone is the whole
+            # document only while every section read here stays small enough
+            # to remain inline.  A long enough transcript moves `lyrics` out
+            # to a part, and the index then holds a `mtx_moved` marker that
+            # reads as "no lyrics available" -- which would report every one
+            # of those tracks as having no words at all.  `want=` keeps this
+            # as cheap as the raw read was.
+            doc = load_analysis(path, want=["lyrics", "warnings"])
+        except (OSError, ValueError, FileNotFoundError):
             continue
         for warning in (doc.get("warnings") or [])[:1]:
             warned.hit(t["rel"], warning=str(warning)[:120])
         lyrics = doc.get("lyrics") or {}
-        if not lyrics.get("available"):
+        transcript = lyrics.get("transcript") or {}
+        reason = str(transcript.get("reason") or "")
+        # A broken run is worth reporting even when the track has a lyric from
+        # its file tags, because the transcript is not a spare copy of the
+        # words: it is the only source of word-level timing, and without it
+        # the delivery-rate and alignment measurements are missing on a track
+        # that otherwise looks completely covered.
+        if (not transcript.get("available") and reason
+                and "not requested" not in reason):
+            broke.hit(t["rel"], reason=reason[:110])
+        elif not lyrics.get("available"):
             empty.hit(t["rel"])
+        if not lyrics.get("available"):
             continue
         stats = lyrics.get("statistics") or {}
-        lines = (stats.get("lines") or {}).get("count")
-        chars = (stats.get("characters") or {}).get("count")
+        lines, chars = _count(stats, "lines"), _count(stats, "characters")
         if (lyrics.get("source") == "file:tag"
-                and isinstance(lines, int) and lines <= 2
-                and isinstance(chars, int) and chars < 200):
+                and lines is not None and lines <= 2
+                and chars is not None and chars < 200):
             credit.hit(t["rel"], lines=lines, characters=chars)
 
 

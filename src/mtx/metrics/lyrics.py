@@ -351,12 +351,20 @@ def _whisper_devices(P: dict[str, Any]) -> list[tuple[str, str]]:
 
     A GPU turns a transcription pass over a 1,300-track corpus from days into
     hours, and the CPU path has to stay because not every machine has one.
-    `float16` is the only compute type worth trying on a consumer card; on CPU
-    `int8` is several times faster than `float32` and the difference in a sung
-    transcript is not measurable next to the mishearing that dominates it.
+    `int8` is several times faster than `float32` on CPU, and the difference in
+    a sung transcript is not measurable next to the mishearing that dominates
+    it.
+
+    The middle rung is the one worth explaining.  `float16` weights plus the
+    activations of a long track do not fit in 4 GB: 78 of 1,321 tracks -- 6%,
+    all of them long -- died with `CUDA failed with error out of memory`.
+    `int8_float16` holds the same weights in half the memory, so the retry
+    stays on the card and costs seconds, where the CPU rung costs minutes a
+    track and would turn that 6% into an overnight job of its own.
     """
     want = str(P.get("device") or "auto")
-    plans = {"cuda": [("cuda", "float16")], "cpu": [("cpu", "int8")]}
+    plans = {"cuda": [("cuda", "float16"), ("cuda", "int8_float16")],
+             "cpu": [("cpu", "int8")]}
     if want in plans:
         return plans[want]
     try:
@@ -372,7 +380,8 @@ def _whisper_devices(P: dict[str, Any]) -> list[tuple[str, str]]:
                     os.add_dll_directory(lib)
                 except OSError:
                     pass
-            return [("cuda", "float16"), ("cpu", "int8")]
+            return [("cuda", "float16"), ("cuda", "int8_float16"),
+                    ("cpu", "int8")]
     except Exception:
         pass
     return [("cpu", "int8")]
@@ -439,7 +448,7 @@ def transcribe(vocal_path: str, collector: Collector) -> dict[str, Any]:
                 gc.collect()
     return {"available": False,
             "reason": "; ".join(failures) or "no device would run the model",
-            "attempted": [d for d, _c in plan]}
+            "attempted": [f"{d}/{c}" for d, c in plan]}
 
 
 def _decode(model: Any, vocal_path: str, name: str, device: str, compute: str,

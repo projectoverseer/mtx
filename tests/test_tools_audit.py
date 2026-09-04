@@ -21,12 +21,15 @@ sys.path.insert(0, TOOLS)
 audit = pytest.importorskip("audit")
 
 
-def track(root, artist, album, title, *, online=None, row=None, run=None):
+def track(root, artist, album, title, *, online=None, row=None, run=None,
+          analysis=None):
     """One analysed folder, shaped the way `mtx scan` shapes them."""
     folder = os.path.join(root, artist, album, title)
     os.makedirs(folder, exist_ok=True)
+    doc = {"file": {"sha256": title}}
+    doc.update(analysis or {})
     with open(os.path.join(folder, "analysis.json"), "w", encoding="utf-8") as fh:
-        json.dump({"file": {"sha256": title}}, fh)
+        json.dump(doc, fh)
     with open(os.path.join(folder, "corpus_row.json"), "w", encoding="utf-8") as fh:
         json.dump(row or {"LUFS-I": -9.0, "Title": title}, fh)
     with open(os.path.join(folder, "mtx_source.json"), "w", encoding="utf-8") as fh:
@@ -230,3 +233,119 @@ def test_the_report_survives_being_written_as_json(tmp_path):
     doc = {"facts": rep.facts, "findings": [f.as_dict() for f in rep.findings]}
     json.dumps(doc)             # a report that cannot be saved is not a report
     assert doc["facts"]["tracks"] == 3
+
+
+# --- the deep pass -----------------------------------------------------------
+#
+# `--deep` reads the analysis rather than the summaries, and every test above
+# writes an analysis with no lyrics in it -- so the deep checks short-circuited
+# on `available` and none of the code past that line was ever executed by a
+# test.  It was also never executed against the corpus, because the one shape
+# it read was wrong and the run died on the first track.  A crash in a mode
+# nobody runs looks exactly like a mode nobody runs.
+
+
+def lyric_analysis(text="a line\nanother line", *, source="transcript",
+                   lines=2, characters=20, **over):
+    """A lyrics block shaped the way `mtx.metrics.lyrics` really writes one.
+
+    The counts are bare integers.  That is the whole point of this fixture:
+    the audit read them as `{"count": n}`, which nothing has ever emitted.
+    """
+    doc = {"lyrics": {"available": True, "source": source, "text": text,
+                      "statistics": {"lines": lines, "characters": characters,
+                                     "words": len(text.split())}}}
+    doc["lyrics"].update(over)
+    return doc
+
+
+def test_the_deep_pass_survives_a_real_statistics_block(tmp_path):
+    """The regression: `--deep` died before it checked a single track."""
+    root = str(tmp_path)
+    track(root, "Real Artist", "The Album", "t0", online=enriched(),
+          analysis=lyric_analysis())
+    identity_file(root)
+
+    rep = audit.run(root, deep=True)
+
+    assert not [f for f in rep.findings if f.check == "audit.crashed"]
+    assert len(find(rep, "lyrics.credit_not_lyric").hits) == 0
+
+
+def test_a_songwriter_credit_read_as_a_lyric_is_caught(tmp_path):
+    """Two lines and 40 characters under `file:tag` is a credit, not a song."""
+    root = str(tmp_path)
+    track(root, "Real Artist", "The Album", "t0", online=enriched(),
+          analysis=lyric_analysis("Some Person", source="file:tag",
+                                  lines=1, characters=11))
+    identity_file(root)
+
+    rep = audit.run(root, deep=True)
+
+    assert len(find(rep, "lyrics.credit_not_lyric").hits) == 1
+
+
+def test_a_real_tag_lyric_is_not_mistaken_for_a_credit(tmp_path):
+    """167 tracks in this corpus carry a genuine sheet; none may be flagged."""
+    root = str(tmp_path)
+    track(root, "Real Artist", "The Album", "t0", online=enriched(),
+          analysis=lyric_analysis(source="file:tag", lines=38,
+                                  characters=1467))
+    identity_file(root)
+
+    rep = audit.run(root, deep=True)
+
+    assert len(find(rep, "lyrics.credit_not_lyric").hits) == 0
+
+
+def test_a_failed_transcription_is_told_apart_from_an_absent_one(tmp_path):
+    """The check that a clean audit needed and did not have.
+
+    78 tracks had died with a CUDA out-of-memory part way through decoding.
+    A failure writes nothing, so each one looked exactly like a track nobody
+    had asked to transcribe -- and both landed in the same `info` finding.
+    """
+    root = str(tmp_path)
+    track(root, "Real Artist", "The Album", "broke", online=enriched(),
+          analysis={"lyrics": {"available": False, "transcript": {
+              "available": False,
+              "reason": "cuda: RuntimeError('CUDA failed with error out of "
+                        "memory')"}}})
+    track(root, "Real Artist", "The Album", "never", online=enriched(),
+          analysis={"lyrics": {"available": False, "transcript": {
+              "available": False,
+              "reason": "not requested; pass --transcribe to run one"}}})
+    identity_file(root)
+
+    rep = audit.run(root, deep=True)
+
+    assert len(find(rep, "lyrics.transcript_failed").hits) == 1
+    assert len(find(rep, "lyrics.absent").hits) == 1
+    assert find(rep, "lyrics.transcript_failed").severity == "warn", \
+        "a broken run is not an observation about the music"
+
+
+def test_the_deep_pass_reads_lyrics_that_live_in_a_part(tmp_path):
+    """The audit must read the document, not the index that stands in for it."""
+    from mtx.split import write_analysis                # noqa: PLC0415
+
+    root = str(tmp_path)
+    folder = track(root, "Real Artist", "The Album", "t0", online=enriched())
+    identity_file(root)
+    doc = dict(lyric_analysis(source="file:tag", lines=1, characters=11))
+    doc["file"] = {"sha256": "t0"}
+    doc["lyrics"]["text"] = "Some Person"
+    doc["padding"] = {"timeline": [round(i * 0.01, 4) for i in range(4000)]}
+    doc["lyrics"]["words"] = [{"word": f"w{i}", "start_s": i * 0.4}
+                              for i in range(2000)]
+    write_analysis(doc, folder, max_bytes=8192)
+
+    index = json.load(open(os.path.join(folder, "analysis.json"),
+                           encoding="utf-8"))
+    assert index["lyrics"].get("mtx_moved"), \
+        "this test is meaningless unless lyrics really was moved to a part"
+
+    rep = audit.run(root, deep=True)
+
+    assert len(find(rep, "lyrics.credit_not_lyric").hits) == 1, \
+        "reading the bare index would have seen a moved marker and no lyric"

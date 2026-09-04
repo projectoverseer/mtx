@@ -55,6 +55,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Reading the log as UTF-8 only helps if the console can render what comes
+# back; without this the names arrive correct and print as question marks.
+try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
+
 # One line per item, from every mtx tool that reports progress:
 #   [transcribe] [453/1321] ok: Drake\ICEMAN [E]\01. Make Them Cry -- 945 words
 #   [scan] [12/40] 03. Whisper My Name.flac
@@ -88,8 +92,18 @@ function Get-JobProcess {
     param([string]$Tool)
     if (-not $Tool) { return $null }
     try {
+        # Match the script being run, not the word anywhere on the command
+        # line: a bare "*transcribe*" also matches `pytest
+        # tests/test_transcribe_fallback.py`, and the watch then reports that
+        # process's age as the job's elapsed time -- which is how a running
+        # job appeared to get younger between two refreshes.
+        $exact = "*$Tool.py*"
+        $module = "*mtx*$Tool*"
         return Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction Stop |
-            Where-Object { $_.CommandLine -and $_.CommandLine -like "*$Tool*" } |
+            Where-Object {
+                $_.CommandLine -and $_.CommandLine -notlike '*pytest*' -and
+                ($_.CommandLine -like $exact -or $_.CommandLine -like $module)
+            } |
             Sort-Object CreationDate |
             Select-Object -First 1
     } catch {
@@ -123,8 +137,12 @@ function Read-Progress {
     param([string]$Path)
 
     # -ReadCount 0 reads the file in one gulp, which matters when this runs
-    # every ten seconds against a log that grows all night.
-    $lines = Get-Content -LiteralPath $Path -ReadCount 0 -ErrorAction Stop
+    # every ten seconds against a log that grows all night.  -Encoding UTF8 is
+    # not optional: PowerShell 5.1 otherwise decodes as the ANSI code page and
+    # turns every non-Latin name in the corpus into mojibake -- an artist
+    # called Den reads as A-tilde-e-n, which looks like corrupt data rather
+    # than a display bug and sends you looking for the wrong problem.
+    $lines = Get-Content -LiteralPath $Path -ReadCount 0 -Encoding UTF8 -ErrorAction Stop
 
     $counts = [ordered]@{ ok = 0; thin = 0; skip = 0; fail = 0; error = 0 }
     $tool = ''; $i = 0; $n = 0
@@ -204,8 +222,17 @@ function Write-Snapshot {
     if ($elapsed -gt 0 -and $worked -gt 0) { $rate = $worked / $elapsed }
 
     $left = $p.Total - $p.Index
+    # Not every remaining folder costs anything.  A resume pass walks the whole
+    # corpus and skips almost all of it -- 997 folders left, of which perhaps
+    # 60 need work -- so charging every one of them the full per-track rate
+    # gives an ETA of days for a job that finishes within the hour.  Scale the
+    # remainder by the share of folders that have actually cost time so far,
+    # which needs no knowledge of what is coming and self-corrects as it goes.
+    $share = 1.0
+    if ($p.Index -gt 0) { $share = $worked / [double]$p.Index }
+    $expected = $left * $share
     $eta = -1.0
-    if ($rate -gt 0) { $eta = $left / $rate }
+    if ($rate -gt 0) { $eta = $expected / $rate }
 
     Write-Host ''
     Write-Host ('  mtx {0}' -f $p.Tool) -NoNewline -ForegroundColor White
@@ -238,8 +265,14 @@ function Write-Snapshot {
         Write-Host ('  rate     {0,6:0.0} / min' -f ($rate * 60))
         Write-Host ('  elapsed  {0}' -f (Format-Span $elapsed))
         if ($eta -ge 0) {
-            Write-Host ('  left     {0}   ({1} to go, done about {2:HH:mm} {3})' -f
-                (Format-Span $eta), $left, $now.AddSeconds($eta),
+            $note = "$left to go"
+            # Say so when most of what is left is a walk rather than work,
+            # otherwise the ETA looks like it disagrees with the counter.
+            if ($share -lt 0.9 -and $worked -gt 0) {
+                $note = ('{0} to go, ~{1:0} needing work' -f $left, $expected)
+            }
+            Write-Host ('  left     {0}   ({1}, done about {2:HH:mm} {3})' -f
+                (Format-Span $eta), $note, $now.AddSeconds($eta),
                 $now.AddSeconds($eta).ToString('ddd'))
         }
     }
