@@ -20,10 +20,19 @@ python tools/audit.py "E:/Music/_mtx_out" --notion   # and the live tables
 python tools/audit.py "E:/Music/_mtx_out" --deep     # + every analysis.json
 ```
 
-Twenty-five named checks. Each carries a severity, a count, the offending
+Twenty-eight named checks. Each carries a severity, a count, the offending
 rows, and what to do about it. It exits non-zero on an `error`, which is how
 `tools/pipeline.py` gates the push: a wrong row is worse than a missing one,
 because the missing one gets noticed.
+
+`--deep` is worth running weekly, and worth distrusting until it has run
+once: it read `lyrics.statistics.lines` as `{"count": n}` when it is a bare
+`int`, so every `--deep` run died on the first track from the day it was
+written until 2026-09-04. No test caught it, because every fixture wrote an
+analysis with no lyrics in it and the deep checks short-circuited before
+reaching the line that crashed. A crash in a mode nobody runs looks exactly
+like a mode nobody runs. Its first completed run found 67 tracks whose
+"lyric" is a songwriter credit.
 
 It writes nothing. An audit that repairs things cannot be trusted to report
 honestly on the next run.
@@ -42,9 +51,23 @@ of them:
 | 63 of 80 sampled lyrics being songwriter credits | `source: "file:tag"` |
 | `best of 2016` filed as a genre | a genre |
 | 264 artist values for 55 artists | a categorical column |
+| 78 tracks killed by an out-of-memory mid-decode | an analysis byte-identical to one nobody asked to transcribe |
+| 95 tracks re-transcribing an identical transcript every run, forever | a fresh `ok` in the log, every time |
 
 That is the failure mode that matters here. The corpus is the evidence base.
 Evidence that is confidently wrong is worse than evidence that is missing.
+
+**And a check can be wrong in the same way.** The obvious next check after
+finding a hallucinated, endlessly-repeating transcript is a repetition
+threshold. Measured against the corpus first, it turns out the most
+repetitive transcript here -- Daft Punk's *Around the World*, a distinct-word
+ratio of 0.017 -- is completely correct; the song repeats one phrase 144
+times. That check would have flagged the most accurate transcriptions in the
+corpus, and flagged them for being what a hit chorus is. What separates
+cleanly is words per line: a median of 7.9, p99 of 16.0, and a tail to 86.5
+where whisper returned four segments for a whole song. `lyrics.line_structure`
+measures that instead, at `info`, because the words are still right and only
+the per-line figures are not.
 
 ---
 

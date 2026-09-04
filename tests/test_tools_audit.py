@@ -349,3 +349,47 @@ def test_the_deep_pass_reads_lyrics_that_live_in_a_part(tmp_path):
 
     assert len(find(rep, "lyrics.credit_not_lyric").hits) == 1, \
         "reading the bare index would have seen a moved marker and no lyric"
+
+
+def test_a_transcript_of_paragraphs_is_flagged(tmp_path):
+    """346 words over 4 lines: the words are fine, the line structure is not."""
+    root = str(tmp_path)
+    track(root, "Real Artist", "The Album", "t0", online=enriched(),
+          analysis=lyric_analysis("a " * 346, lines=4, characters=700))
+    identity_file(root)
+
+    rep = audit.run(root, deep=True)
+
+    hit = find(rep, "lyrics.line_structure").hits
+    assert len(hit) == 1 and hit[0]["words_per_line"] > 20
+
+
+def test_a_repetitive_song_is_not_flagged(tmp_path):
+    """`Around the World` repeats one phrase 144 times and is transcribed right.
+
+    The check must key on segmentation, never on repetition: a repetition
+    threshold would flag the most accurate transcript in the corpus, and flag
+    it for being exactly what a hit chorus is.
+    """
+    root = str(tmp_path)
+    text = "around the world " * 144
+    track(root, "Real Artist", "The Album", "t0", online=enriched(),
+          analysis=lyric_analysis(text, lines=72, characters=len(text)))
+    identity_file(root)
+
+    rep = audit.run(root, deep=True)
+
+    assert find(rep, "lyrics.line_structure").hits == []
+
+
+def test_a_tag_lyric_is_not_judged_on_line_length(tmp_path):
+    """A sheet is laid out by whoever typed it; that is not a defect."""
+    root = str(tmp_path)
+    track(root, "Real Artist", "The Album", "t0", online=enriched(),
+          analysis=lyric_analysis("a " * 346, source="file:tag", lines=4,
+                                  characters=700))
+    identity_file(root)
+
+    rep = audit.run(root, deep=True)
+
+    assert find(rep, "lyrics.line_structure").hits == []

@@ -564,6 +564,20 @@ def check_measurement(rep: Report, tracks: list[dict[str, Any]]) -> None:
     rep.fact("analysis_tool_versions", dict(tool_seen))
 
 
+# A sung line is a phrase.  Across 1,093 transcribed tracks the median is 7.9
+# words per line, p95 is 11.4 and p99 is 16.0 -- then a tail out to 86.5 where
+# whisper returned four segments for a whole song instead of one per phrase.
+# 20 sits above p99 and below every track in that tail but one, and it flags
+# 6 tracks rather than the 13 a p99 cut would.
+#
+# It deliberately does *not* measure repetition.  The most repetitive
+# transcript in this corpus -- Daft Punk's "Around the World", a distinct-word
+# ratio of 0.017 -- is completely correct: the song repeats one phrase 144
+# times.  A repetition threshold would flag the most accurate transcriptions
+# there are, and would flag them for being what a hit chorus is.
+WORDS_PER_LINE_MAX = 20.0
+
+
 def _count(stats: dict[str, Any], key: str) -> int | None:
     """Read a count that is written as a bare number.
 
@@ -614,6 +628,16 @@ def check_deep(rep: Report, tracks: list[dict[str, Any]]) -> None:
         "analysis.warnings", "info",
         "the analysis recorded a warning about itself",
         "read the warnings block; most are benign, none are invented")
+    segments = rep.check(
+        "lyrics.line_structure", "info",
+        f"more than {WORDS_PER_LINE_MAX:.0f} words per line, against a corpus "
+        "median of 8.  The words are still the words -- what is unusable is "
+        "the line structure, because whisper returned a handful of long "
+        "segments instead of one per sung phrase.  Every line-based "
+        "measurement on this track is measuring paragraphs: rhyme scheme, "
+        "syllables per line, repeated-line share, readability",
+        "read the word counts and the text on these tracks, not the "
+        "per-line figures; nothing else about them is affected")
     broke = rep.check(
         "lyrics.transcript_failed", "warn",
         "transcription was attempted on this track and failed, so the gap is "
@@ -657,6 +681,11 @@ def check_deep(rep: Report, tracks: list[dict[str, Any]]) -> None:
             continue
         stats = lyrics.get("statistics") or {}
         lines, chars = _count(stats, "lines"), _count(stats, "characters")
+        words = _count(stats, "words")
+        if (lyrics.get("source") == "transcript" and words and lines
+                and words / lines > WORDS_PER_LINE_MAX):
+            segments.hit(t["rel"], words=words, lines=lines,
+                         words_per_line=round(words / lines, 1))
         if (lyrics.get("source") == "file:tag"
                 and lines is not None and lines <= 2
                 and chars is not None and chars < 200):
