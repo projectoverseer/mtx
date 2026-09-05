@@ -149,6 +149,8 @@ function Read-Progress {
     $recent = New-Object System.Collections.ArrayList
     $failed = New-Object System.Collections.ArrayList
     $finished = $null
+    $passes = 0
+    $carried = [ordered]@{}
 
     foreach ($line in $lines) {
         $m = [regex]::Match($line, $ProgressLine)
@@ -159,7 +161,19 @@ function Read-Progress {
             continue
         }
         $tool = $m.Groups['tool'].Value
-        $i = [int]$m.Groups['i'].Value
+        $next = [int]$m.Groups['i'].Value
+        # A resumed job appended to the same log starts counting from one
+        # again.  Without noticing that, the earlier pass's work is charged to
+        # this process's elapsed time -- 36 tracks over 32 seconds, an ETA of
+        # nine seconds for a job with 291 folders to walk.  Everything before
+        # the reset belongs to a run that has already ended.
+        if ($next -lt $i) {
+            $passes++
+            foreach ($k in $counts.Keys) { $carried[$k] = $counts[$k] }
+            $counts = [ordered]@{ ok = 0; thin = 0; skip = 0; fail = 0; error = 0 }
+            $recent.Clear(); $failed.Clear(); $finished = $null
+        }
+        $i = $next
         $n = [int]$m.Groups['n'].Value
         $status = $m.Groups['status'].Value
         if ($status) {
@@ -176,6 +190,7 @@ function Read-Progress {
     return [pscustomobject]@{
         Tool = $tool; Index = $i; Total = $n; Counts = $counts
         Recent = $recent; Failed = $failed; Finished = $finished
+        Passes = $passes; Carried = $carried
         Modified = (Get-Item -LiteralPath $Path).LastWriteTime
     }
 }
@@ -257,10 +272,24 @@ function Write-Snapshot {
         Write-Host ('{0} {1}   ' -f $k, $p.Counts[$k]) -NoNewline -ForegroundColor $c
     }
     Write-Host ''
+    if ($p.Passes -gt 0) {
+        $was = ($p.Carried.Keys | Where-Object { $p.Carried[$_] } |
+                ForEach-Object { '{0} {1}' -f $_, $p.Carried[$_] }) -join ', '
+        Write-Host ('  (resumed; the previous pass in this log did {0})' -f $was) `
+            -ForegroundColor DarkGray
+    }
     Write-Host ''
 
     if ($p.Finished) {
         Write-Host ('  {0}' -f $p.Finished) -ForegroundColor Green
+    } elseif (-not $proc) {
+        # Stopped part way.  An ETA here would be a projection for a process
+        # that no longer exists -- the number that made a job killed fifteen
+        # hours ago read as one due to finish in a quarter of an hour.
+        Write-Host ('  stopped at {0} of {1}, {2} still to do' -f
+            $p.Index, $p.Total, $left) -ForegroundColor Yellow
+        Write-Host '  re-run the same command: finished tracks are skipped' `
+            -ForegroundColor DarkGray
     } else {
         Write-Host ('  rate     {0,6:0.0} / min' -f ($rate * 60))
         Write-Host ('  elapsed  {0}' -f (Format-Span $elapsed))
@@ -281,8 +310,14 @@ function Write-Snapshot {
     # difference: the log stops growing while the process is still there.
     $quiet = ($now - $p.Modified).TotalSeconds
     $line = '  last log  {0} ago' -f (Format-Span $quiet)
-    if (-not $p.Finished -and $quiet -gt 600) {
-        Write-Host ($line + '   <- nothing for ten minutes; it may be stuck') -ForegroundColor Red
+    if (-not $p.Finished -and -not $proc) {
+        Write-Host ($line + '   <- and the process is gone') -ForegroundColor Yellow
+    } elseif (-not $p.Finished -and $quiet -gt 600) {
+        # Quote the measured silence rather than the threshold: "nothing for
+        # ten minutes" under a gap of fifteen hours is worse than no warning,
+        # because it makes a dead job look like a slow one.
+        Write-Host ($line + ('   <- silent for {0}; it may be stuck' -f
+            (Format-Span $quiet))) -ForegroundColor Red
     } elseif (-not $p.Finished -and $quiet -gt 180) {
         Write-Host $line -ForegroundColor Yellow
     } else {
