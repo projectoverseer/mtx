@@ -92,13 +92,26 @@ class Notion:
                     return json.loads(resp.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", "replace")
-                # 429 is expected under load and 5xx is Notion having a moment;
-                # both are worth waiting out.  4xx otherwise is our own bug and
-                # retrying it just makes the same mistake more slowly.
+                # 429 is expected under load and 5xx is Notion having a
+                # moment; both are worth waiting out.  4xx otherwise is our own
+                # bug and retrying it just makes the same mistake more slowly.
+                #
+                # 409 `conflict_error` is the exception that proves the rule.
+                # It is not a bad request: it is Notion refusing a write
+                # because something else touched the same page or database
+                # first, and the same payload succeeds on the next attempt.
+                # The evidence is a matched pair of runs -- 13 pages lost at
+                # eight workers, none at three, identical bodies.  Failing
+                # those is worse than slow: the row silently keeps yesterday's
+                # numbers while the run reports a count that looks like a
+                # rounding error.
                 if exc.code == 429:
                     delay = float(exc.headers.get("Retry-After") or 1.0)
-                elif 500 <= exc.code < 600:
-                    delay = min(2 ** attempt, 30) + random.random()
+                elif exc.code == 409 or 500 <= exc.code < 600:
+                    # Jittered, because the writers that collided are the ones
+                    # about to retry, and an unjittered backoff walks them
+                    # straight into each other again.
+                    delay = min(2 ** attempt, 30) * (0.5 + random.random())
                 else:
                     raise NotionError(exc.code, body, path) from None
                 if attempt == MAX_ATTEMPTS:

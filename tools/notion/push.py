@@ -22,6 +22,7 @@ token.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -177,6 +178,67 @@ def ensure_databases(api: Notion, parent: str, state: State,
     state.data["databases"] = {"tracks": tracks, "observations": observations}
     state.save()
     return tracks, observations
+
+
+# Files whose content ends up on a track's page.  `mtx_source.json` is in the
+# list because it carries the schema and profile the page reports.
+STAMPED = ("analysis.json", "online.json", "corpus_row.json", "mtx_source.json")
+# Artefacts shared by every page: a change in any of them changes every row.
+SHARED = ("cohort.json", "outcome.json", "artists.json")
+
+
+def folder_stamp(folder: str) -> str:
+    """A cheap fingerprint of everything this folder contributes to its page.
+
+    `stat`, never a read: deciding what to push by parsing 1,321 analyses
+    would cost nine minutes before the first page is written, which is the
+    reason the skip check looked only at the state file in the first place.
+    Size and modification time together are enough to notice an amendment --
+    and an amendment is exactly what a transcription pass is.
+    """
+    parts = []
+    for name in STAMPED:
+        try:
+            st = os.stat(os.path.join(folder, name))
+            parts.append(f"{st.st_mtime_ns}.{st.st_size}")
+        except OSError:
+            parts.append("-")
+    return ",".join(parts)
+
+
+def shared_stamp(root: str) -> str:
+    """A fingerprint of the artefacts every page reads.
+
+    Hashed by content rather than by mtime: `cohort.json` is rewritten on
+    every pipeline run whether or not a single number in it moved, and
+    stamping it by mtime would force a full 1,321-page re-push daily for
+    nothing.
+    """
+    h = hashlib.sha256()
+    for name in SHARED:
+        try:
+            with open(os.path.join(root, name), "rb") as fh:
+                h.update(hashlib.sha256(fh.read()).digest())
+        except OSError:
+            h.update(b"-")
+    return h.hexdigest()[:16]
+
+
+def needs_push(key: str, stamp: str, tracks: dict, stamps: dict,
+               force: bool = False) -> bool:
+    """Should this track be sent?  Three reasons, and the third was missing.
+
+    Never pushed; pushed but the page is gone from the state; or pushed with
+    content that has since changed.  Only the first two were checked, so an
+    amended analysis reported `already present` for ever -- which is how a
+    day's worth of transcripts, repaired lyrics and fresh percentiles came to
+    sit on disk while the pipeline said every stage was clean.
+    """
+    if force:
+        return True
+    if not tracks.get(key):
+        return True
+    return stamps.get(key) != stamp
 
 
 def source_sha(folder: str) -> str | None:
@@ -394,13 +456,34 @@ def _run(args) -> int:
         f"traits {TRAIT_VERSION} | {args.workers} workers | "
         f"{'DRY RUN' if args.dry_run else 'live'}")
 
-    # Decide what to skip from `mtx_source.json` (895 bytes), never by loading
-    # the analysis.  Reading all 1,321 documents up front to look at one field
-    # would cost nine minutes before the first page is written and hold every
-    # parsed document in memory at once; the worker loads its own.
-    todo = [f for f in folders
-            if args.force or not state.data["tracks"].get(source_sha(f) or f)]
+    # Decide what to skip from `mtx_source.json` (895 bytes) and a handful of
+    # `stat` calls, never by loading the analysis.  Reading all 1,321
+    # documents up front to look at one field would cost nine minutes before
+    # the first page is written and hold every parsed document in memory at
+    # once; the worker loads its own.
+    #
+    # The state used to record only *that* a sha had been pushed.  So an
+    # amended analysis -- 1,306 new transcripts, 66 repaired lyrics, a fresh
+    # set of cohort percentiles -- was invisible to it: `0 pushed, 1321
+    # already present`, a clean exit, and 25 columns that stayed empty while
+    # every stage reported success.  What it records now is what was pushed,
+    # not merely that something was.
+    shared = shared_stamp(args.root)
+    stamps = state.data.setdefault("stamps", {})
+    want: dict[str, str] = {}
+    todo = []
+    for f in folders:
+        key = source_sha(f) or f
+        want[key] = f"{shared}|{folder_stamp(f)}"
+        if needs_push(key, want[key], state.data["tracks"], stamps,
+                      args.force):
+            todo.append(f)
     skipped = len(folders) - len(todo)
+    changed = sum(1 for f in folders
+                  if (source_sha(f) or f) in stamps
+                  and stamps.get(source_sha(f) or f) != want.get(source_sha(f) or f))
+    if changed and not args.force:
+        log(f"{changed} track(s) changed since their last push")
 
     counts = {"pushed": 0, "failed": 0, "obs": 0}
     guard = threading.Lock()
@@ -422,8 +505,15 @@ def _run(args) -> int:
                     "observations": observations_for(doc),
                 })
                 return sha, "dry-run", 0, None
+            # Always hand over the page this sha is already on.  `push_track`
+            # creates when it gets None, and passing None only outside
+            # `--force` was safe *only* while `todo` could not contain a sha
+            # that had been pushed before.  It can now -- that is the point of
+            # the stamp -- so a changed track would have arrived here with no
+            # page id and been published a second time, once per amended
+            # analysis, silently, alongside the original.
             page_id = push_track(api, tracks_db, doc,
-                                 (state.data["tracks"] or {}).get(sha) if args.force else None,
+                                 (state.data["tracks"] or {}).get(sha),
                                  not args.no_body)
             rows = 0
             if not args.skip_observations:
@@ -453,6 +543,11 @@ def _run(args) -> int:
                             log(f"  {err}")
                         else:
                             state.data["tracks"][sha] = page_id
+                            # Only on success: a failed page must be retried,
+                            # and a stamp written regardless would mark it
+                            # current for ever.
+                            if sha in want:
+                                stamps[sha] = want[sha]
                             counts["pushed"] += 1
                             counts["obs"] += rows
                         if n % 25 == 0 or n == len(todo):
