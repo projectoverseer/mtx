@@ -162,12 +162,18 @@ function Read-Progress {
         }
         $tool = $m.Groups['tool'].Value
         $next = [int]$m.Groups['i'].Value
-        # A resumed job appended to the same log starts counting from one
-        # again.  Without noticing that, the earlier pass's work is charged to
-        # this process's elapsed time -- 36 tracks over 32 seconds, an ETA of
-        # nine seconds for a job with 291 folders to walk.  Everything before
-        # the reset belongs to a run that has already ended.
-        if ($next -lt $i) {
+        # Two ways to tell that what follows belongs to a later run than what
+        # came before, both of which have to reset the tally:
+        #
+        #   * the index goes backwards -- a resume that started from one;
+        #   * a `done:` line already went past -- a resume that picked up
+        #     where the last one stopped, so the index never drops.
+        #
+        # Missing the second one had the watch reporting "finished", with the
+        # previous run's summary, while the GPU sat at 92% working on the new
+        # one.  A stale completion notice is worse than none: it is the answer
+        # someone stops reading at.
+        if ($next -lt $i -or $finished) {
             $passes++
             foreach ($k in $counts.Keys) { $carried[$k] = $counts[$k] }
             $counts = [ordered]@{ ok = 0; thin = 0; skip = 0; fail = 0; error = 0 }

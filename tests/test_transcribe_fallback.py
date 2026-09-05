@@ -172,3 +172,27 @@ def test_an_out_of_memory_lands_on_the_second_gpu_rung(stub, monkeypatch):
     assert got["device"] == "cuda"
     assert got["compute_type"] == "int8_float16"
     assert "cpu/int8" not in stub.made, "the CPU pass was not needed"
+
+
+def test_a_padded_model_path_is_still_found(stub, monkeypatch):
+    """A stray space in an env var must not fail every track on every device.
+
+    `set VAR=path && cmd` in cmd.exe puts the space before the `&&` into the
+    value, and a hand-written `.env` line does the same.  The path then looks
+    correct in every log line it appears in -- the space sits inside the
+    closing quote -- and ctranslate2 reports `Unable to open file
+    'model.bin'`, which reads as a corrupt download rather than a typo.  It
+    cost 43 tracks on a run that was otherwise failing none.
+    """
+    monkeypatch.setenv("MTX_WHISPER_MODEL", "  /models/faster-whisper-small 	")
+    seen = {}
+
+    class Recording(_StubModel):
+        def __init__(self, name, device, compute_type):
+            seen["name"] = name
+            super().__init__(name, device, compute_type)
+
+    sys.modules["faster_whisper"].WhisperModel = Recording
+    m_lyrics.transcribe("nowhere.wav", Collector())
+
+    assert seen["name"] == "/models/faster-whisper-small"

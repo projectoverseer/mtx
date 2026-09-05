@@ -422,7 +422,14 @@ def transcribe(vocal_path: str, collector: Collector) -> dict[str, Any]:
     # network dependency in the middle of an otherwise offline analysis.  On a
     # connection that resets -- as this one does -- a local directory is the
     # difference between a corpus that can be transcribed and one that cannot.
-    name = str(os.environ.get("MTX_WHISPER_MODEL") or P.get("model") or "base")
+    # `.strip()` is not cosmetic.  `set VAR=path && cmd` in cmd.exe puts the
+    # space before the `&&` into the value, and a `.env` file written by hand
+    # does the same at the end of a line.  The result is a path that looks
+    # right in every log line it appears in and fails on all three devices
+    # with `Unable to open file 'model.bin'` -- 43 tracks, on a run that
+    # otherwise had a 0% failure rate.
+    name = str(os.environ.get("MTX_WHISPER_MODEL") or P.get("model")
+               or "base").strip()
     # Load *and* decode inside one attempt per device.  A card loads the model
     # happily and then runs out of memory part way through a long track -- 16
     # of the first 486 tracks on a 4 GB card -- so a fallback that only covers

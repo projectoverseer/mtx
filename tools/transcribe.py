@@ -262,7 +262,7 @@ def main() -> int:
     args = ap.parse_args()
 
     P = PARAMS["lyrics"]["transcript"]
-    model = os.environ.get("MTX_WHISPER_MODEL") or P.get("model")
+    model = (os.environ.get("MTX_WHISPER_MODEL") or P.get("model") or "").strip()
     log(f"model {model!r}, device {P.get('device')!r}, vad {P.get('vad')}")
 
     todo = folders(args.root)
