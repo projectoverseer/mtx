@@ -239,3 +239,58 @@ def test_a_bad_request_is_not_retried(monkeypatch):
         api.request("PATCH", "/pages/x", {"properties": {}})
 
     assert calls["n"] == 1, "no retry"
+
+
+# --- the schema sync ---------------------------------------------------------
+
+def test_only_missing_properties_are_sent():
+    """An existing select must not appear in a schema update at all.
+
+    `database_schema()` describes a select as `{"options": []}`, which is what
+    *creating* one needs.  Sent at an existing database, Notion reads the empty
+    list as "these are the options now" and deletes every one -- and deleting
+    an option blanks it on every page holding it.  That ran on every push,
+    wiping all 22 select columns, and hid behind the same run rewriting all
+    1,321 pages and re-creating them on the way through.
+
+    The moment a run wrote only what had changed, the restore covered 13
+    pages: 46 artists gone and 1,005 rows blanked.
+    """
+    live = {"properties": {"Artist": {"type": "select"},
+                           "LUFS-I": {"type": "number"}}}
+    wanted = {"Artist": {"select": {"options": []}},
+              "LUFS-I": {"number": {}},
+              "Lyric language": {"select": {"options": []}}}
+
+    assert push.new_properties(live, wanted) == {
+        "Lyric language": {"select": {"options": []}}}
+
+
+def test_a_database_that_matches_gets_no_update():
+    live = {"properties": {"Artist": {"type": "select"}}}
+
+    assert push.new_properties(live, {"Artist": {"select": {"options": []}}}) == {}
+
+
+def test_a_database_with_no_properties_gets_everything():
+    wanted = {"Artist": {"select": {"options": []}}}
+
+    assert push.new_properties({}, wanted) == wanted
+
+
+def test_the_sync_never_calls_update_when_nothing_is_missing(monkeypatch):
+    """No request at all is the only way to be sure nothing was touched."""
+    calls = []
+
+    class _Api:
+        def request(self, method, path, body=None):
+            return {"properties": {"Artist": {"type": "select"}}}
+
+        def update_database(self, db_id, payload):
+            calls.append(payload)
+
+    added = push.add_new_properties(_Api(), "db",
+                                    {"Artist": {"select": {"options": []}}})
+
+    assert added == []
+    assert calls == [], "an existing schema must produce no write"

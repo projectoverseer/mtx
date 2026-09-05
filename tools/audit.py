@@ -854,7 +854,22 @@ def run(root: str, notion: bool = False, deep: bool = False) -> Report:
     if deep:
         check_deep(rep, tracks)
     if notion:
-        check_notion(rep, root)
+        unreachable = rep.check(
+            "notion.unreachable", "error",
+            "the live tables could not be read, so every check that compares "
+            "the corpus against what is actually published was skipped.  This "
+            "is not a finding about the data: it is the absence of one",
+            "check the network and the token, then re-run; the gate fails "
+            "closed on purpose, because 'could not look' must never be "
+            "reported as 'looked and found nothing wrong'")
+        try:
+            check_notion(rep, root)
+        except Exception as exc:
+            # A DNS blip used to end the run in a raw traceback -- which reads
+            # like corpus corruption, at the exact moment the corpus is fine
+            # and the network is not.  It still exits non-zero, so the
+            # pipeline still refuses to push; it just says which thing broke.
+            unreachable.hit("notion", error=f"{type(exc).__name__}: {exc}"[:160])
     return rep
 
 

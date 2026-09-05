@@ -139,6 +139,41 @@ class Lock:
             self.held = False
 
 
+def new_properties(live: dict, wanted: dict) -> dict:
+    """The properties `wanted` has and the live database does not.
+
+    The whole schema used to be sent on every run, and `database_schema()`
+    describes a select as `{"options": []}` because that is what creating one
+    needs.  Notion reads an explicit empty list as *these are the options now*
+    and deletes the rest -- and deleting an option blanks it on every page
+    holding it.  So each run silently wiped every select column in the
+    database.
+
+    It went unnoticed for as long as it did because each run then rewrote all
+    1,321 pages, which re-created every option on the way through: destroyed
+    and restored inside one run, net zero, invisible.  The moment a run only
+    wrote the pages that had changed, the restore covered 13 pages and 9
+    artists, and 1,005 rows were left with an empty Artist.
+
+    Sending only genuinely new properties keeps what this was for -- a column
+    added to schema.py reaches the live table -- and cannot touch an existing
+    one.
+    """
+    have = set((live.get("properties") or {}))
+    return {name: spec for name, spec in wanted.items() if name not in have}
+
+
+def add_new_properties(api: Notion, db_id: str, wanted: dict) -> list[str]:
+    """Create any property the live database is missing.  Never edit one."""
+    live = api.request("GET", f"/databases/{db_id}")
+    add = new_properties(live, wanted)
+    if add:
+        api.update_database(db_id, add)
+        log(f"  added {len(add)} new propert(y/ies): "
+            f"{', '.join(sorted(add)[:6])}")
+    return sorted(add)
+
+
 def ensure_databases(api: Notion, parent: str, state: State,
                      dry_run: bool) -> tuple[str, str]:
     if dry_run:
@@ -146,13 +181,10 @@ def ensure_databases(api: Notion, parent: str, state: State,
 
     known = state.data.get("databases") or {}
     if known.get("tracks") and known.get("observations"):
-        # Still push the schema.  Skipping this because the ids were already
-        # known meant a property added to schema.py never reached the live
-        # database, and every page then failed with "Could not find property"
-        # -- the run cannot write a column the database has not been told
-        # about.  Adding properties is safe and idempotent; nothing is removed
-        # here (that is what --prune-options is for).
-        api.update_database(known["tracks"], database_schema())
+        # Still push the schema: a property added to schema.py that never
+        # reached the live database makes every page fail with "Could not find
+        # property".  But send only the properties that are actually missing.
+        add_new_properties(api, known["tracks"], database_schema())
         return known["tracks"], known["observations"]
 
     existing = api.find_databases(parent)
@@ -162,7 +194,7 @@ def ensure_databases(api: Notion, parent: str, state: State,
     if tracks:
         # Adding properties to a live database is safe and lets the schema
         # grow without a rebuild; removing them is not, so this only adds.
-        api.update_database(tracks, database_schema())
+        add_new_properties(api, tracks, database_schema())
         log(f"reusing {TRACKS_DB} ({tracks})")
     else:
         tracks = api.create_database(parent, TRACKS_DB, database_schema())["id"]

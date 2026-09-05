@@ -393,3 +393,35 @@ def test_a_tag_lyric_is_not_judged_on_line_length(tmp_path):
     rep = audit.run(root, deep=True)
 
     assert find(rep, "lyrics.line_structure").hits == []
+
+
+def test_an_unreachable_notion_is_a_finding_not_a_traceback(tmp_path, monkeypatch):
+    """A DNS blip must not read like corpus corruption.
+
+    The live checks died in a raw urllib traceback, at the exact moment the
+    corpus was fine and the network was not.  It has to keep failing the gate
+    -- "could not look" must never be published as "looked and found nothing
+    wrong" -- while saying which of the two things actually broke.
+    """
+    root = build(tmp_path)
+    identity_file(root)
+    monkeypatch.setattr(audit, "check_notion",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            OSError("[Errno 11001] getaddrinfo failed")))
+
+    rep = audit.run(root, notion=True)
+
+    hits = find(rep, "notion.unreachable").hits
+    assert len(hits) == 1
+    assert "getaddrinfo" in hits[0]["error"]
+    assert "notion.unreachable" in {f.check for f in rep.errors()},         "the gate must still fail closed"
+
+
+def test_a_reachable_notion_reports_no_such_finding(tmp_path, monkeypatch):
+    root = build(tmp_path)
+    identity_file(root)
+    monkeypatch.setattr(audit, "check_notion", lambda *a, **k: None)
+
+    rep = audit.run(root, notion=True)
+
+    assert find(rep, "notion.unreachable").hits == []
