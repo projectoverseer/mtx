@@ -454,8 +454,24 @@ def lookup(client: Client, local: dict[str, Any]) -> dict[str, Any]:
 
 
 def _esc(text: str) -> str:
-    """Escape the Lucene syntax MusicBrainz search uses."""
-    out = str(text)
-    for ch in '+-&|!(){}[]^"~*?:\\/':
-        out = out.replace(ch, " ")
+    """Escape the Lucene syntax MusicBrainz search uses.
+
+    Every value this escapes is interpolated *inside a quoted phrase*, and
+    inside a phrase Lucene treats its metacharacters as literal text.  Only
+    the quote that would close the phrase early, and the backslash that would
+    escape something else, have to be handled at all.
+
+    Deleting them instead threw away part of the title.  Billie Eilish's
+    `&burn` became `burn`, and the difference is not subtle:
+
+        recording:"&burn" AND artist:"Billie Eilish"  -> score 100
+        recording:"burn"  AND artist:"Billie Eilish"  -> nothing
+
+    So the track came back `no candidate recording` -- no credits, no genre
+    vote, no release date -- from a search that had removed the thing being
+    searched for.  `Don't Start Now` against `Dont Start Now` is the same
+    story and the same result, which is why the apostrophe was never in the
+    strip list; every other punctuation mark was, for no better reason.
+    """
+    out = str(text).replace("\\", "\\\\").replace('"', '\\"')
     return " ".join(out.split())

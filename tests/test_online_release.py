@@ -323,3 +323,42 @@ def test_cohort_reads_the_keys_enrichment_actually_writes(tmp_path):
     assert (got["genre"], got["genre_source"]) == ("rock", "online")
     assert (got["year"], got["year_source"]) == (1994, "online")
     assert got["artist"] == "Nirvana"
+
+
+# --- the search query --------------------------------------------------------
+
+def test_punctuation_survives_into_the_search():
+    """Deleting Lucene metacharacters threw away part of the title.
+
+    Every value is interpolated inside a quoted phrase, and inside a phrase
+    Lucene treats its metacharacters as literal text -- so nothing needed
+    removing.  Measured against the live index:
+
+        recording:"&burn" AND artist:"Billie Eilish"  -> score 100
+        recording:"burn"  AND artist:"Billie Eilish"  -> nothing
+
+    The track came back `no candidate recording` -- no credits, no genre vote,
+    no release date -- from a search that had removed the thing being searched
+    for.
+    """
+    from mtx.online.musicbrainz import _esc
+
+    assert _esc("&burn") == "&burn"
+    assert _esc("AC/DC") == "AC/DC"
+    assert _esc("Don't Start Now") == "Don't Start Now"
+    assert _esc("P!nk") == "P!nk"
+    assert _esc("Blink-182") == "Blink-182"
+
+
+def test_a_quote_cannot_close_the_phrase_early():
+    """The one character that genuinely has to be escaped, and its escape."""
+    from mtx.online.musicbrainz import _esc
+
+    assert _esc('say "hello"') == 'say \\"hello\\"'
+    assert _esc("back" + chr(92) + "slash") == "back" + chr(92) * 2 + "slash"
+
+
+def test_whitespace_is_still_collapsed():
+    from mtx.online.musicbrainz import _esc
+
+    assert _esc("  a   b  ") == "a b"

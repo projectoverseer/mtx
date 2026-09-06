@@ -103,6 +103,25 @@ python tools/pipeline.py --dry-run          # print the commands
 python tools/pipeline.py --transcribe       # see "Lyrics" below
 ```
 
+### The amendment tools
+
+Three jobs add one block to analyses that already exist, rather than
+re-measuring them. That distinction is the whole reason they exist: `mtx scan
+--force` re-runs the full battery including demucs, eleven minutes a track,
+**240 hours** for this corpus. Each of these costs seconds a track.
+
+```
+python tools/transcribe.py <root>     # lyrics, ~2 s/track on the GPU
+python tools/embed.py <root>          # a 768-d MERT vector, ~2 s/track
+python tools/charts.py <root> peaks.csv   # chart outcomes from a CSV
+```
+
+Every one records what it changed under `run.amendments`, because editing an
+analysis in place breaks the reproducibility promise unless the edit is on the
+record. All three skip work already done, and a failure writes a reason rather
+than nothing -- an analysis that failed and one nobody asked about used to be
+byte-identical, which is how 78 broken tracks passed a clean audit.
+
 ### Watching one while it runs
 
 The long stages print one line per track, which is a fine record and a poor
@@ -335,7 +354,7 @@ The sidecar is purely for your own material.
 
 ---
 
-### 5. Chart outcomes — Billboard peak, weeks, certifications. *Only you can supply these.*
+### 5. Chart outcomes — Billboard peak, weeks, certifications. *The path is built; the data is yours.*
 
 **What it is.** `Billboard peak`, `Weeks on chart` and `Certification` are
 already Notion columns, read from `declared.outcome.*`. Nothing fills them.
@@ -418,6 +437,36 @@ half of a scan, and the reason a full scan takes ~11 minutes a track.
    been pasted into a chat window.
 
 ---
+
+## What is still genuinely open
+
+**Chart outcomes.** `tools/charts.py` loads them over the whole corpus from
+one CSV, `declare.py` now offers the keys, and `schema.py` has always read
+them. Nothing feeds it, because no free database carries a chart position:
+MusicBrainz does not model charts, Discogs is about pressings, Last.fm is
+about listening. Until it is fed, the only outcome column is a Last.fm play
+count -- scrobbling listeners, which is a proxy for one kind of enthusiast and
+is biased by era, genre and platform in ways nothing here corrects for. A 1998
+house record and a 2024 pop single are not comparable on it. This is the
+weakest link in the evidence chain, and it is the one thing a tool cannot fix.
+
+```
+python tools/charts.py "E:/Music/_mtx_out" --template peaks.csv
+```
+
+**`declared.json` for your own mixes.** Two fields, `cohort.genre` and
+`cohort.year`, are the difference between "your PSR is 4.7 dB" and "your PSR
+is 4.7 dB, which is the 12th percentile for club house since 2022".
+
+**`harmony.loop`.** Never fires: the threshold is 0.75 and the best candidate
+across the corpus scores 0.15, because the chord detector's per-bar output is
+too noisy for an exact set match. The 4-bar period *is* correctly the highest
+scorer on `Around the World`, so the measurement works and the threshold does
+not. Recalibrating it means choosing a number against evidence rather than
+lowering one until it fires, which is a separate piece of work.
+
+**Two tracks MusicBrainz has never catalogued**, and one Last.fm title
+(`u + me = <3`) spelt with a character no query reproduces.
 
 ## Standing rule
 
