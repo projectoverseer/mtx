@@ -757,6 +757,43 @@ def check_hygiene(rep: Report, tracks: list[dict[str, Any]]) -> None:
 # --------------------------------------------------------------------------
 
 
+def column_coverage(pages: list[dict[str, Any]]) -> dict[str, Any]:
+    """How many rows carry a value for each column, by Notion property type.
+
+    Separated from the check so it can be tested without a live table: the
+    bug it exists to prevent was invisible from the outside.  A checkbox is
+    never blank, so the counting loop skipped it -- and skipping the count
+    left it at zero, which is exactly what an empty column looks like.  Every
+    checkbox in the table was reported dead on every run, eleven of sixteen
+    findings, and a warning list that is mostly noise stops being read.
+
+    Checkboxes are therefore always counted as filled, and counted separately
+    for how often they are ticked, so `notion.constant_checkbox` can report
+    the case `dead_column` structurally cannot see.
+    """
+    filled: dict[str, int] = collections.Counter()
+    ticked: dict[str, int] = collections.Counter()
+    checkboxes: set[str] = set()
+    seen: set[str] = set()
+    for page in pages:
+        for name, prop in (page.get("properties") or {}).items():
+            seen.add(name)
+            kind = prop.get("type")
+            value = prop.get(kind)
+            if kind in ("title", "rich_text"):
+                value = value or None
+            if kind == "checkbox":
+                checkboxes.add(name)
+                filled[name] += 1
+                if value:
+                    ticked[name] += 1
+                continue
+            if value not in (None, [], "", {}):
+                filled[name] += 1
+    return {"filled": filled, "ticked": ticked,
+            "checkboxes": checkboxes, "seen": seen}
+
+
 def check_notion(rep: Report, root: str) -> None:
     """What actually landed, as opposed to what was sent.
 
@@ -809,6 +846,16 @@ def check_notion(rep: Report, root: str) -> None:
         "check the property's source path against a real analysis.json; if "
         "the path is right, the column is waiting on data that does not "
         "exist yet and can be ignored")
+    constant = rep.check(
+        "notion.constant_checkbox", "info",
+        "a checkbox with the same answer on every row.  A checkbox is never "
+        "blank, so `dead_column` cannot see it, and a box that is false "
+        "everywhere is either a trait no record in this corpus has or a key "
+        "that reads nothing -- which look identical from the table.  It is "
+        "also worth knowing when true everywhere: a column that never varies "
+        "cannot distinguish one record from another",
+        "resolve the property's source against a real analysis.json.  If the "
+        "path is right, this is a fact about the corpus, not a defect")
 
     api = Notion(log=lambda m: None)
     try:
@@ -844,22 +891,15 @@ def check_notion(rep: Report, root: str) -> None:
     # Every property the pages carry, and how many rows have a value for it.
     # A column at zero is either a dead key or a column with no source yet,
     # and the table cannot tell those apart -- which is the point of saying so.
-    filled: dict[str, int] = collections.Counter()
-    seen_props: set[str] = set()
-    for page in pages:
-        for name, prop in (page.get("properties") or {}).items():
-            seen_props.add(name)
-            kind = prop.get("type")
-            value = prop.get(kind)
-            if kind in ("title", "rich_text"):
-                value = value or None
-            if kind == "checkbox":
-                continue            # false is a value, not a blank
-            if value not in (None, [], "", {}):
-                filled[name] += 1
-    for name in sorted(seen_props):
-        if pages and not filled.get(name):
+    cover = column_coverage(pages)
+    for name in sorted(cover["seen"]):
+        if pages and not cover["filled"].get(name):
             dead.hit(name, rows=len(pages))
+    for name in sorted(cover["checkboxes"]):
+        hits = cover["ticked"].get(name, 0)
+        if pages and hits in (0, len(pages)):
+            constant.hit(name, rows=len(pages), ticked=hits)
+    filled = cover["filled"]
 
     rep.fact("notion_rows", len(pages))
     rep.fact("notion_columns_filled", len(filled))
