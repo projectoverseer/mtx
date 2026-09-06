@@ -47,6 +47,8 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "notion"))
 sys.path.insert(0, os.path.join(HERE, "..", "src"))
 
+from env import load_env                          # noqa: E402
+
 import identity                                        # noqa: E402
 from mtx.split import load_analysis                    # noqa: E402
 
@@ -960,6 +962,7 @@ def main() -> int:
     ap.add_argument("--warn-is-error", action="store_true",
                     help="exit non-zero on warnings too")
     args = ap.parse_args()
+    load_env(args.root)
 
     try:
         rep = run(args.root, notion=args.notion, deep=args.deep)

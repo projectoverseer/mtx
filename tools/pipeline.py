@@ -41,10 +41,12 @@ from typing import Any, Callable
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+
+from env import ENV_FILE, load_env               # noqa: E402
 
 DEFAULT_LIBRARY = r"E:\Music"
 DEFAULT_OUT = r"E:\Music\_mtx_out"
-ENV_FILE = "mtx.env"
 
 # Which keys each stage needs, so a missing one is reported before an hour of
 # work rather than as a column of empty cells afterwards.
@@ -57,28 +59,6 @@ NEEDS = {
 def log(msg: str = "") -> None:
     print(msg, file=sys.stderr, flush=True)
 
-
-def load_env(root: str) -> list[str]:
-    """`mtx.env` beside the corpus, for the keys that would otherwise be typed.
-
-    Returns the names it set, never the values: a log line that echoes a token
-    has published it to every terminal scrollback on the machine.
-    """
-    path = os.path.join(root, ENV_FILE)
-    if not os.path.isfile(path):
-        return []
-    loaded = []
-    with open(path, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            key, value = key.strip(), value.strip().strip('"').strip("'")
-            if key and value and not os.environ.get(key):
-                os.environ[key] = value
-                loaded.append(key)
-    return loaded
 
 
 class Stage:
