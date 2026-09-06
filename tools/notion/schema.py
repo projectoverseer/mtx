@@ -160,6 +160,25 @@ def descriptive_tags(doc: dict) -> list[str]:
     return out
 
 
+def track_number(doc: dict) -> Any:
+    """The track number as a number.
+
+    The tag is a string, and often `2/12` rather than `2`.  Notion's number
+    property takes neither, so the conversion returned nothing and the column
+    was empty on all 1,321 rows -- with the value present, correct, and one
+    `int()` away.
+    """
+    raw = dig(doc, "tags.named.tracknumber")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return int(raw)
+    text = str(raw or "").strip()
+    head = text.split("/")[0].strip()
+    try:
+        return int(head)
+    except (TypeError, ValueError):
+        return None
+
+
 def credit(*roles: str) -> Callable[[dict], Any]:
     """The named people for a role, from the merged credit block.
 
@@ -449,7 +468,7 @@ _group("identity", [
     P("Recording MBID", "rich_text", "online.identity.recording_mbid"),
     P("Label", "rich_text", "online.identity.label"),
     P("Duration", "number", "headline.duration_s", "s"),
-    P("Track no", "number", "tags.named.tracknumber"),
+    P("Track no", "number", track_number),
     P("Is single", "checkbox", is_single),
     P("Producer", "rich_text", credit("producer", "co-producer")),
     P("Mixing engineer", "rich_text", credit("mixing engineer", "mixer", "mix")),
@@ -525,7 +544,10 @@ _group("rhythm", [
     P("Bars", "number", "headline.bar_count"),
     P("Swing ratio", "number", "headline.swing_ratio"),
     P("Grid deviation", "number", "headline.grid_deviation_std_ms", "ms"),
-    P("Syncopation per bar", "number", "rhythm.syncopation.per_bar"),
+    # `per_bar` is the whole series, one value per bar.  A list cannot go
+    # into a number, so the column was empty on every row while the data
+    # sat right there; `mean_per_bar` is the scalar the heading promises.
+    P("Syncopation per bar", "number", "rhythm.syncopation.mean_per_bar"),
     P("Kick on-off", "number", "rhythm.beat_position_profile.kick_on_minus_off_beat_db", "dB"),
     P("Snare backbeat", "number",
       "rhythm.beat_position_profile.snare_backbeat_minus_downbeat_db", "dB"),
@@ -541,7 +563,10 @@ _group("harmony", [
     P("Diatonic", "number", "headline.diatonic_time_pct", "%"),
     P("Borrowed", "number", "harmony.degrees.borrowed_time_pct", "%"),
     P("Chord entropy", "number", "harmony.vocabulary.entropy_bits", "bits"),
-    P("Loop bars", "number", "harmony.loop.loop"),
+    # `loop` is `{"bars": 1, "match_fraction": 1.0}`, not a number.  It
+    # confirms on 15 tracks and none of them reached the column.
+    P("Loop bars", "number", "harmony.loop.loop.bars"),
+    P("Loop match", "number", "harmony.loop.loop.match_fraction"),
     P("Loop candidate bars", "number", loop_candidate("bars")),
     P("Loop candidate match", "number", loop_candidate("match_fraction")),
     P("Modulations", "number", "harmony.modulation.change_count"),
