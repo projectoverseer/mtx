@@ -157,12 +157,20 @@ def _record_attempt(folder: str, path: str, doc: dict, whole: bool,
     note = lyrics.setdefault("transcript", {})
     if not isinstance(note, dict):
         return
-    if note.get("reason") == reason and not force_stamp:
+    declined = transcript.get("instrumental_lu") is not None
+    unchanged = (note.get("reason") == reason
+                 and bool(note.get("declined")) == declined)
+    if unchanged and not force_stamp:
         # Nothing new to say.  Rewriting anyway would restamp the folder on
         # every run, and the Notion push decides what to send by folder stamp
         # -- so a nightly no-op would re-send every instrumental in the corpus
         # for the sake of a changed timestamp.  The lost precision is the time
         # of the *latest* identical attempt, which nobody reads.
+        #
+        # The flag is part of "unchanged" and not just the wording: comparing
+        # the sentence alone meant a note written before the flag existed
+        # could never acquire it, and the only way to add it was `--force`,
+        # which re-transcribes the whole corpus to fix fourteen rows.
         return
     note["available"] = False
     note["reason"] = reason
@@ -171,6 +179,11 @@ def _record_attempt(folder: str, path: str, doc: dict, whole: bool,
         note["attempted_devices"] = transcript["attempted"]
     if transcript.get("instrumental_lu") is not None:
         note["vocal_lufs_delta"] = transcript["instrumental_lu"]
+        # A flag, not a phrase.  The audit has to tell a run that broke from a
+        # track that was measured and declined, and matching on the wording of
+        # a sentence means the next edit to that sentence silently reclassifies
+        # fourteen tracks.
+        note["declined"] = True
     _save(folder, path, doc, whole)
 
 
