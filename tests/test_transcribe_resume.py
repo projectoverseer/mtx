@@ -137,7 +137,8 @@ def test_recording_the_same_reason_twice_does_not_touch_the_file(tmp_path):
     folder.mkdir()
     path = folder / "analysis.json"
     reason = "not transcribed: the separated vocal sits -41.0 LU below the mix"
-    doc = {"lyrics": {"transcript": {"available": False, "reason": reason}}}
+    doc = {"lyrics": {"transcript": {"available": False, "reason": reason,
+                                     "declined": True}}}
     path.write_text(json.dumps(doc), encoding="utf-8")
     before = path.stat().st_mtime_ns
 
@@ -161,3 +162,44 @@ def test_a_changed_reason_is_still_written(tmp_path):
 
     got = json.loads(path.read_text(encoding="utf-8"))
     assert got["lyrics"]["transcript"]["reason"] == "a new reason"
+
+
+def test_a_note_written_before_the_flag_existed_still_gains_it(tmp_path):
+    """Comparing only the sentence meant the flag could never be added.
+
+    Fourteen instrumentals had the reason and not the marker, and the only
+    way to write it was `--force`, which re-transcribes all 1,321 tracks to
+    repair fourteen rows. The flag is part of what "unchanged" means.
+    """
+    import transcribe as T
+
+    folder = tmp_path / "track"
+    folder.mkdir()
+    path = folder / "analysis.json"
+    reason = "not transcribed: the separated vocal sits -41.0 LU below the mix"
+    doc = {"lyrics": {"transcript": {"available": False, "reason": reason}}}
+    path.write_text(json.dumps(doc), encoding="utf-8")
+
+    T._record_attempt(str(folder), str(path), doc, False, reason,
+                      {"instrumental_lu": -41.0})
+
+    got = json.loads(path.read_text(encoding="utf-8"))
+    assert got["lyrics"]["transcript"]["declined"] is True
+
+
+def test_a_real_failure_is_not_marked_declined(tmp_path):
+    """An out-of-memory crash and an instrumental are opposite findings."""
+    import transcribe as T
+
+    folder = tmp_path / "track"
+    folder.mkdir()
+    path = folder / "analysis.json"
+    doc = {"lyrics": {"transcript": {}}}
+    path.write_text(json.dumps(doc), encoding="utf-8")
+
+    T._record_attempt(str(folder), str(path), doc, False,
+                      "cuda: out of memory", {"attempted": ["cuda/float16"]})
+
+    note = json.loads(path.read_text(encoding="utf-8"))["lyrics"]["transcript"]
+    assert not note.get("declined")
+    assert note["attempted_devices"] == ["cuda/float16"]

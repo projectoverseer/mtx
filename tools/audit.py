@@ -652,6 +652,14 @@ def check_deep(rep: Report, tracks: list[dict[str, Any]]) -> None:
         "syllables per line, repeated-line share, readability",
         "read the word counts and the text on these tracks, not the "
         "per-line figures; nothing else about them is affected")
+    declined = rep.check(
+        "lyrics.instrumental", "info",
+        "transcription was attempted and declined: the separated vocal sits "
+        "more than 25 LU below the mix, so there is no voice here to "
+        "transcribe and whisper would invent one.  These tracks will never "
+        "have words, and that is a fact about the record rather than a gap",
+        "nothing to do -- recorded so an instrumental is not mistaken for a "
+        "track whose transcription broke")
     broke = rep.check(
         "lyrics.transcript_failed", "warn",
         "transcription was attempted on this track and failed, so the gap is "
@@ -686,7 +694,14 @@ def check_deep(rep: Report, tracks: list[dict[str, Any]]) -> None:
         # words: it is the only source of word-level timing, and without it
         # the delivery-rate and alignment measurements are missing on a track
         # that otherwise looks completely covered.
-        if (not transcript.get("available") and reason
+        if transcript.get("declined"):
+            # Measured and declined, not broken.  A score cue whose separated
+            # vocal sits 55 LU below the mix has no vocal to transcribe, and
+            # filing that next to an out-of-memory crash asks the reader to
+            # re-run a job that will decline again for the same good reason.
+            declined.hit(t["rel"],
+                         vocal_lufs_delta=transcript.get("vocal_lufs_delta"))
+        elif (not transcript.get("available") and reason
                 and "not requested" not in reason):
             broke.hit(t["rel"], reason=reason[:110])
         elif not lyrics.get("available"):
@@ -755,6 +770,102 @@ def check_hygiene(rep: Report, tracks: list[dict[str, Any]]) -> None:
 # --------------------------------------------------------------------------
 # the Notion side
 # --------------------------------------------------------------------------
+
+
+def usable_for(kind: str, value: Any) -> bool:
+    """Would `notion_value` turn this into something the column can hold?
+
+    Asked here rather than after a push, because `notion_value` returning None
+    is silent: the property is omitted, the row is written, the run reports
+    success, and the column is empty.  `notion.dead_column` catches it a whole
+    round-trip later and cannot say why.
+    """
+    from rows import notion_value                      # noqa: PLC0415
+    try:
+        return notion_value(kind, value) is not None
+    except Exception:
+        return False
+
+
+def check_schema_paths(rep: Report, root: str,
+                       tracks: list[dict[str, Any]]) -> None:
+    """Resolve every Notion column against the corpus on disk.
+
+    Three columns were empty on all 1,321 rows with the value sitting at the
+    end of the path, in the wrong shape for the destination:
+
+      * `Loop bars` read `harmony.loop.loop`, which is
+        `{"bars": 1, "match_fraction": 1.0}` -- a dict cannot be a number;
+      * `Syncopation per bar` read the whole per-bar series, a list;
+      * `Track no` read the tag `"2"`, a string.
+
+    `notion.dead_column` sees all three, but only from the live table, only
+    after a push, and it cannot tell "wrong key" from "no data yet".  Reading
+    the corpus separates them: a path that resolves to nothing on every track
+    is dead, and a path that resolves to something the column cannot hold is a
+    type mismatch, which is a different repair.
+    """
+    sys.path.insert(0, os.path.join(HERE, "notion"))
+    try:
+        from schema import PROPERTIES                   # noqa: PLC0415
+        from rows import (load_cohorts, load_folder,    # noqa: PLC0415
+                          load_identities, load_outcomes)
+    except ImportError as exc:
+        log(f"  schema paths not checked: {exc}")
+        return
+
+    # The same sidecars the push mounts.  Loading a folder without them
+    # resolves every outcome, identity and cohort column to nothing, and the
+    # first run of this check duly reported 42 dead paths of which 3 were real
+    # -- a check reproducing the exact defect it was written to catch.
+    cohorts = load_cohorts(root)
+    identities = load_identities(root)
+    outcomes = load_outcomes(root)
+
+    dead = rep.check(
+        "schema.dead_path", "warn",
+        "a Notion column whose source resolves to nothing on every track in "
+        "the corpus.  Either the path is wrong, or the measurement does not "
+        "exist yet -- and from the published table those look identical",
+        "resolve the path against a real analysis.json.  If it is right, the "
+        "column is waiting on data and can be ignored")
+    mistyped = rep.check(
+        "schema.wrong_type", "error",
+        "a Notion column whose source resolves to a value the column cannot "
+        "hold -- a dict or a list where a number is declared, or a string "
+        "that is not parsed.  The push drops it silently and the column is "
+        "empty, which reads as 'not measured' about a measurement that was "
+        "taken",
+        "point the property at the scalar inside the value, or give the "
+        "column a reader that converts it")
+
+    found: dict[str, int] = collections.Counter()
+    wrong: dict[str, int] = collections.Counter()
+    example: dict[str, str] = {}
+    for t in tracks:
+        try:
+            doc = load_folder(t["folder"], outcomes=outcomes, root=root,
+                              identities=identities, cohorts=cohorts)
+        except Exception:
+            continue
+        for prop in PROPERTIES:
+            try:
+                raw = prop.read(doc)
+            except Exception:
+                raw = None
+            if raw is None or raw == "" or raw == []:
+                continue
+            found[prop.name] += 1
+            if not usable_for(prop.kind, raw):
+                wrong[prop.name] += 1
+                example.setdefault(prop.name, f"{type(raw).__name__}: "
+                                              f"{str(raw)[:60]}")
+    for prop in PROPERTIES:
+        if wrong.get(prop.name):
+            mistyped.hit(prop.name, kind=prop.kind, tracks=wrong[prop.name],
+                         got=example.get(prop.name, ""))
+        elif not found.get(prop.name):
+            dead.hit(prop.name, kind=prop.kind)
 
 
 def column_coverage(pages: list[dict[str, Any]]) -> dict[str, Any]:
@@ -940,6 +1051,7 @@ def run(root: str, notion: bool = False, deep: bool = False) -> Report:
     check_hygiene(rep, tracks)
     if deep:
         check_deep(rep, tracks)
+        check_schema_paths(rep, root, tracks)
     if notion:
         unreachable = rep.check(
             "notion.unreachable", "error",
