@@ -713,6 +713,13 @@ _group("cohort", [
     P("Typicality (mean |z|)", "number", "cohort.typicality.mean_abs_z"),
     P("A/B references", "rich_text", references),
     P("References basis", "rich_text", "cohort.neighbours.basis"),
+    # Five names look like five references whether or not any of them is close.
+    # `Get Lucky` finds its own radio edit at 0.993; `How Deep Is Your Love`
+    # tops out at 0.382, the 1st percentile of this corpus, which is the
+    # measurement saying "there is nothing here to compare you against".  Both
+    # rows show five names.  Sort or filter on this before trusting one.
+    P("Nearest match", "number", "cohort.neighbours.nearest_similarity"),
+    P("Nearest match pct", "number", "cohort.neighbours.nearest_percentile", "%"),
 
     P("LUFS-I pct", "number", _pct("headline.lufs_i"), "%"),
     P("LUFS-I cohort median", "number", _cohort_median("headline.lufs_i"), "LUFS"),

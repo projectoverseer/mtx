@@ -311,17 +311,67 @@ def _neighbours(rows: list[dict[str, Any]], zmat: np.ndarray,
         M = M - M.mean(axis=0, keepdims=True)
         M = M / np.maximum(np.linalg.norm(M, axis=1, keepdims=True), 1e-12)
         sim = M @ M.T
+
+        # A neighbour list is `k` slots long and every slot is meant to be a
+        # different record to A/B against.  Two of `How Deep Is Your Love`'s
+        # five went to the same Queen recording, filed twice under different
+        # folders: `mark_duplicates` had already worked out that the corpus
+        # holds it twice, the percentiles honoured that, and nothing told the
+        # cosine.  So only a primary may be recommended, and no row recommends
+        # its own recording back to itself -- a duplicate still *gets* a list,
+        # for the same reason it still gets a percentile.
+        keys = [rows[i].get("recording_key") for i in have_emb]
+        primary = np.array([bool(rows[i].get("recording_primary", True))
+                            for i in have_emb])
+        sim[:, ~primary] = -np.inf
         np.fill_diagonal(sim, -np.inf)
+
+        twins: dict[Any, list[int]] = {}
+        for j, key in enumerate(keys):
+            if key:
+                twins.setdefault(key, []).append(j)
+
+        picked: list[list[int]] = []
         for pos, i in enumerate(have_emb):
-            order = np.argsort(sim[pos])[::-1][:k]
+            row = sim[pos]
+            mine = twins.get(keys[pos]) if keys[pos] else None
+            if mine:
+                row = row.copy()
+                row[mine] = -np.inf
+            order = [int(j) for j in np.argsort(row)[::-1][:k]
+                     if np.isfinite(row[j])]
+            picked.append(order)
             rows[i]["neighbours"] = {
                 "basis": "corpus-centred embedding cosine",
                 "list": [{"artist": rows[have_emb[j]]["artist"],
                           "title": rows[have_emb[j]]["title"],
                           "similarity": float(sim[pos, j])} for j in order],
             }
+
+        # How near the nearest one actually is, on the corpus's own scale.
+        #
+        # Five names read as five references whatever the numbers next to them
+        # say, and for one track in twenty there is nothing here to reference.
+        # Across this corpus the best match per track runs 0.35 to 1.00, median
+        # 0.579; `Get Lucky` finds its own radio edit at 0.993 and `How Deep Is
+        # Your Love` tops out at 0.382, the 1st percentile.  Both lists have
+        # five rows and they are not the same kind of answer.  The percentile
+        # is what separates them, so it travels with the list rather than being
+        # something a reader has to reconstruct.
+        best = np.array([sim[pos, order[0]] if order else np.nan
+                         for pos, order in enumerate(picked)])
+        rank = best[np.isfinite(best)]
+        for pos, i in enumerate(have_emb):
+            nb = rows[i]["neighbours"]
+            if not np.isfinite(best[pos]) or rank.size == 0:
+                nb["nearest_similarity"] = None
+                nb["nearest_percentile"] = None
+                continue
+            nb["nearest_similarity"] = float(best[pos])
+            nb["nearest_percentile"] = float((rank < best[pos]).mean() * 100.0)
     finite = np.where(np.isfinite(zmat), zmat, 0.0)
     valid = np.isfinite(zmat)
+    secondary = np.array([not r.get("recording_primary", True) for r in rows])
     for i in range(len(rows)):
         if "neighbours" in rows[i]:
             continue
@@ -331,12 +381,25 @@ def _neighbours(rows: list[dict[str, Any]], zmat: np.ndarray,
                     / np.maximum(counts, 1))
         d[i] = np.inf
         d[counts < 5] = np.inf
+        d[secondary] = np.inf
+        key = rows[i].get("recording_key")
+        if key:
+            for j, other in enumerate(rows):
+                if other.get("recording_key") == key:
+                    d[j] = np.inf
         order = np.argsort(d)[:k]
         rows[i]["neighbours"] = {
             "basis": "mean per-metric z-space distance over shared metrics",
             "list": [{"artist": rows[j]["artist"], "title": rows[j]["title"],
                       "distance": float(d[j])} for j in order
                      if np.isfinite(d[j])],
+            # A distance in z-space and a cosine are not on one scale, and
+            # there is no corpus-wide ranking to place this one against when
+            # only a handful of rows land here.  Naming the keys and leaving
+            # them empty is the difference between "not measured" and a number
+            # a reader would compare with a cosine percentile.
+            "nearest_similarity": None,
+            "nearest_percentile": None,
         }
 
 
