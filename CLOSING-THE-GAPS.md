@@ -116,6 +116,13 @@ python tools/embed.py <root>          # a 768-d MERT vector, ~2 s/track
 python tools/charts.py <root> peaks.csv   # chart outcomes from a CSV
 ```
 
+Every tool that needs an API key reads `mtx.env` from the root it is pointed
+at, so none of them has to be run through the pipeline to work. That was not
+always true, and the failure was quiet in the way that matters: `audit.py`
+stopped and said `no Notion token`, while `transcribe.py` fell back from the
+configured Whisper model to `base`, transcribed the corpus with it and
+reported success.
+
 Every one records what it changed under `run.amendments`, because editing an
 analysis in place breaks the reproducibility promise unless the edit is on the
 record. All three skip work already done, and a failure writes a reason rather
@@ -458,15 +465,27 @@ python tools/charts.py "E:/Music/_mtx_out" --template peaks.csv
 `cohort.year`, are the difference between "your PSR is 4.7 dB" and "your PSR
 is 4.7 dB, which is the 12th percentile for club house since 2022".
 
-**`harmony.loop`.** Never fires: the threshold is 0.75 and the best candidate
-across the corpus scores 0.15, because the chord detector's per-bar output is
-too noisy for an exact set match. The 4-bar period *is* correctly the highest
-scorer on `Around the World`, so the measurement works and the threshold does
-not. Recalibrating it means choosing a number against evidence rather than
-lowering one until it fires, which is a separate piece of work.
+**`harmony.loop`.** Confirms on 15 tracks of 1,321 -- 1.1%. The threshold is
+0.75 against an exact per-bar chord-set match, and the chord detector emits
+multi-chord bars (`Gm|D#sus2|Fsus4`) that rarely match exactly, so the median
+best candidate across the corpus is 0.226. Where the writing is plainly one
+figure it does clear the bar: four `Homework` tracks, three from `Happier Than
+Ever`, `Thunder`, `Marry You`. That still leaves 1,306 records reading as
+though they do not repeat, so `Loop candidate bars` and `Loop candidate match`
+report the period that repeats most and how often it does. Recalibrating the
+threshold means choosing a number against evidence rather than lowering one
+until it fires, which is a separate piece of work.
 
 **Two tracks MusicBrainz has never catalogued**, and one Last.fm title
 (`u + me = <3`) spelt with a character no query reproduces.
+
+**Two Notion columns that cannot be pruned in place.** An option list longer
+than 100 is rejected by the property update, and the update is a full
+replacement, so on `Cohort genres` (161 options) and `Genres all` (458) no
+single option can be removed. `tools/notion/prune_options.py --rebuild` drops
+the column so a forced push rebuilds it, which works because every value in
+them is derived from the analyses on disk. It is a rebuild, not a repair, and
+it costs a full push each time.
 
 ## Standing rule
 
