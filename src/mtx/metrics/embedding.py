@@ -33,8 +33,14 @@ BACKENDS = ("laion_clap", "openl3", "transformers:MERT")
 # which attention handles in milliseconds; a whole track does not.  A 30 s hop
 # over a 4-minute song is 8 views, enough to average out an intro and an
 # outro without paying for every frame of the middle.
+# A 30 s hop over a 4-minute song is 8 windows of 5 s each: 40 seconds looked
+# at out of 240, 17% of the record.  That is enough to tell two masters of one
+# recording apart (`Get Lucky` matches itself at 0.98) and thin enough that a
+# track whose sampled seconds are unrepresentative lands beside the wrong
+# neighbours.  15 s doubles the coverage to a third of the track for twice the
+# GPU time, which for an unattended overnight job is the right trade.
 WINDOW_S = 5.0
-HOP_S = 30.0
+HOP_S = 15.0
 MAX_WINDOWS = 24
 BATCH = 8
 
