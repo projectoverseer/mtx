@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -294,3 +295,34 @@ def test_the_sync_never_calls_update_when_nothing_is_missing(monkeypatch):
 
     assert added == []
     assert calls == [], "an existing schema must produce no write"
+
+
+def test_the_property_spec_is_part_of_the_shared_stamp(tmp_path, monkeypatch):
+    """Repointing a column moves nothing on disk.
+
+    `Loop bars` read `harmony.loop.loop`, a dict, and was empty on all 1,321
+    rows. Pointing it at `.bars` changed no analysis, no cohort, no outcome --
+    so every stamp stayed identical and a routine push would have said
+    `0 pushed, 1321 already present`, exit 0, leaving the column empty for
+    good. The same silence hides any repointed path.
+    """
+    import push as P
+
+    schema_path = Path(P.__file__).parent / "schema.py"
+    before = P.shared_stamp(str(tmp_path))
+
+    original = schema_path.read_bytes()
+    try:
+        schema_path.write_bytes(original + b"\n# a change to a reader\n")
+        after = P.shared_stamp(str(tmp_path))
+    finally:
+        schema_path.write_bytes(original)
+
+    assert before != after, "a schema edit must invalidate the push stamps"
+
+
+def test_the_stamp_is_stable_when_nothing_changed(tmp_path):
+    """Otherwise every run re-pushes 1,321 pages."""
+    import push as P
+
+    assert P.shared_stamp(str(tmp_path)) == P.shared_stamp(str(tmp_path))
