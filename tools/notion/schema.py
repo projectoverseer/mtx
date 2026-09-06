@@ -160,30 +160,53 @@ def descriptive_tags(doc: dict) -> list[str]:
     return out
 
 
-def credit(role: str) -> Callable[[dict], Any]:
+def credit(*roles: str) -> Callable[[dict], Any]:
+    """The named people for a role, from the merged credit block.
+
+    The role names in that block are MusicBrainz's and Discogs' own, and they
+    are not the words a column heading uses.  It holds `mixing engineer` on
+    1,059 tracks and `mastering engineer` on 499; this asked for `mixer` and
+    `mastering`.  Both columns were empty on all 1,321 rows with the data one
+    key away -- populated, correctly typed, and unreadable, which is the
+    defect this corpus keeps producing.
+
+    So: several spellings per column, matched case-insensitively, and names
+    de-duplicated because one person credited by two providers is one person.
+    """
+    wanted = {r.strip().lower() for r in roles}
+
     def read(doc: dict) -> Any:
-        people = (dig(doc, "online.credits", {}) or {}).get(role) or []
-        names = [str((p or {}).get("name") or "").strip() for p in people]
-        return ", ".join(n for n in names if n) or None
+        block = dig(doc, "online.credits", {}) or {}
+        names: list[str] = []
+        seen: set[str] = set()
+        for role, people in block.items():
+            if str(role).strip().lower() not in wanted:
+                continue
+            for person in people or []:
+                name = str((person or {}).get("name") or "").strip()
+                if name and name.lower() not in seen:
+                    seen.add(name.lower())
+                    names.append(name)
+        return ", ".join(names) or None
     return read
 
 
 def loop_candidate(field: str) -> Callable[[dict], Any]:
     """The strongest repeating chord period, and how well it actually repeats.
 
-    `harmony.loop.loop` is null on every track in this corpus.  Not because
-    nothing loops -- `Around the World` is four bars repeated for seven
-    minutes and its 4-bar candidate does score highest -- but because the
-    confirmation threshold is 0.75 against an exact per-bar chord-set match,
-    and the chord detector emits multi-chord bars (`Gm|D#sus2|Fsus4`) that
-    rarely match exactly.  The best score anywhere in the corpus is 0.15.
+    `harmony.loop.loop` confirms on 15 of 1,321 tracks -- 1.1%.  The threshold
+    is 0.75 against an exact per-bar chord-set match, and the chord detector
+    emits multi-chord bars (`Gm|D#sus2|Fsus4`) that rarely match exactly, so
+    across the corpus the best candidate per track has a median of 0.226.  It
+    does clear the bar where the writing is plainly one figure: four Homework
+    tracks, three from `Happier Than Ever`, `Thunder`, `Marry You`.
 
-    So the threshold is unreachable and the column is empty, which reads as
-    "this music does not repeat" about records built entirely on repetition.
-    Rather than lower a number until it fires -- which would be manufacturing
-    a result -- these report what was measured: the period that repeats most,
-    and the share of bars at which it does.  Naming it a candidate is the
-    difference between a measurement and a claim.
+    That leaves the confirmed column empty on 1,306 records that visibly do
+    repeat, which reads as "this music does not repeat".  Lowering the
+    threshold until it fires would be manufacturing a result, so these report
+    what was measured instead: the period that repeats most, and the share of
+    bars at which it does.  Naming it a candidate is the difference between a
+    measurement and a claim.
     """
     def read(doc: dict) -> Any:
         cands = dig(doc, "analysis.harmony.loop.candidates") or \
@@ -428,9 +451,12 @@ _group("identity", [
     P("Duration", "number", "headline.duration_s", "s"),
     P("Track no", "number", "tags.named.tracknumber"),
     P("Is single", "checkbox", is_single),
-    P("Producer", "rich_text", credit("producer")),
-    P("Mixing engineer", "rich_text", credit("mixer")),
-    P("Mastering engineer", "rich_text", credit("mastering")),
+    P("Producer", "rich_text", credit("producer", "co-producer")),
+    P("Mixing engineer", "rich_text", credit("mixing engineer", "mixer", "mix")),
+    P("Mastering engineer", "rich_text",
+      credit("mastering engineer", "mastering")),
+    P("Recording engineer", "rich_text",
+      credit("recording engineer", "engineer")),
     P("Match confidence", "number", "online.match_confidence"),
 ])
 
