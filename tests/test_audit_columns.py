@@ -119,3 +119,52 @@ def test_no_pages_reports_nothing_rather_than_everything():
     got = column_coverage([])
 
     assert got["seen"] == set() and not got["filled"]
+
+
+def test_a_dict_cannot_be_a_number_column():
+    """`harmony.loop.loop` is `{"bars": 1, "match_fraction": 1.0}`.
+
+    `notion_value` returns None for it, the push omits the property, the row
+    is written, the run reports success, and the column reads as "not
+    measured" about a measurement that exists on 15 tracks.
+    """
+    from audit import usable_for
+
+    assert not usable_for("number", {"bars": 1, "match_fraction": 1.0})
+
+
+def test_a_list_cannot_be_a_number_column():
+    """`rhythm.syncopation.per_bar` is the whole series, one value per bar."""
+    from audit import usable_for
+
+    assert not usable_for("number", [0.0, 0.0, 0.0])
+
+
+def test_a_numeric_string_is_not_a_number_column_either():
+    """The tag is `"2"`, and often `"2/12"`. Notion takes neither."""
+    from audit import usable_for
+
+    assert not usable_for("number", "2")
+    assert not usable_for("number", "2/12")
+
+
+def test_a_real_number_is_usable():
+    from audit import usable_for
+
+    assert usable_for("number", 1)
+    assert usable_for("number", 0.226)
+    assert usable_for("number", 0), "zero is a measurement"
+
+
+def test_a_string_is_usable_as_rich_text_and_select():
+    from audit import usable_for
+
+    assert usable_for("rich_text", "Serban Ghenea")
+    assert usable_for("select", "house")
+
+
+def test_an_unknown_kind_is_reported_unusable_rather_than_raising():
+    """`notion_value` raises on an unknown kind; the audit must not die on it."""
+    from audit import usable_for
+
+    assert not usable_for("nonsense_kind", "x")
