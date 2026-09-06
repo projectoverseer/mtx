@@ -191,10 +191,16 @@ def labels_for(res: dict[str, Any], folder: str,
     artist = (declared.get("artist") or catalogue or tags.get("artist")
               or tags.get("albumartist") or "(unknown artist)")
     title = declared.get("title") or tags.get("title") or os.path.basename(folder)
+    # What makes two rows the same performance.  The recording MBID first,
+    # because an ISRC is per-release and a re-issue gets a new one; the ISRC
+    # is the fallback for tracks MusicBrainz has never heard of.
+    ident = o.get("identity") if isinstance(o, dict) else None
+    ident = ident if isinstance(ident, dict) else {}
     return {"artist": str(artist), "title": str(title),
             "genre": (str(genre).strip().lower() if genre else None),
             "genre_source": source, "year": year, "year_source": year_source,
-            "genres": _voted_genres(o, genre, d_cohort, declared)}
+            "genres": _voted_genres(o, genre, d_cohort, declared),
+            "recording_key": ident.get("recording_mbid") or ident.get("isrc")}
 
 
 def _voted_genres(online: Any, primary: Any, d_cohort: dict,
@@ -320,6 +326,45 @@ def _neighbours(rows: list[dict[str, Any]], zmat: np.ndarray,
         }
 
 
+def mark_duplicates(rows: list[dict[str, Any]]) -> int:
+    """Flag rows that are the same recording, and pick one to count.
+
+    Eight recordings appear twice in this corpus -- a single and its album cut,
+    with different sha256s because they are genuinely different masters of one
+    performance.  Both are worth keeping: two masters of one recording is the
+    only A/B in the library where the song itself is held constant.  But they
+    are one recording, and counted twice they vote twice in every percentile
+    and in the artist's own median.
+
+    A duplicate still *gets* a percentile -- it is a track the reader wants
+    placed -- it just does not sit in the population it is placed against.
+
+    The primary is the longest, which is the album cut rather than the radio
+    edit, ties broken on sha256 so a re-run picks the same one.  That is
+    `tools/notion/outcome.py`'s rule, deliberately: two tools disagreeing
+    about which copy is the real one is worse than either rule being wrong.
+    """
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        key = r.get("recording_key")
+        if key:
+            groups.setdefault(str(key), []).append(r)
+    dupes = 0
+    for key, members in groups.items():
+        n = len(members)
+        if n > 1:
+            dupes += n
+        members.sort(key=lambda r: (-(r.get("duration_s") or 0.0),
+                                    str(r.get("sha256") or "")))
+        for i, r in enumerate(members):
+            r["recording_duplicates"] = n
+            r["recording_primary"] = (i == 0)
+    for r in rows:
+        r.setdefault("recording_duplicates", 1)
+        r.setdefault("recording_primary", True)
+    return dupes
+
+
 def build(root: str, neighbours: int = 5, log=None) -> dict[str, Any]:
     """Read a folder of analyses and compute every track's relative position."""
     from .export import find_analyses
@@ -344,6 +389,7 @@ def build(root: str, neighbours: int = 5, log=None) -> dict[str, Any]:
         lab["folder"] = os.path.basename(folder)
         lab["analysis_path"] = os.path.abspath(p)
         lab["sha256"] = (res.get("file") or {}).get("sha256")
+        lab["duration_s"] = (res.get("file") or {}).get("duration_s")
         rows.append(lab)
         values.append({key: dig(res, key) for key, _ in METRICS})
         emb = (res.get("embedding") or {})
@@ -354,9 +400,15 @@ def build(root: str, neighbours: int = 5, log=None) -> dict[str, Any]:
     if not rows:
         raise ValueError("no readable analyses")
 
+    duplicated = mark_duplicates(rows)
+    if duplicated and log:
+        log(f"  {duplicated} row(s) share a recording with another; "
+            f"one of each counts toward the population")
+
     P = PARAMS["cohort"]
     win = int(P["year_window"])
-    cohorts: dict[str, list[int]] = {"all": list(range(len(rows)))}
+    cohorts: dict[str, list[int]] = {
+        "all": [i for i, r in enumerate(rows) if r.get("recording_primary")]}
     for i, r in enumerate(rows):
         window = (f"year={r['year'] - win}-{r['year'] + win}"
                   if r["year"] is not None else None)
@@ -372,10 +424,14 @@ def build(root: str, neighbours: int = 5, log=None) -> dict[str, Any]:
     # Year cohorts are windows, so membership is by overlap, not by equality.
     for i, r in enumerate(rows):
         for key in r["cohort_keys"]:
+            # `setdefault` before the primary test on purpose: a duplicate
+            # still names its cohorts, and the cohort has to exist for it to
+            # be placed against even when it contributes no row to it.
             members = cohorts.setdefault(key, [])
             if key.startswith("year=") or "|year=" in key:
                 continue
-            members.append(i)
+            if r.get("recording_primary"):
+                members.append(i)
     for i, r in enumerate(rows):
         if r["year"] is None:
             continue
@@ -396,7 +452,7 @@ def build(root: str, neighbours: int = 5, log=None) -> dict[str, Any]:
                 if genre is not None and genre not in (
                         other.get("genres") or [other.get("genre")]):
                     continue
-                if j not in members:
+                if other.get("recording_primary") and j not in members:
                     members.append(j)
 
     keys = [k for k, _ in METRICS]

@@ -90,6 +90,26 @@ TEMPLATE: dict = {
     "interpolations": [],
     "origin": "",
     "notes": "",
+    "outcome": {
+        "_help": (
+            "How the record actually did.  Nothing measures this and no free "
+            "database carries it, so these are yours to supply -- and they "
+            "are the only columns in the corpus that say whether a record "
+            "worked, as opposed to what it sounds like.  A Last.fm playcount "
+            "is scrobbling listeners, which is not the same question."
+        ),
+        "billboard_peak": None,
+        "_billboard_peak_help": "highest chart position reached, 1 is best.",
+        "weeks_on_chart": None,
+        "certification": "",
+        "_certification_help": "gold, platinum, 2x platinum, diamond...",
+        "chart": "",
+        "_chart_help": (
+            "which chart the peak is from -- 'Billboard Hot 100', 'UK "
+            "Singles', 'Vietnam Hot 100'.  A peak with no chart named is a "
+            "number nobody can check."
+        ),
+    },
 }
 
 
@@ -109,6 +129,7 @@ def prefill(folder: str) -> dict:
     """Start from what the file already says, so there is less to type."""
     doc = dict(TEMPLATE)
     doc["cohort"] = dict(TEMPLATE["cohort"])
+    doc["outcome"] = dict(TEMPLATE["outcome"])
     analysis = os.path.join(folder, "analysis.json")
     if not os.path.isfile(analysis):
         return doc

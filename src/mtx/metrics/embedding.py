@@ -29,6 +29,15 @@ from ..util import Collector
 
 BACKENDS = ("laion_clap", "openl3", "transformers:MERT")
 
+# Windowing for the transformer backends.  5 s at 24 kHz is 120,000 samples,
+# which attention handles in milliseconds; a whole track does not.  A 30 s hop
+# over a 4-minute song is 8 views, enough to average out an intro and an
+# outro without paying for every frame of the middle.
+WINDOW_S = 5.0
+HOP_S = 30.0
+MAX_WINDOWS = 24
+BATCH = 8
+
 
 def _try_laion_clap(src: AudioSource) -> tuple[np.ndarray, dict[str, Any]] | None:
     try:
@@ -58,27 +67,88 @@ def _try_openl3(src: AudioSource) -> tuple[np.ndarray, dict[str, Any]] | None:
         "pooling": "mean over the model's own frames"}
 
 
+_MERT_CACHE: dict[str, Any] = {}
+
+
+def _mert_model(name: str):
+    """Load once per process.  Loading per track dominated everything else."""
+    if name not in _MERT_CACHE:
+        import torch  # type: ignore
+        from transformers import AutoModel, Wav2Vec2FeatureExtractor  # type: ignore
+        extractor = Wav2Vec2FeatureExtractor.from_pretrained(
+            name, trust_remote_code=True)
+        # Asked for on the config, not only on the call: in transformers 5.x
+        # passing `output_hidden_states=True` to `forward` alone comes back
+        # with `hidden_states=None`, and `torch.stack(None)` then raises a
+        # TypeError that `analyse()` catches and reports as "no embedding
+        # backend is installed" -- a message about the environment for a fault
+        # in the call.
+        model = AutoModel.from_pretrained(
+            name, trust_remote_code=True, output_hidden_states=True).eval()
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = model.to(device)
+        _MERT_CACHE[name] = (extractor, model, device)
+    return _MERT_CACHE[name]
+
+
 def _try_mert(src: AudioSource) -> tuple[np.ndarray, dict[str, Any]] | None:
     try:
         import torch  # type: ignore
-        from transformers import AutoModel, Wav2Vec2FeatureExtractor  # type: ignore
+        import transformers  # type: ignore
+        from transformers import AutoModel, Wav2Vec2FeatureExtractor  # noqa: F401
     except Exception:
         return None
     name = "m-a-p/MERT-v1-95M"
-    extractor = Wav2Vec2FeatureExtractor.from_pretrained(name, trust_remote_code=True)
-    model = AutoModel.from_pretrained(name, trust_remote_code=True).eval()
+    extractor, model, device = _mert_model(name)
     from ..audio import resample_to
     sr = int(extractor.sampling_rate)
     y = resample_to(src.mono.astype(np.float32), src.sr, sr)
-    inputs = extractor(y, sampling_rate=sr, return_tensors="pt")
+
+    # In windows, never as one sequence.  MERT is a transformer, so attention
+    # over a whole track is quadratic in its length: a four-minute song at
+    # 24 kHz is ~18,000 frames, and one track took over ten minutes -- 220
+    # hours for this corpus, against a few seconds a track windowed.  The
+    # window is also the honest unit: a song is not one texture, and a mean
+    # over five-second views of it is a better summary than one attention
+    # pass that has to attend across the whole arrangement at once.
+    win = int(WINDOW_S * sr)
+    hop = int(HOP_S * sr)
+    if y.size < win:
+        y = np.pad(y, (0, win - y.size))
+    starts = list(range(0, max(1, y.size - win + 1), hop))[:MAX_WINDOWS]
+    vecs = []
+    layers_used = "layers"
     with torch.no_grad():
-        hidden = model(**inputs, output_hidden_states=True).hidden_states
-    vec = torch.stack(hidden).mean(dim=0).mean(dim=1).squeeze(0).numpy()
-    import transformers  # type: ignore
+        for i in range(0, len(starts), BATCH):
+            chunk = [y[a:a + win] for a in starts[i:i + BATCH]]
+            inputs = extractor(chunk, sampling_rate=sr, return_tensors="pt",
+                               padding=True)
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            out = model(**inputs, output_hidden_states=True)
+            hidden = getattr(out, "hidden_states", None)
+            if hidden:
+                # Mean over layers, then over time: MERT's lower layers carry
+                # timbre and its upper ones carry structure, and a similarity
+                # question wants both.
+                stacked = torch.stack(list(hidden)).mean(dim=0).mean(dim=1)
+                pooled = "layers"
+            else:
+                # Still a usable vector, and saying which one was taken
+                # matters more than always taking the same one: two tracks
+                # embedded under different poolings are not comparable, and
+                # nothing downstream could tell without this.
+                stacked = out.last_hidden_state.mean(dim=1)
+                pooled = "last layer"
+            layers_used = pooled
+            vecs.append(stacked.float().cpu().numpy())
+    vec = np.concatenate(vecs, axis=0).mean(axis=0)
     return np.asarray(vec, dtype=float), {
         "backend": "transformers:MERT", "model": name,
         "input_sr_hz": sr, "version": transformers.__version__,
-        "pooling": "mean over layers, then over time"}
+        "device": device,
+        "window_s": WINDOW_S, "hop_s": HOP_S, "windows": len(starts),
+        "pooling": (f"mean over {layers_used}, then over time within each "
+                    f"{WINDOW_S:g}s window, then over {len(starts)} windows")}
 
 
 def _section_vectors(src: AudioSource, sections: list[dict[str, Any]],

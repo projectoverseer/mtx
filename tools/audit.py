@@ -783,6 +783,18 @@ def check_notion(rep: Report, root: str) -> None:
         "notion.missing_rows", "error",
         "the corpus on disk has tracks the database does not",
         "python tools/notion/push.py <root>")
+    dead = rep.check(
+        "notion.dead_column", "warn",
+        "a column that is empty on every single row.  Sometimes that is "
+        "honest -- nothing feeds `Certification` until chart data is "
+        "supplied -- and sometimes the key is simply wrong, which looks "
+        "exactly the same from the table.  `Delivery` read "
+        "`vocals.delivery.classification` for the life of the column; the "
+        "value is under `inference`, and 1,321 rows of blank read as "
+        "\"no vocal detected\" rather than \"wrong key\"",
+        "check the property's source path against a real analysis.json; if "
+        "the path is right, the column is waiting on data that does not "
+        "exist yet and can be ignored")
 
     api = Notion(log=lambda m: None)
     try:
@@ -815,7 +827,28 @@ def check_notion(rep: Report, root: str) -> None:
             if len(group) > 1:
                 collide.hit(f"{name}: {group}")
 
+    # Every property the pages carry, and how many rows have a value for it.
+    # A column at zero is either a dead key or a column with no source yet,
+    # and the table cannot tell those apart -- which is the point of saying so.
+    filled: dict[str, int] = collections.Counter()
+    seen_props: set[str] = set()
+    for page in pages:
+        for name, prop in (page.get("properties") or {}).items():
+            seen_props.add(name)
+            kind = prop.get("type")
+            value = prop.get(kind)
+            if kind in ("title", "rich_text"):
+                value = value or None
+            if kind == "checkbox":
+                continue            # false is a value, not a blank
+            if value not in (None, [], "", {}):
+                filled[name] += 1
+    for name in sorted(seen_props):
+        if pages and not filled.get(name):
+            dead.hit(name, rows=len(pages))
+
     rep.fact("notion_rows", len(pages))
+    rep.fact("notion_columns_filled", len(filled))
     on_disk = {t["rel"] for t in load_corpus(root)}
     if len(pages) < len(on_disk):
         missing.hit(f"{len(on_disk) - len(pages)} track(s) not in Notion",
