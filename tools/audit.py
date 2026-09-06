@@ -337,7 +337,19 @@ def check_release(rep: Report, tracks: list[dict[str, Any]]) -> None:
             # legitimately carries a 2003 recording, and flagging that as a
             # conflict buries the real ones under 90 correct rows.
             a, b = year_of(package), year_of(tag)
-            if a and b and abs(a - b) > DATE_DRIFT_YEARS:
+            song = year_of(dig(t["online"], "musicbrainz.first_release_date"))
+            # And a compilation is not a conflict either.  When the package
+            # date agrees with the song's own first release and only the file
+            # tag is later, that is a 2015 compilation of a 2003 recording
+            # resolving exactly as intended -- 48 of the 51 rows this check
+            # reported.  A finding that is right 6% of the time is one people
+            # learn to scroll past, which costs more than the check earns.
+            #
+            # What stays flagged is the reissue it exists for: a package date
+            # that agrees with neither the tag nor the song.
+            compilation = (song is not None and a == song and b is not None
+                           and b > song)
+            if a and b and abs(a - b) > DATE_DRIFT_YEARS and not compilation:
                 drift.hit(t["rel"], package=package, file_tag=tag,
                           song=checks.get("song_first_release"))
 

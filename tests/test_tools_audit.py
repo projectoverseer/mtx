@@ -425,3 +425,34 @@ def test_a_reachable_notion_reports_no_such_finding(tmp_path, monkeypatch):
     rep = audit.run(root, notion=True)
 
     assert find(rep, "notion.unreachable").hits == []
+
+
+def test_a_compilation_of_an_older_song_is_not_a_date_conflict(tmp_path):
+    """A 2015 soundtrack carrying a 2003 recording resolved exactly right.
+
+    48 of the 51 rows this check reported were this shape, and a finding that
+    is right 6% of the time is one people learn to scroll past -- which costs
+    more than the check earns.
+    """
+    root = build(tmp_path, **{
+        "query.date": "2015-10-30",
+        "cross_checks.release_date": {"consensus": "2003-10-06"},
+        "musicbrainz.first_release_date": "2003-10-06"})
+    identity_file(root)
+
+    rep = audit.run(root)
+
+    assert find(rep, "release.date_conflict").hits == []
+
+
+def test_a_reissue_matched_instead_of_the_original_still_flags(tmp_path):
+    """The case the check exists for: a date agreeing with nothing."""
+    root = build(tmp_path, **{
+        "query.date": "1979-05-01",
+        "cross_checks.release_date": {"consensus": "2011-06-01"},
+        "musicbrainz.first_release_date": "1979-05-01"})
+    identity_file(root)
+
+    rep = audit.run(root)
+
+    assert len(find(rep, "release.date_conflict").hits) == 3

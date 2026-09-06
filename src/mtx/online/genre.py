@@ -209,6 +209,48 @@ def _squash(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", str(name).lower())
 
 
+# Discogs files everything under fifteen top-level buckets, several of which
+# are lists wearing a single label: `Folk, World, & Country` is not a genre
+# any record is in, it is three of them stapled together for a shop's browse
+# menu.  Notion rejects a comma in a select option outright, so the push
+# silently swapped it for a semicolon -- which kept the table working and left
+# `folk; world; & country` sitting in the filter menu as a category matching
+# 38 tracks and describing none of them.
+_BUCKET = re.compile(r"\s*,\s*|\s*&\s*|\s+/\s+")
+
+
+def split_bucket(name: str) -> list[str]:
+    """One label per genre, so a browse-menu bucket votes for its parts.
+
+    Only splits on the separators a bucket is built from, and only when what
+    falls out is more than one word long -- `Drum & Bass` and `Rock & Roll`
+    are single genres that happen to contain an ampersand, and splitting them
+    would invent `drum`, `bass` and `roll`.
+    """
+    text = str(name or "").strip()
+    if not text:
+        return []
+    if _squash(text) in _INDIVISIBLE:
+        return [text]
+    parts = [p.strip(" -/&") for p in _BUCKET.split(text)]
+    parts = [p for p in parts if len(p) > 2]
+    return parts or [text]
+
+
+# Genres whose own name contains a separator.  Kept as a list rather than a
+# rule because there is no rule: `Funk / Soul` is Discogs' bucket for two
+# genres and `Drum & Bass` is one genre, and only knowing the music tells
+# them apart.
+# Spelt the way `_squash` leaves them: it strips the ampersand rather than
+# expanding it, so `Drum & Bass` arrives here as `drumbass`.
+_INDIVISIBLE = {
+    "drumbass", "drumandbass", "drumnbass",
+    "rockroll", "rockandroll",
+    "rhythmblues", "rhythmandblues",
+    "bluesrock", "folkrock", "poprock", "jazzfunk", "souljazz",
+}
+
+
 def collect(by_source: dict[str, Iterable[Any]], top: int = 12,
             exclude: Iterable[str] | None = None) -> dict[str, Any]:
     """Merge every source's labels into one ranked, sourced list.
@@ -237,7 +279,8 @@ def collect(by_source: dict[str, Iterable[Any]], top: int = 12,
         raw[source] = [{"name": n, "votes": v} for n, v in votes]
         peak_vote = max((v for _n, v in votes), default=0.0) or 1.0
         trust = SOURCE_WEIGHT.get(source, 0.5)
-        for name, vote in votes:
+        for whole, vote in votes:
+          for name in split_bucket(whole):
             # The tag noise filter belongs here too.  It only ever ran on the
             # descriptive tags, so a shelf label that `umbrella()` failed to
             # classify fell through into the genre list instead -- which is
