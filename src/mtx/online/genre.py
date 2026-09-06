@@ -220,7 +220,12 @@ def _squash(name: str) -> str:
 # `Folk, World, & Country`; a genre is written `R&B`, and splitting on a bare
 # `&` turned `Contemporary R&B` into `contemporary r` on 283 tracks -- a
 # category that reads like a real one and is a fragment of a word.
-_BUCKET = re.compile(r"\s*,\s*|\s+&\s+|\s+/\s+")
+# The slash needs no surrounding whitespace, because `normalise` has already
+# tightened ` / ` to `/` by the time a label arrives here.  Every slashed name
+# in this corpus is a bucket rather than a genre -- `funk/soul` 415 tracks,
+# `films/games` 52, `rnb/swing` 51, `techno/house` 5 -- so the split is safe,
+# and `_INDIVISIBLE` is where a genuine slashed genre would go.
+_BUCKET = re.compile(r"\s*,\s*|\s+&\s+|\s*/\s*")
 
 
 def split_bucket(name: str) -> list[str]:

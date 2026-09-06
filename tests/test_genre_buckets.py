@@ -88,3 +88,16 @@ def test_a_spaced_ampersand_is_still_a_separator():
 def test_the_lowercased_bucket_splits_too():
     """`normalise` runs first, so this is the spelling that actually arrives."""
     assert split_bucket("folk, world, & country") == ["folk", "world", "country"]
+
+
+def test_a_slash_bucket_splits_without_needing_spaces():
+    """`normalise` tightens ` / ` to `/` before a label reaches the splitter.
+
+    Every slashed name in this corpus is a bucket rather than a genre --
+    `funk/soul` on 415 tracks, `films/games` on 52, `rnb/swing` on 51 -- so
+    those tracks were voting for a category no record is in, and casting no
+    vote for `funk` or `soul`, which is what they are.
+    """
+    assert split_bucket("funk/soul") == ["funk", "soul"]
+    assert split_bucket("rnb/swing") == ["rnb", "swing"]
+    assert split_bucket("techno/house") == ["techno", "house"]
