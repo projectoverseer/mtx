@@ -289,7 +289,14 @@ def collect(by_source: dict[str, Iterable[Any]], top: int = 12,
         peak_vote = max((v for _n, v in votes), default=0.0) or 1.0
         trust = SOURCE_WEIGHT.get(source, 0.5)
         for whole, vote in votes:
-          for name in split_bucket(whole):
+          # Re-normalised after splitting: `_votes` normalised the whole
+          # label, so the parts falling out of a bucket have never been
+          # through the alias table.  `electro pop/electro rock` split into
+          # `electro pop`, which ALIAS maps to `electropop` and never got the
+          # chance to -- leaving both spellings in the vocabulary, which is
+          # the case collision the audit exists to catch.
+          for name in filter(None, (normalise(part)
+                                    for part in split_bucket(whole))):
             # The tag noise filter belongs here too.  It only ever ran on the
             # descriptive tags, so a shelf label that `umbrella()` failed to
             # classify fell through into the genre list instead -- which is
