@@ -256,6 +256,23 @@ def shared_stamp(root: str) -> str:
                 h.update(hashlib.sha256(fh.read()).digest())
         except OSError:
             h.update(b"-")
+    # The property spec is a shared input too, and the corpus does not move
+    # when it changes.  `Loop bars` was repointed from a dict to the number
+    # inside it, and every stamp stayed identical -- so a routine push would
+    # have reported `0 pushed, 1321 already present`, exit 0, and left the
+    # column empty for good.  The same silence would hide any repointed path.
+    #
+    # Hashed as a file rather than by walking the property list, because the
+    # bug that made this necessary was inside a reader's body: `credit()` kept
+    # its name and its wiring while matching a role no provider emits.  A
+    # comment change re-pushes the corpus for nothing, ten minutes, rarely.
+    # A missed one publishes an empty column indefinitely.
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "schema.py"), "rb") as fh:
+            h.update(hashlib.sha256(fh.read()).digest())
+    except OSError:
+        h.update(b"-")
     return h.hexdigest()[:16]
 
 
