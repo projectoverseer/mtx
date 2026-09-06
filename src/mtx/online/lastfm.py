@@ -77,6 +77,15 @@ def lookup(client: Client, local: dict[str, Any]) -> dict[str, Any]:
     if lead and clean:
         attempts.append(("primary", lead, clean))
     attempts.append(("tag", artist, title))
+    # Last resort: the title with every bracket stripped.  `My Everything
+    # (Debut Single 2015)` is the shop's own annotation rather than the song's
+    # name, and no careful cleaner will remove it -- `(Debut Single 2015)`
+    # does not open with a packaging word.  A track with no play count has no
+    # outcome variable and drops out of every popularity comparison, which is
+    # a worse outcome than one blunt extra query.
+    bare = match.bare_title(title)
+    if lead and bare and bare != clean:
+        attempts.append(("bare title", lead, bare))
 
     track: dict[str, Any] = {}
     tried: list[str] = []

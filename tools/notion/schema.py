@@ -515,7 +515,14 @@ _group("melody", [
     P("Melisma index", "number", "stems.melody.vocals.melisma_index"),
     P("Vibrato rate", "number", "stems.melody.vocals.vibrato.rate_hz_median", "Hz"),
     P("Self-similarity", "number", "stems.melody.vocals.self_similarity.repeated_ngram_share"),
-    P("Delivery", "select", "stems.melody.vocals.delivery.classification"),
+    # `delivery.classification` has never existed: the value is nested under
+    # `inference`, because it is one.  Empty on all 1,321 rows since the
+    # column was added, and empty reads as "no vocal" rather than "wrong key".
+    P("Delivery", "select", "stems.melody.vocals.delivery.inference.delivery"),
+    P("Delivery confidence", "select",
+      "stems.melody.vocals.delivery.inference.confidence"),
+    P("Stable pitch share", "number",
+      "stems.melody.vocals.delivery.stable_pitch_share"),
     P("Out of scale", "number", "stems.melody.vocals.chromaticism.out_of_scale_time_pct", "%"),
 ])
 

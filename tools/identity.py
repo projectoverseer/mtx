@@ -42,6 +42,7 @@ import sys
 import unicodedata
 from typing import Any
 
+HERE = os.path.dirname(os.path.abspath(__file__))
 SCHEMA_VERSION = "1.0.0"
 FILENAME = "artists.json"
 
@@ -140,8 +141,7 @@ def resolve_one(folder: str, facts: list[dict[str, Any]]) -> dict[str, Any]:
                      key=lambda kv: (kv[1], squash(kv[0]) == target, -len(kv[0])))
     out["votes"] = count
     out["agreement"] = round(count / len(facts), 4)
-    if mbids[top]:
-        out["mbid"] = mbids[top].most_common(1)[0][0]
+    winner_mbid = mbids[top].most_common(1)[0][0] if mbids[top] else None
 
     same = squash(top) == target
     # A one-track folder cannot vote, but "Stepen Sanchez" against "Stephen
@@ -160,16 +160,120 @@ def resolve_one(folder: str, facts: list[dict[str, Any]]) -> dict[str, Any]:
         out["notion_name"] = notion_safe(top)
         out["source"] = "musicbrainz"
         out["renamed"] = top != folder
+        out["mbid"] = winner_mbid
     else:
+        # The credit was rejected as this folder's name -- so its MBID is a
+        # different artist's, and keeping it pairs one artist's id with
+        # another's name.  The `Alan Walker` folder held K-391's MBID under
+        # the name `Alan Walker`: a row that is populated, correctly typed,
+        # internally consistent to every reader, and about two people.
+        #
+        # Dropping it also lets the artist search below run, which finds the
+        # real Alan Walker at score 100.
         out["note"] = (f"kept the folder name: the most common credit {top!r} "
-                       f"covers {count}/{len(facts)} track(s)")
+                       f"covers {count}/{len(facts)} track(s), and its MBID "
+                       f"was left with it")
+        out["rejected_credit"] = top
+        out["rejected_mbid"] = winner_mbid
     return out
 
 
-def build(root: str) -> dict[str, Any]:
+# A MusicBrainz artist search returns a score out of 100.  Below this the top
+# hit is a different person with a similar name, and a wrong MBID is worse
+# than none: it merges two catalogues in every within-artist comparison.
+ARTIST_SEARCH_FLOOR = 90
+# And the name it returns still has to be the name that was asked for.
+ARTIST_NAME_FLOOR = 0.90
+
+
+def search_artist(client, name: str) -> dict[str, Any] | None:
+    """Ask MusicBrainz for an artist directly, by name.
+
+    Every MBID in this file otherwise comes from a *recording* match: the
+    tracks vote, and the winning credit brings its id along.  That leaves a
+    folder whose tracks MusicBrainz has never seen with no identity at all --
+    four Vietnamese artists here, each a single track, each with `no candidate
+    recording` against an ISRC the database does not carry.
+
+    But MusicBrainz knows the artists perfectly well.  `Lê Hiếu` and
+    `Tiên Tiên` both come back from an artist search at score 100 with a
+    Vietnamese country code.  Nothing was wrong except that nobody asked.
+
+    Held to a high floor on both the search score and the name itself,
+    because this runs exactly where there is no vote to corroborate it.
+    """
+    from urllib.parse import quote                     # noqa: PLC0415
+
+    query = quote(f'artist:"{name}"')
+    body, err = client.get_json(
+        f"https://musicbrainz.org/ws/2/artist?fmt=json&limit=3&query={query}")
+    if err or not body:
+        return None
+    for hit in body.get("artists") or []:
+        score = int(hit.get("score") or 0)
+        if score < ARTIST_SEARCH_FLOOR:
+            break                                      # sorted by score
+        ratio = difflib.SequenceMatcher(
+            None, squash(hit.get("name") or ""), squash(name)).ratio()
+        if ratio >= ARTIST_NAME_FLOOR and hit.get("id"):
+            return {"mbid": hit["id"], "name": hit.get("name") or name,
+                    "score": score, "country": hit.get("country"),
+                    "disambiguation": hit.get("disambiguation") or None}
+    return None
+
+
+def resolve_unheard(root: str, artists: dict[str, dict[str, Any]],
+                    log_fn=None) -> int:
+    """Give an identity to folders no recording could vote on."""
+    unheard = [f for f, a in artists.items()
+               if not a.get("mbid") and a.get("source") == "folder"]
+    if not unheard:
+        return 0
+    try:
+        sys.path.insert(0, os.path.join(HERE, "..", "src"))
+        from mtx.online.http import Client              # noqa: PLC0415
+    except Exception:
+        return 0
+    cache = os.path.join(root, ".mtx_cache")
+    client = Client(f"mtx/{_version()} ( identity )", cache)
+    found = 0
+    for folder in unheard:
+        hit = search_artist(client, artists[folder]["name"])
+        if not hit:
+            continue
+        entry = artists[folder]
+        entry["mbid"] = hit["mbid"]
+        entry["source"] = "musicbrainz:artist-search"
+        entry["search_score"] = hit["score"]
+        entry["country"] = hit.get("country")
+        # The name is only replaced when the database spells it differently;
+        # an identical name with an id attached is not a rename.
+        if hit["name"] != entry["name"]:
+            entry["name"] = hit["name"]
+            entry["notion_name"] = notion_safe(hit["name"])
+            entry["renamed"] = hit["name"] != folder
+        entry.pop("note", None)
+        found += 1
+        if log_fn:
+            log_fn(f"  {folder!r} -> {hit['name']!r} by artist search "
+                   f"(score {hit['score']}, {hit.get('country') or '??'})")
+    return found
+
+
+def _version() -> str:
+    try:
+        from mtx import __version__                    # noqa: PLC0415
+        return __version__
+    except Exception:
+        return "0"
+
+
+def build(root: str, search: bool = True) -> dict[str, Any]:
     by_folder = scan(root)
     artists = {folder: resolve_one(folder, facts)
                for folder, facts in sorted(by_folder.items())}
+    if search:
+        resolve_unheard(root, artists, log)
 
     # Two folders that resolve to one artist would silently merge two
     # catalogues in every within-artist comparison.  Report, never merge.
@@ -206,9 +310,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("root", help="the corpus root that `mtx scan` wrote")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--no-search", action="store_true",
+                    help="skip the MusicBrainz artist-search fallback")
     args = ap.parse_args()
 
-    doc = build(args.root)
+    doc = build(args.root, search=not args.no_search)
     log(f"{doc['folders']} catalogue folder(s), {doc['renamed']} renamed by "
         f"MusicBrainz, {len(doc['unresolved'])} unresolved")
     for folder, entry in sorted(doc["artists"].items()):

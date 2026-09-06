@@ -134,6 +134,27 @@ def search_title(title: str) -> str:
     return t or str(title or "").strip()
 
 
+_ANY_BRACKET = re.compile(r"\s*[\(\[][^\)\]]*[\)\]]\s*")
+
+
+def bare_title(title: str) -> str:
+    """Every bracketed segment removed, whatever is in it.
+
+    `search_title` only strips brackets that open with a word it recognises as
+    packaging, which is right: it is used to ask a database a question, and
+    throwing away `(Live at Wembley)` would ask about a different recording.
+
+    But `My Everything (Debut Single 2015)` is not packaging by that list and
+    is not part of the name either, and Last.fm has never heard of it. So this
+    exists as a *last* attempt, after the careful ones have missed: blunter
+    than is safe as a default, and worth trying when the alternative is no
+    play count at all.
+    """
+    t = _ANY_BRACKET.sub(" ", str(title or ""))
+    t = re.sub(r"\s+", " ", t).strip(" -")
+    return t or str(title or "").strip()
+
+
 def search_artist(artist: str) -> str:
     """Tag multi-value separators turned into something a search box accepts."""
     a = re.sub(r"\s*[/;\x00]\s*", ", ", str(artist or ""))
