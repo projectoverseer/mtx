@@ -295,13 +295,27 @@ def _neighbours(rows: list[dict[str, Any]], zmat: np.ndarray,
     have_emb = [i for i, e in enumerate(embeddings) if e is not None]
     if len(have_emb) >= 2 and len({embeddings[i].size for i in have_emb}) == 1:
         M = np.vstack([embeddings[i] for i in have_emb])
+        # Centred on the corpus before the cosine.  A mean-pooled transformer
+        # embedding is dominated by a component every input shares -- "this is
+        # music" -- and on raw vectors that component is most of the angle:
+        # measured over these 1,321 tracks, cosine ran min 0.535, median 0.909,
+        # p95 0.949, sd 0.042.  Everything was similar to everything, so the
+        # top five were whichever tracks happened to sit a thousandth higher,
+        # and `How Deep Is Your Love` returned Taylor Swift and Queen.
+        #
+        # Subtracting the corpus mean removes what the corpus has in common
+        # and leaves what distinguishes a record from it: the same similarities
+        # spread out to median -0.010, sd 0.176, four times the range. The
+        # question changes from "is this music" to "how does this differ from
+        # the average record here", which is the one a neighbour list is for.
+        M = M - M.mean(axis=0, keepdims=True)
         M = M / np.maximum(np.linalg.norm(M, axis=1, keepdims=True), 1e-12)
         sim = M @ M.T
         np.fill_diagonal(sim, -np.inf)
         for pos, i in enumerate(have_emb):
             order = np.argsort(sim[pos])[::-1][:k]
             rows[i]["neighbours"] = {
-                "basis": "embedding cosine",
+                "basis": "corpus-centred embedding cosine",
                 "list": [{"artist": rows[have_emb[j]]["artist"],
                           "title": rows[have_emb[j]]["title"],
                           "similarity": float(sim[pos, j])} for j in order],
