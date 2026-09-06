@@ -16,6 +16,7 @@ The bug is invisible from the log, which reports each one as a fresh `ok`.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -91,3 +92,72 @@ def test_a_lyric_from_somewhere_else_does_not_fake_a_transcript():
             transcript={"available": True, "source": "file:tag"})
 
     assert transcribe.already_done(d) is False
+
+
+def test_an_instrumental_records_why_it_was_not_transcribed(tmp_path):
+    """A silent skip leaves the file claiming nobody asked.
+
+    Four tracks came back from a re-scan saying `not requested; pass
+    --transcribe` after a run that had requested it and refused, correctly,
+    because the separated vocal sat 41 LU below the mix. Queen's `God Save the
+    Queen` is an instrumental arrangement; the others are score cues. None of
+    them will ever have words, and the difference between "buy a lyric sheet"
+    and "there is no vocal here" is the whole value of the note.
+    """
+    import transcribe as T
+
+    folder = tmp_path / "track"
+    folder.mkdir()
+    path = folder / "analysis.json"
+    doc = {"lyrics": {"transcript": {"available": False,
+                                     "reason": "not requested; pass --transcribe"}}}
+    path.write_text(json.dumps(doc), encoding="utf-8")
+
+    T._record_attempt(str(folder), str(path), doc, False,
+                      "not transcribed: the separated vocal sits -41.0 LU below "
+                      "the mix", {"instrumental_lu": -41.0})
+
+    got = json.loads(path.read_text(encoding="utf-8"))
+    note = got["lyrics"]["transcript"]
+    assert "-41.0 LU" in note["reason"]
+    assert note["vocal_lufs_delta"] == -41.0
+    assert note["available"] is False
+    assert "attempted_utc" in note
+
+
+def test_recording_the_same_reason_twice_does_not_touch_the_file(tmp_path):
+    """The push decides what to send by folder stamp.
+
+    Re-stamping every instrumental nightly, to change one timestamp nobody
+    reads, would re-send them to Notion on every run for the rest of time.
+    """
+    import transcribe as T
+
+    folder = tmp_path / "track"
+    folder.mkdir()
+    path = folder / "analysis.json"
+    reason = "not transcribed: the separated vocal sits -41.0 LU below the mix"
+    doc = {"lyrics": {"transcript": {"available": False, "reason": reason}}}
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    before = path.stat().st_mtime_ns
+
+    T._record_attempt(str(folder), str(path), doc, False, reason,
+                      {"instrumental_lu": -41.0})
+
+    assert path.stat().st_mtime_ns == before, "an unchanged finding rewrote the file"
+
+
+def test_a_changed_reason_is_still_written(tmp_path):
+    """Idempotence must not swallow a track that started failing differently."""
+    import transcribe as T
+
+    folder = tmp_path / "track"
+    folder.mkdir()
+    path = folder / "analysis.json"
+    doc = {"lyrics": {"transcript": {"available": False, "reason": "old reason"}}}
+    path.write_text(json.dumps(doc), encoding="utf-8")
+
+    T._record_attempt(str(folder), str(path), doc, False, "a new reason", {})
+
+    got = json.loads(path.read_text(encoding="utf-8"))
+    assert got["lyrics"]["transcript"]["reason"] == "a new reason"

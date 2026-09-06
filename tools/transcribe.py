@@ -140,7 +140,8 @@ def _save(folder: str, path: str, doc: dict, whole: bool) -> None:
 
 
 def _record_attempt(folder: str, path: str, doc: dict, whole: bool,
-                    reason: str, transcript: dict) -> None:
+                    reason: str, transcript: dict,
+                    force_stamp: bool = False) -> None:
     """Note that transcription was tried here and did not work.
 
     Deliberately not enough to count as done: `available` stays false and no
@@ -156,11 +157,20 @@ def _record_attempt(folder: str, path: str, doc: dict, whole: bool,
     note = lyrics.setdefault("transcript", {})
     if not isinstance(note, dict):
         return
+    if note.get("reason") == reason and not force_stamp:
+        # Nothing new to say.  Rewriting anyway would restamp the folder on
+        # every run, and the Notion push decides what to send by folder stamp
+        # -- so a nightly no-op would re-send every instrumental in the corpus
+        # for the sake of a changed timestamp.  The lost precision is the time
+        # of the *latest* identical attempt, which nobody reads.
+        return
     note["available"] = False
     note["reason"] = reason
     note["attempted_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     if transcript.get("attempted"):
         note["attempted_devices"] = transcript["attempted"]
+    if transcript.get("instrumental_lu") is not None:
+        note["vocal_lufs_delta"] = transcript["instrumental_lu"]
     _save(folder, path, doc, whole)
 
 
@@ -193,6 +203,21 @@ def transcribe_one(folder: str, force: bool) -> tuple[str, str]:
         return "skip", "source audio is not where the analysis says it is"
     level = vocal_level(folder)
     if level is not None and level < INSTRUMENTAL_LU:
+        why = (f"not transcribed: the separated vocal sits {level:.1f} LU below "
+               f"the mix, past the {INSTRUMENTAL_LU:.0f} LU at which this counts "
+               f"as an instrumental, and a transcript here would be invention")
+        # Write the finding down.  Skipping silently leaves `reason` saying
+        # "not requested; pass --transcribe", which is untrue after a run that
+        # did request it and refused for a measured reason -- and it is the
+        # difference between "buy a lyric sheet for this track" and "this
+        # record has no vocal to transcribe".  Queen's `God Save the Queen`
+        # is an instrumental arrangement and three of the others are score
+        # cues; none of them will ever have words.
+        try:
+            _record_attempt(folder, path, doc, moved_lyrics, why,
+                            {"instrumental_lu": round(level, 2)})
+        except (OSError, ValueError):
+            pass
         return "skip", (f"instrumental: the vocal stem is {level:.1f} LU below "
                         f"the mix, and a transcript here would be invention")
 
