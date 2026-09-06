@@ -216,7 +216,11 @@ def _squash(name: str) -> str:
 # silently swapped it for a semicolon -- which kept the table working and left
 # `folk; world; & country` sitting in the filter menu as a category matching
 # 38 tracks and describing none of them.
-_BUCKET = re.compile(r"\s*,\s*|\s*&\s*|\s+/\s+")
+# The ampersand must have whitespace on both sides.  A bucket is written
+# `Folk, World, & Country`; a genre is written `R&B`, and splitting on a bare
+# `&` turned `Contemporary R&B` into `contemporary r` on 283 tracks -- a
+# category that reads like a real one and is a fragment of a word.
+_BUCKET = re.compile(r"\s*,\s*|\s+&\s+|\s+/\s+")
 
 
 def split_bucket(name: str) -> list[str]:
