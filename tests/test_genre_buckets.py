@@ -101,3 +101,18 @@ def test_a_slash_bucket_splits_without_needing_spaces():
     assert split_bucket("funk/soul") == ["funk", "soul"]
     assert split_bucket("rnb/swing") == ["rnb", "swing"]
     assert split_bucket("techno/house") == ["techno", "house"]
+
+
+def test_the_parts_of_a_bucket_go_through_the_alias_table():
+    """`_votes` normalises the whole label; the parts had never been.
+
+    `electro pop/electro rock` split into `electro pop`, which ALIAS maps to
+    `electropop` and never got the chance to -- so both spellings sat in the
+    vocabulary, and Notion, which folds one casing onto another, showed a
+    column agreeing with neither.
+    """
+    got = collect({"lastfm": [{"name": "electro pop/electro rock", "count": 1}]})
+
+    names = {g["name"] for g in got["ranked"]}
+    assert "electropop" in names
+    assert "electro pop" not in names
