@@ -66,3 +66,25 @@ def test_an_indivisible_genre_still_votes_as_itself():
 
     names = {g["name"] for g in got["ranked"]}
     assert "drum" not in names and "bass" not in names
+
+
+def test_an_ampersand_inside_a_word_is_not_a_separator():
+    """The regression this rule introduced before the corpus caught it.
+
+    A bucket is written `Folk, World, & Country`, with spaces.  A genre is
+    written `R&B`, without.  Splitting on a bare ampersand turned
+    `Contemporary R&B` into `contemporary r` on 283 tracks -- a category that
+    reads like a real one and is a fragment of a word.
+    """
+    assert split_bucket("Contemporary R&B") == ["Contemporary R&B"]
+    assert split_bucket("R&B") == ["R&B"]
+    assert split_bucket("contemporary r&b") == ["contemporary r&b"]
+
+
+def test_a_spaced_ampersand_is_still_a_separator():
+    assert split_bucket("Stage & Screen") == ["Stage", "Screen"]
+
+
+def test_the_lowercased_bucket_splits_too():
+    """`normalise` runs first, so this is the spelling that actually arrives."""
+    assert split_bucket("folk, world, & country") == ["folk", "world", "country"]

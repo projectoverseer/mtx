@@ -456,3 +456,39 @@ def test_a_reissue_matched_instead_of_the_original_still_flags(tmp_path):
     rep = audit.run(root)
 
     assert len(find(rep, "release.date_conflict").hits) == 3
+
+
+def test_the_loop_candidate_reports_what_was_measured():
+    """`harmony.loop.loop` is null on every track in this corpus.
+
+    Not because nothing loops -- `Around the World` is four bars repeated for
+    seven minutes, and its 4-bar candidate does score highest -- but because
+    the confirmation threshold is 0.75 against an exact per-bar chord-set
+    match, and the chord detector emits multi-chord bars that rarely match
+    exactly.  The best score anywhere in the corpus is 0.15.
+
+    Lowering the threshold until it fires would be manufacturing a result.
+    Reporting the period that repeats most, and the share of bars at which it
+    does, is reporting the measurement.
+    """
+    import sys, os
+    sys.path.insert(0, os.path.join(TOOLS, "notion"))
+    from schema import loop_candidate                   # noqa: PLC0415
+
+    doc = {"harmony": {"loop": {"loop": None, "threshold": 0.75, "candidates": [
+        {"bars": 1, "match_fraction": 0.075},
+        {"bars": 4, "match_fraction": 0.148},
+        {"bars": 8, "match_fraction": 0.117}]}}}
+
+    assert loop_candidate("bars")(doc) == 4
+    assert loop_candidate("match_fraction")(doc) == 0.148
+
+
+def test_no_candidates_reports_nothing_rather_than_zero():
+    """A track with no chord track has no period, which is not a period of 0."""
+    import sys, os
+    sys.path.insert(0, os.path.join(TOOLS, "notion"))
+    from schema import loop_candidate                   # noqa: PLC0415
+
+    assert loop_candidate("bars")({"harmony": {"loop": {"candidates": []}}}) is None
+    assert loop_candidate("bars")({}) is None

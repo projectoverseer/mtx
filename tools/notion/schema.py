@@ -168,6 +168,39 @@ def credit(role: str) -> Callable[[dict], Any]:
     return read
 
 
+def loop_candidate(field: str) -> Callable[[dict], Any]:
+    """The strongest repeating chord period, and how well it actually repeats.
+
+    `harmony.loop.loop` is null on every track in this corpus.  Not because
+    nothing loops -- `Around the World` is four bars repeated for seven
+    minutes and its 4-bar candidate does score highest -- but because the
+    confirmation threshold is 0.75 against an exact per-bar chord-set match,
+    and the chord detector emits multi-chord bars (`Gm|D#sus2|Fsus4`) that
+    rarely match exactly.  The best score anywhere in the corpus is 0.15.
+
+    So the threshold is unreachable and the column is empty, which reads as
+    "this music does not repeat" about records built entirely on repetition.
+    Rather than lower a number until it fires -- which would be manufacturing
+    a result -- these report what was measured: the period that repeats most,
+    and the share of bars at which it does.  Naming it a candidate is the
+    difference between a measurement and a claim.
+    """
+    def read(doc: dict) -> Any:
+        cands = dig(doc, "analysis.harmony.loop.candidates") or \
+            dig(doc, "harmony.loop.candidates") or []
+        best = None
+        for c in cands:
+            if not isinstance(c, dict):
+                continue
+            if best is None or (c.get("match_fraction") or 0) > \
+                    (best.get("match_fraction") or 0):
+                best = c
+        if not best:
+            return None
+        return best.get(field)
+    return read
+
+
 def is_single(doc: dict) -> Any:
     """Album cut or standalone release -- the corpus's natural contrast set.
 
@@ -483,6 +516,8 @@ _group("harmony", [
     P("Borrowed", "number", "harmony.degrees.borrowed_time_pct", "%"),
     P("Chord entropy", "number", "harmony.vocabulary.entropy_bits", "bits"),
     P("Loop bars", "number", "harmony.loop.loop"),
+    P("Loop candidate bars", "number", loop_candidate("bars")),
+    P("Loop candidate match", "number", loop_candidate("match_fraction")),
     P("Modulations", "number", "harmony.modulation.change_count"),
     P("Harmony confidence", "select", "harmony.confidence"),
 ])
