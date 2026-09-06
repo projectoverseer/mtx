@@ -33,6 +33,8 @@ from typing import Any
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "src"))
 
+from env import load_env                          # noqa: E402
+
 from mtx import __version__ as MTX_VERSION            # noqa: E402
 from mtx.metrics import lyrics as m_lyrics            # noqa: E402
 from mtx.params import PARAMS                         # noqa: E402
@@ -260,6 +262,7 @@ def main() -> int:
                     help="re-transcribe folders that already have one")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
+    load_env(args.root)
 
     P = PARAMS["lyrics"]["transcript"]
     model = (os.environ.get("MTX_WHISPER_MODEL") or P.get("model") or "").strip()

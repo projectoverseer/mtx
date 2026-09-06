@@ -43,6 +43,10 @@ import unicodedata
 from typing import Any
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+from env import load_env                          # noqa: E402
+
 SCHEMA_VERSION = "1.0.0"
 FILENAME = "artists.json"
 
@@ -313,6 +317,7 @@ def main() -> int:
     ap.add_argument("--no-search", action="store_true",
                     help="skip the MusicBrainz artist-search fallback")
     args = ap.parse_args()
+    load_env(args.root)
 
     doc = build(args.root, search=not args.no_search)
     log(f"{doc['folders']} catalogue folder(s), {doc['renamed']} renamed by "

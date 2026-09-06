@@ -37,9 +37,11 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "src"))
 
+from env import load_env                        # noqa: E402
 from mtx import __version__                     # noqa: E402
 from mtx.cli import _enrich_targets             # noqa: E402
 from mtx.online import ALL_PROVIDERS, DEFAULT_PROVIDERS, enrich  # noqa: E402
@@ -100,6 +102,7 @@ def main() -> int:
                     help="re-enrich folders that already have an online.json")
     ap.add_argument("--limit", type=int)
     args = ap.parse_args()
+    load_env(args.root)
 
     providers = (list(ALL_PROVIDERS) if args.providers.strip().lower() == "all"
                  else [p.strip() for p in args.providers.split(",") if p.strip()])

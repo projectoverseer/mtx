@@ -46,6 +46,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "src"))
 
+from env import load_env                          # noqa: E402
+
 from mtx import __version__ as MTX_VERSION            # noqa: E402
 from mtx.audio import AudioSource                     # noqa: E402
 from mtx.metrics import embedding as m_embedding      # noqa: E402
@@ -157,6 +159,7 @@ def main() -> int:
                     help="re-embed folders that already have a vector")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
+    load_env(args.root)
 
     available = [name for name, fn in (("laion_clap", m_embedding._try_laion_clap),
                                        ("openl3", m_embedding._try_openl3),

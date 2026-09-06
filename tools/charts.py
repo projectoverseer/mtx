@@ -45,6 +45,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "src"))
 
+from env import load_env                          # noqa: E402
+
 FIELDS = ("billboard_peak", "weeks_on_chart", "certification", "chart")
 NUMERIC = ("billboard_peak", "weeks_on_chart")
 
@@ -192,6 +194,7 @@ def main() -> int:
                     help="replace outcome values already in a declared.json")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
+    load_env(args.root)
 
     if args.template:
         with open(args.template, "w", encoding="utf-8", newline="\n") as fh:

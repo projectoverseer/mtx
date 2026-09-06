@@ -32,9 +32,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "..", "src"))
 
 from client import Notion, NotionError            # noqa: E402
+from env import load_env                          # noqa: E402
 from rows import (OBSERVATION_SCHEMA, body_blocks, database_schema,  # noqa: E402
                   load_cohorts, load_folder, load_identities,
                   load_outcomes,
@@ -436,6 +439,7 @@ def main() -> int:
                     help=("archive a database of this title under --parent "
                           "once the push succeeds; repeatable"))
     args = ap.parse_args()
+    load_env(args.root)
 
     if not args.dry_run and not args.parent:
         # Only needed to *create* the databases.  Once the state file knows
