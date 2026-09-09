@@ -72,8 +72,16 @@ class State:
     requests to work out where it stopped.
     """
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, dry_run: bool = False):
         self.path = path
+        # A dry run must not be able to change what a later real run believes.
+        # It used to: `Notion.request` answers every call with `{"id":
+        # "dry-run"}`, that id was stored as the page a track had become, and
+        # the next live push tried to PATCH `/pages/dry-run` -- 400, and the
+        # track silently stopped being published.  Two tracks were lost that
+        # way on 2026-09-09 after a two-row dry run taken to check a schema
+        # edit.  The state is now read-only whenever the client is.
+        self.dry_run = dry_run
         self.data = {"tracks": {}, "observations": [], "databases": {}}
         if os.path.isfile(path):
             try:
@@ -83,6 +91,8 @@ class State:
                 log(f"warning: unreadable state at {path}; starting fresh")
 
     def save(self) -> None:
+        if self.dry_run:
+            return
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(self.data, fh, indent=1, ensure_ascii=False)
@@ -493,7 +503,8 @@ def _run(args) -> int:
         log("note: no outcome.json; the within-artist outcome columns will "
             "be empty. Run tools/notion/outcome.py first.")
 
-    state = State(args.state or os.path.join(args.root, ".notion_state.json"))
+    state = State(args.state or os.path.join(args.root, ".notion_state.json"),
+                  dry_run=args.dry_run)
     api = Notion(args.token, dry_run=args.dry_run, log=log)
     tracks_db, obs_db = ensure_databases(api, args.parent, state, args.dry_run)
 

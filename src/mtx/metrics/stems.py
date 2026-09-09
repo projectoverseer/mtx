@@ -435,7 +435,12 @@ def analyse(src: AudioSource, collector: Collector, profile: str = "full",
     for name in sorted(sources):
         s = sources[name]
         sub = Collector()
-        loud = m_loudness.analyse(s, sub)
+        # A stem is never delivered, so the 16x oversampled true peak and
+        # the intersample-over count are measured on a signal nobody ships
+        # and read by no column -- `level_vs_mix` below wants the gated
+        # integrated loudness, which the quick path still computes.  On a
+        # 55 s track the four stems spent 11.1 s of a 81.8 s analysis here.
+        loud = m_loudness.analyse(s, sub, "quick")
         entry = {
             "source": "separated",
             "path": s.path,

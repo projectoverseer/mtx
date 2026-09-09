@@ -72,6 +72,35 @@ def folder(tmp_path, **files):
     return d
 
 
+def test_a_dry_run_never_writes_the_state_file(tmp_path):
+    """A dry run must not change what a later real run believes.
+
+    `Notion.request` answers every call in dry-run mode with `{"id":
+    "dry-run"}`.  That id used to be saved as the page a track had become, so
+    the next live push issued `PATCH /pages/dry-run`, got a 400, and dropped
+    the track -- while every other row published normally and the run still
+    exited 0.  Two tracks were lost that way on 2026-09-09 after a two-row dry
+    run taken to verify a schema edit.
+    """
+    path = tmp_path / ".notion_state.json"
+    real = push.State(str(path))
+    real.data["tracks"]["sha-1"] = "11111111-2222-3333-4444-555555555555"
+    real.save()
+    before = path.read_text(encoding="utf-8")
+
+    dry = push.State(str(path), dry_run=True)
+    assert dry.data["tracks"]["sha-1"] == "11111111-2222-3333-4444-555555555555"
+    dry.data["tracks"]["sha-1"] = "dry-run"
+    dry.data["tracks"]["sha-2"] = "dry-run"
+    dry.save()
+
+    assert path.read_text(encoding="utf-8") == before
+    assert "dry-run" not in path.read_text(encoding="utf-8")
+    # and a fresh reader still sees the real page id
+    assert push.State(str(path)).data["tracks"] == {
+        "sha-1": "11111111-2222-3333-4444-555555555555"}
+
+
 def test_amending_an_analysis_changes_the_folder_stamp(tmp_path):
     """A transcription pass is an amendment, and must be visible as one."""
     d = folder(tmp_path, **{"analysis.json": '{"lyrics": {}}',

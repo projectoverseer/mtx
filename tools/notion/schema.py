@@ -629,6 +629,42 @@ _group("mix", [
     P("Concurrent sources", "number", "headline.concurrent_sources_mean"),
 ])
 
+# --------------------------------------------------------------------------
+# per-stem balance -- the four separated sources, compared across tracks
+# --------------------------------------------------------------------------
+# `stems.stems.<name>` already carried a full loudness, dynamics, spectrum and
+# stereo pass for every separated source, measured on every track in the
+# corpus and read by nothing: the mix group above lifts only `stems.masking`.
+# So "how far under the mix does a vocal usually sit" was a question the data
+# could answer and the table could not.
+#
+# Five per stem, chosen by the same test as everything else -- would you
+# compare it across tracks?  Level against the mix is the balance decision;
+# crest is how hard the source is compressed; tilt is its tonal centre; side
+# minus mid is how wide it is; LRA is how much it rides.
+#
+# Each scalar is named explicitly rather than pointed at the block that holds
+# it: `dynamics.crest`, `spectrum.tilt` and `loudness.dr14` are dicts, and a
+# dict in a number column is dropped by `notion_value` in silence.
+#
+# The 16x true peak is deliberately absent.  A stem is never delivered, so it
+# is no longer measured (see metrics/stems.py), which would leave the column
+# full for tracks measured before that change and empty for every one after.
+_STEM_METRICS = (
+    ("vs mix",   "level_vs_mix.lufs_delta",          "LU"),
+    ("crest",    "dynamics.crest.whole_file_db",     "dB"),
+    ("tilt",     "spectrum.tilt.slope_db_per_oct",   "dB/oct"),
+    ("side/mid", "stereo.side_minus_mid_db",         "dB"),
+    ("LRA",      "loudness.lra_lu",                  "LU"),
+)
+
+_group("stems", [
+    P(f"{label} {metric}", "number", f"stems.stems.{stem}.{path}", unit)
+    for stem, label in (("vocals", "Vocals"), ("drums", "Drums"),
+                        ("bass", "Bass"), ("other", "Other"))
+    for metric, path, unit in _STEM_METRICS
+])
+
 _group("lyrics", [
     P("Has real lyric", "checkbox", lyric_is_real),
     P("Lyric source", "select", "headline.lyric_source"),

@@ -109,12 +109,75 @@ def test_an_unenriched_track_is_an_error(tmp_path):
     assert "coverage.not_enriched" in {f.check for f in rep.errors()}
 
 
-def test_a_bootleg_release_is_an_error(tmp_path):
-    root = build(tmp_path, **{"musicbrainz.release": {
-        "title": "Best", "status": "Bootleg"}})
+def test_a_bootleg_that_supplied_the_date_is_an_error(tmp_path):
+    """The harm the check names: the published date came off the bootleg."""
+    root = build(tmp_path, **{
+        "musicbrainz.release": {"title": "Best", "status": "Bootleg",
+                                "date": "1999"},
+        "cross_checks.release_date": {"earliest": "1999", "consensus": "1999"}})
     identity_file(root)
     rep = audit.run(root)
     assert find(rep, "release.bootleg").hits
+    assert not find(rep, "release.bootleg_unused").hits
+
+
+def test_a_bootleg_that_supplied_nothing_only_warns(tmp_path):
+    """A bootleg match whose date was rejected is a smell, not a wrong row.
+
+    Seven Bjork tracks matched bootleg-only recordings on 2026-09-09 and every
+    one of them published an iTunes or file-tag date -- Homogenic 1997,
+    Vespertine 2001-08-27, both correct -- while the bootleg's own date was
+    thrown away by `_song_first_release`, which already refuses to date a song
+    from a bootleg.  Erroring on those held back a 1,889-row publish over data
+    that was never wrong.  The recording match is still suspect for credits, so
+    it must not go silent either.
+    """
+    root = build(tmp_path, **{
+        "musicbrainz.release": {"title": "Live in Nowhere", "status": "Bootleg",
+                                "date": "2013"},
+        "cross_checks.release_date": {"earliest": "2001-08-27",
+                                      "consensus": "2001-08-27"}})
+    identity_file(root)
+    rep = audit.run(root)
+    assert not find(rep, "release.bootleg").hits
+    assert find(rep, "release.bootleg_unused").hits
+    assert rep.errors() == [], [f.check for f in rep.errors()]
+
+
+def test_a_quiet_full_length_track_is_an_error(tmp_path):
+    """Below -30 LUFS at full length is a bounce that never got its master."""
+    root = str(tmp_path)
+    track(root, "Real Artist", "The Album", "t0",
+          online=enriched(**{"query": {"artist": "Real Artist",
+                                       "album": "The Album",
+                                       "date": "2020-01-01",
+                                       "duration_s": 210.0}}),
+          row={"LUFS-I": -32.0, "Title": "t0"})
+    identity_file(root)
+    rep = audit.run(root)
+    assert find(rep, "audio.near_silent").hits
+    assert not find(rep, "audio.near_silent_short").hits
+
+
+def test_a_quiet_interlude_only_warns(tmp_path):
+    """Janet Jackson's "Interlude - Sad" is 10.9 s at -32.1 LUFS and correct.
+
+    Severity splits on the duration the corpus already calls "not a song",
+    never on the word "Interlude" in a title -- the next retitle would
+    otherwise reclassify the row silently.
+    """
+    root = str(tmp_path)
+    track(root, "Real Artist", "The Album", "t0",
+          online=enriched(**{"query": {"artist": "Real Artist",
+                                       "album": "The Album",
+                                       "date": "2020-01-01",
+                                       "duration_s": 10.9}}),
+          row={"LUFS-I": -32.0, "Title": "t0"})
+    identity_file(root)
+    rep = audit.run(root)
+    assert not find(rep, "audio.near_silent").hits
+    assert find(rep, "audio.near_silent_short").hits
+    assert rep.errors() == [], [f.check for f in rep.errors()]
 
 
 def test_a_compilation_that_is_not_the_album_tag_warns(tmp_path):

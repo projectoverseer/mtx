@@ -46,7 +46,10 @@ sys.path.insert(0, HERE)
 from env import ENV_FILE, load_env               # noqa: E402
 
 DEFAULT_LIBRARY = r"E:\Music"
-DEFAULT_OUT = r"E:\Music\_mtx_out"
+# The corpus moved off E: on 2026-09-08: that drive filled to 0 bytes
+# mid-backfill and the scan could no longer write a result.  The library
+# it measures still lives on E:; only the output tree moved.
+DEFAULT_OUT = r"D:\_mtx_out"
 
 # Which keys each stage needs, so a missing one is reported before an hour of
 # work rather than as a column of empty cells afterwards.
@@ -78,8 +81,15 @@ def python() -> str:
 def stages() -> list[Stage]:
     return [
         Stage("scan", "measure every audio file that has no analysis yet",
+              # `--prune-stems` is not optional for a library run: four
+              # uncompressed wavs a track, ~165 MB, and nothing deletes them
+              # otherwise.  Omitting it here filled the disk 100 tracks into a
+              # 414-track backfill -- demucs died with `OSError: [Errno 28] No
+              # space left on device`, and the tracks after it were measured
+              # without stems, which empties every mix and per-stem column
+              # instead of failing.
               lambda a: [python(), "-m", "mtx", "scan", a.library,
-                         "--out", a.root, "--stems",
+                         "--out", a.root, "--stems", "--prune-stems",
                          *(["--jobs", str(a.jobs)] if a.jobs else []),
                          *(["--transcribe"] if a.transcribe else []),
                          *(["--embed"] if a.embed else []),

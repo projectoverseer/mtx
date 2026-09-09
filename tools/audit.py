@@ -305,9 +305,29 @@ def check_release(rep: Report, tracks: list[dict[str, Any]]) -> None:
         "as complete")
     bootleg = rep.check(
         "release.bootleg", "error",
-        "the chosen release is a bootleg, which carries a real date about as "
-        "often as it carries a real title",
-        "re-run enrichment; the picker now ranks Official above Bootleg")
+        "the chosen release is a bootleg AND the corpus took its date from it, "
+        "which is the harm: a bootleg carries a real date about as often as it "
+        "carries a real title",
+        "re-run enrichment; the picker ranks Official above Bootleg")
+    # A bootleg that supplied nothing is a provenance smell, not a wrong row.
+    # `_song_first_release` already refuses to date a song from a bootleg, so
+    # the usual outcome is that some other provider supplied the date and it is
+    # correct: all seven Bjork tracks flagged on 2026-09-09 published iTunes and
+    # file-tag dates -- Homogenic 1997, Vespertine 2001-08-27, both right --
+    # while the bootleg's own 2000/2013/2001 were rejected.  Erroring on those
+    # blocked a 1,889-row publish over data that was never wrong.
+    #
+    # The real defect it was standing in for is upstream and still open: the
+    # recording picker chose a bootleg-only recording out of 12 candidates,
+    # which does still colour credits and `issued_as_single`.  That is what the
+    # warning is for -- it should not be silent, it should not be a gate.
+    bootleg_unused = rep.check(
+        "release.bootleg_unused", "warn",
+        "the chosen release is a bootleg, but the published date came from "
+        "elsewhere; the recording match is still suspect for credits and the "
+        "single flag",
+        "fix the recording picker to prefer a recording with a non-bootleg "
+        "release; the date itself is sound")
 
     for t in tracks:
         if not t["has_online"]:
@@ -325,7 +345,15 @@ def check_release(rep: Report, tracks: list[dict[str, Any]]) -> None:
                            types=rg.get("secondary_types"),
                            album_tag=dig(t["online"], "query.album"))
         if rel.get("status") == "Bootleg":
-            bootleg.hit(t["rel"], release=rel.get("title"))
+            # Did this bootleg actually supply the date the corpus published?
+            cc = dig(t["online"], "cross_checks.release_date") or {}
+            used = cc.get("consensus")
+            from_bootleg = bool(
+                used and (str(rel.get("date") or "") == str(used)
+                          or str(mb.get("first_release_date") or "") == str(used)))
+            (bootleg if from_bootleg else bootleg_unused).hit(
+                t["rel"], release=rel.get("title"),
+                bootleg_date=rel.get("date"), published_date=used)
         if mb.get("releases_truncated_at"):
             truncated.hit(t["rel"], total=mb.get("releases_total"))
 
@@ -512,13 +540,31 @@ def check_vocabulary(rep: Report, tracks: list[dict[str, Any]]) -> None:
                 case.hit(f"{kind}:{key}", spellings=sorted(spellings))
 
 
+# Under this, a track is an interlude, a skit or a score cue rather than a
+# song.  Used in two places that must agree: `audio.not_a_song`, and the
+# severity split in `audio.near_silent` -- a quiet interlude is correct,
+# a quiet full-length master is broken.
+NOT_A_SONG_MAX_S = 60.0
+
+
 def check_measurement(rep: Report, tracks: list[dict[str, Any]]) -> None:
     """Sanity on the audio itself: a corrupt file measures, it does not fail."""
     silent = rep.check(
         "audio.near_silent", "error",
-        "integrated loudness below -30 LUFS: an empty file, a lead-in, or a "
-        "bounce that never got its master bus",
+        "integrated loudness below -30 LUFS on a full-length track: an empty "
+        "file, or a bounce that never got its master bus",
         "check the source file; it is almost certainly not the record")
+    # An interlude is quiet on purpose.  Janet Jackson's "Interlude - Sad" is
+    # 10.9 s at -32.1 LUFS -- measured correctly, genuinely part of the record,
+    # and it held back a 1,889-row publish as an error.  Severity is split on
+    # the duration the corpus already uses to mean "not a song" rather than on
+    # the word "Interlude" in a title, because the next retitle would silently
+    # reclassify the row.
+    silent_short = rep.check(
+        "audio.near_silent_short", "warn",
+        "integrated loudness below -30 LUFS on a track under "
+        f"{NOT_A_SONG_MAX_S:.0f}s: an interlude or skit, quiet by design",
+        "nothing to do if it really is an interlude; the loudness is right")
     hot = rep.check(
         "audio.impossible_loudness", "error",
         "integrated loudness above -3 LUFS, which no released master reaches",
@@ -556,16 +602,20 @@ def check_measurement(rep: Report, tracks: list[dict[str, Any]]) -> None:
             if run.get("stems") is False:
                 nostems.hit(t["rel"])
         row = headline(t)
+        # mtx measured this duration exactly; it is echoed into the enrichment
+        # query, which is the cheap place to read it back from.  Read before
+        # the loudness branch, which splits on it.
+        dur = dig(t["online"], "query.duration_s")
+        is_short = isinstance(dur, (int, float)) and dur < NOT_A_SONG_MAX_S
         lufs = row.get("LUFS-I")
         if isinstance(lufs, (int, float)):
             if lufs < -30:
-                silent.hit(t["rel"], lufs_i=round(lufs, 2))
+                (silent_short if is_short else silent).hit(
+                    t["rel"], lufs_i=round(lufs, 2),
+                    duration_s=round(dur, 1) if isinstance(dur, (int, float)) else None)
             elif lufs > -3:
                 hot.hit(t["rel"], lufs_i=round(lufs, 2))
-        # mtx measured this duration exactly; it is echoed into the enrichment
-        # query, which is the cheap place to read it back from.
-        dur = dig(t["online"], "query.duration_s")
-        if isinstance(dur, (int, float)) and dur < 60:
+        if is_short:
             short.hit(t["rel"], duration_s=round(dur, 1))
 
     newest = max((k for k in schema_seen if k), default=None)
