@@ -25,6 +25,14 @@ ci_masters.csv
 ci_pred.txt
 ci_signal.flac
 
+# HTTP response cache.  `online/http.py` names its directory after the
+# User-Agent, and MusicBrainz asks that a User-Agent carry a contact address --
+# so an enrichment run started with a relative cache path writes
+# `mtx/<version> ( <contact> )/` next to the source, and 30 of those were
+# committed with a real email address in the path.  Rooted, because the
+# package itself lives at `src/mtx/`.
+/mtx/
+
 # Machine-specific CPU baseline recorded by tools/bench_cpu.py
 tools/.cpu_baseline.json
 
