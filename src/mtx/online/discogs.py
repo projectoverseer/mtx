@@ -92,24 +92,72 @@ def lookup(client: Client, local: dict[str, Any]) -> dict[str, Any]:
         return result
 
     headers = {"Authorization": f"Discogs token={tok}"}
-    params: dict[str, Any] = {"type": "release", "per_page": 10}
-    if local.get("barcode"):
-        params["barcode"] = local["barcode"]
-    else:
-        params["artist"] = local.get("artist") or ""
-        params["track"] = local.get("title") or ""
-        params["release_title"] = local.get("album") or ""
-    url = build_url(f"{BASE}/database/search", **params)
-    body, err = client.get_json(url, headers=headers)
-    result["requests"] += 1
-    if err:
-        result["errors"].append(f"search: {err}")
-        return result
 
-    hits = [h for h in (body or {}).get("results") or [] if h.get("id")]
+    # A barcode is the exact query when Discogs has it, and useless when it
+    # does not -- a digital release's UPC is often absent from a database
+    # built around physical pressings.  Searching by it alone gave "no
+    # results" on the whole corpus while artist+track matched immediately, so
+    # the barcode is tried first and then fallen back on rather than trusted.
+    attempts: list[tuple[str, dict[str, Any]]] = []
+    if local.get("barcode"):
+        attempts.append(("barcode",
+                         {"type": "release", "per_page": 10,
+                          "barcode": local["barcode"]}))
+
+    # One artist string, cleaned the way the other providers clean it: Discogs
+    # indexes a release's credited artist, and "Adele (ft. someone)" matches
+    # nothing as written.
+    artist = (match.primary_artist(local.get("artist") or "")
+              or local.get("artist") or "")
+    title = local.get("title") or ""
+    album = local.get("album") or ""
+
+    # Ordered by what Discogs can actually answer, measured against the live
+    # API rather than assumed:
+    #
+    #   artist + track + release_title   ->  0 results
+    #   artist + track                   ->  2
+    #   artist + release_title           -> 10
+    #
+    # `track` and `release_title` together return nothing -- the index does
+    # not support the conjunction -- and the old query sent exactly that
+    # whenever the file had an album tag, which is 425 of 1,321 tracks.  Every
+    # one of them recorded "no results", which reads as *Discogs does not have
+    # this record* and meant the opposite.
+    #
+    # The album query leads because what Discogs is *for* here is the pressing
+    # -- label, catalogue number, credits -- and those are properties of a
+    # release, not of a track.  The track query is the fallback for a
+    # standalone single with no album to name.
+    if artist and album:
+        attempts.append(("artist+release", {"type": "release", "per_page": 10,
+                                            "artist": artist,
+                                            "release_title": album}))
+    if artist and title:
+        attempts.append(("artist+track", {"type": "release", "per_page": 10,
+                                          "artist": artist, "track": title}))
+    if not attempts or not (artist or album or title):
+        attempts.append(("free text", {"type": "release", "per_page": 10,
+                                       "q": f"{artist} {album or title}".strip()}))
+
+    hits: list[dict[str, Any]] = []
+    matched_by = None
+    for name, params in attempts:
+        url = build_url(f"{BASE}/database/search", **params)
+        body, err = client.get_json(url, headers=headers)
+        result["requests"] += 1
+        if err:
+            result["errors"].append(f"search ({name}): {err}")
+            continue
+        hits = [h for h in (body or {}).get("results") or [] if h.get("id")]
+        if hits:
+            matched_by = name
+            break
+
     if not hits:
         result["errors"].append("no results")
         return result
+    result["matched_by"] = matched_by
 
     # Search hits carry no duration, so rank on title text and prefer the
     # earliest year -- the original pressing over a later compilation.
@@ -134,6 +182,13 @@ def lookup(client: Client, local: dict[str, Any]) -> dict[str, Any]:
         "id": rel.get("id"), "title": rel.get("title"),
         "year": rel.get("year"), "country": rel.get("country"),
         "labels": [lb.get("name") for lb in (rel.get("labels") or [])],
+        # The catalogue number lives on the label entry, not on the release,
+        # and was never read -- so "no Discogs release" and "a Discogs release
+        # with no catalogue number" looked identical from the corpus, and the
+        # one field a pressing is actually identified by was missing from
+        # every row that did match.
+        "catalogue_numbers": [lb.get("catno") for lb in (rel.get("labels") or [])
+                              if lb.get("catno")],
         "formats": [f.get("name") for f in (rel.get("formats") or [])],
         "url": rel.get("uri"),
         "notes": (rel.get("notes") or "")[:2000] or None,

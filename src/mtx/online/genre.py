@@ -58,7 +58,21 @@ ALIAS = {
     "dance pop": "dance-pop", "electro pop": "electropop",
     "trip-hop": "trip hop", "lofi": "lo-fi", "lo fi": "lo-fi",
     "nu disco": "nu-disco", "post punk": "post-punk", "post rock": "post-rock",
-    "kpop": "k-pop", "j-pop": "j-pop", "jpop": "j-pop",
+    "2 step": "2-step", "2step": "2-step", "g funk": "g-funk",
+    "singer song writer": "singer-songwriter",
+    "singer & songwriter": "singer-songwriter",
+    "singer and songwriter": "singer-songwriter",
+    "break up": "breakup", "trapsoul": "trap soul",
+    "children s music": "children's music", "childrens music": "children's music",
+    "r b": "r&b", "discoth que": "discothèque",
+    # Latin-script is the vocabulary this table speaks; a Cyrillic vote for
+    # the same genre is the same vote and has to land on the same option.
+    "\u043f\u043e\u043f": "pop", "\u0440\u043e\u043a": "rock",
+    "\u043c\u0435\u0436\u0434\u0443\u043d\u0430\u0440\u043e\u0434\u043d\u0430\u044f "
+    "\u043f\u043e\u043f \u043c\u0443\u0437\u044b\u043a\u0430": "pop",
+    "kpop": "k-pop", "k pop": "k-pop", "j-pop": "j-pop", "jpop": "j-pop",
+    "j pop": "j-pop", "lo fi": "lo-fi", "nu disco": "nu-disco",
+    "post punk": "post-punk", "post rock": "post-rock",
     "film soundtracks": "soundtrack", "film soundtrack": "soundtrack",
     "soundtracks": "soundtrack", "original score": "score",
     "alternative/indie": "alternative", "alternative & indie": "alternative",
@@ -107,9 +121,23 @@ UMBRELLA = [
 # the record.  Bare years, review-site handles and star ratings all show up in
 # Last.fm and MusicBrainz tag lists.
 TAG_NOISE = re.compile(
-    r"^\d{4}$|^\d{2}s$|charts?\b|"
-    r"\.(de|com|net|org|co\.uk)\b|^ph[ _]|\bstars?\b|^my |^i |\balbums?\b|"
-    r"\bcheck out\b|\bradio\b|^under \d|^top \d", re.IGNORECASE)
+    # Bare numbers of any length -- years, decades, track positions, and the
+    # 13-digit barcode somebody pasted into a tag field.
+    r"^\d+$|^\d{2,4}s$|"
+    # Durations and dates.
+    r"^\d+[:.]\d+$|^\d{4}-\d{2}|"
+    # Ranges and counts: "1-4 wochen", "5+ wochen" are shelf labels in any
+    # language, and a number with a unit is never a description of a sound.
+    r"^\d+\s*[-\u2013]\s*\d+\b|^\d+\s*\+|\bwochen?\b|\bmonate?\b|"
+    # Review sites, star ratings, and a listener's own filing system.
+    r"charts?\b|\bbest of\b|\bsession\d|\btrack\d|\bvol\.? ?\d|"
+    r"\.(de|com|net|org|co\.uk)\b|^ph[ _]|\bstars?\b|^my |^i |"
+    # `^top \d` missed "eurohit top 40": a chart is a chart wherever the words
+    # naming it happen to sit in the string.
+    r"\balbums?\b|\bcheck out\b|\bradio\b|^under \d|\btop \d|\bhit(s)? \d|"
+    # Nothing but punctuation: "<3" and friends.
+    r"^[^\w\s]+$",
+    re.IGNORECASE)
 
 
 def normalise(name: str) -> str:
@@ -121,9 +149,19 @@ def normalise(name: str) -> str:
     n = re.sub(r"\s*/\s*", "/", n)
     n = re.sub(r"\s+", " ", n).strip(" -/&")
     n = ALIAS.get(n, n)
+    # Hyphen and space are the same word in tag data: `neo-soul` and `neo soul`
+    # are one genre voted for twice, and left alone they become two options in
+    # every categorical filter built from this.  Fold to the space form and let
+    # ALIAS decide which spelling is canonical, so the table stays the single
+    # authority and no rule here has to guess which genres keep their hyphen.
+    spaced = re.sub(r"\s*-\s*", " ", n)
+    n = ALIAS.get(spaced, spaced)
     # `Alternative & Indie` style pairs survive as the first half once the
     # alias table has had its chance at the whole string.
-    if n in JUNK or len(n) < 2:
+    # Two letters minimum.  "<3" and "3:45" survive every pattern above --
+    # the digit is a word character, so a punctuation test does not catch them
+    # -- and neither is the name of a sound.
+    if n in JUNK or len(n) < 2 or len(re.findall(r"[^\W\d_]", n)) < 2:
         return ""
     return n
 
@@ -166,7 +204,64 @@ def _votes(items: Iterable[Any]) -> list[tuple[str, float]]:
     return out
 
 
-def collect(by_source: dict[str, Iterable[Any]], top: int = 12) -> dict[str, Any]:
+def _squash(name: str) -> str:
+    """`Billie Eilish` and `billieeilish` are one string once squashed."""
+    return re.sub(r"[^a-z0-9]", "", str(name).lower())
+
+
+# Discogs files everything under fifteen top-level buckets, several of which
+# are lists wearing a single label: `Folk, World, & Country` is not a genre
+# any record is in, it is three of them stapled together for a shop's browse
+# menu.  Notion rejects a comma in a select option outright, so the push
+# silently swapped it for a semicolon -- which kept the table working and left
+# `folk; world; & country` sitting in the filter menu as a category matching
+# 38 tracks and describing none of them.
+# The ampersand must have whitespace on both sides.  A bucket is written
+# `Folk, World, & Country`; a genre is written `R&B`, and splitting on a bare
+# `&` turned `Contemporary R&B` into `contemporary r` on 283 tracks -- a
+# category that reads like a real one and is a fragment of a word.
+# The slash needs no surrounding whitespace, because `normalise` has already
+# tightened ` / ` to `/` by the time a label arrives here.  Every slashed name
+# in this corpus is a bucket rather than a genre -- `funk/soul` 415 tracks,
+# `films/games` 52, `rnb/swing` 51, `techno/house` 5 -- so the split is safe,
+# and `_INDIVISIBLE` is where a genuine slashed genre would go.
+_BUCKET = re.compile(r"\s*,\s*|\s+&\s+|\s*/\s*")
+
+
+def split_bucket(name: str) -> list[str]:
+    """One label per genre, so a browse-menu bucket votes for its parts.
+
+    Only splits on the separators a bucket is built from, and only when what
+    falls out is more than one word long -- `Drum & Bass` and `Rock & Roll`
+    are single genres that happen to contain an ampersand, and splitting them
+    would invent `drum`, `bass` and `roll`.
+    """
+    text = str(name or "").strip()
+    if not text:
+        return []
+    if _squash(text) in _INDIVISIBLE:
+        return [text]
+    parts = [p.strip(" -/&") for p in _BUCKET.split(text)]
+    parts = [p for p in parts if len(p) > 2]
+    return parts or [text]
+
+
+# Genres whose own name contains a separator.  Kept as a list rather than a
+# rule because there is no rule: `Funk / Soul` is Discogs' bucket for two
+# genres and `Drum & Bass` is one genre, and only knowing the music tells
+# them apart.
+# Spelt the way `_squash` leaves them: it strips the ampersand rather than
+# expanding it, so `Drum & Bass` arrives here as `drumbass`.
+_INDIVISIBLE = {
+    "drumbass", "drumandbass", "drumnbass",
+    "rockroll", "rockandroll",
+    "rhythmblues", "rhythmandblues",
+    "bluesrock", "folkrock", "poprock", "jazzfunk", "souljazz",
+}
+
+
+def collect(by_source: dict[str, Iterable[Any]], top: int = 12,
+            exclude: Iterable[str] | None = None) -> dict[str, Any]:
     """Merge every source's labels into one ranked, sourced list.
 
     Within a source the votes are scaled against that source's own top vote,
@@ -180,6 +275,11 @@ def collect(by_source: dict[str, Iterable[Any]], top: int = 12) -> dict[str, Any
     scores: dict[str, float] = {}
     sources: dict[str, list[str]] = {}
     raw: dict[str, list[dict[str, Any]]] = {}
+    # Listeners tag a record with the artist who made it, and a proper name in
+    # a genre list is a category matching one artist that describes nothing.
+    # Compared squashed, so "billieeilish" is caught as well as "Billie Eilish".
+    banned = {_squash(x) for x in (exclude or []) if x}
+    banned.discard("")
 
     for source, items in by_source.items():
         votes = _votes(items)
@@ -188,7 +288,21 @@ def collect(by_source: dict[str, Iterable[Any]], top: int = 12) -> dict[str, Any
         raw[source] = [{"name": n, "votes": v} for n, v in votes]
         peak_vote = max((v for _n, v in votes), default=0.0) or 1.0
         trust = SOURCE_WEIGHT.get(source, 0.5)
-        for name, vote in votes:
+        for whole, vote in votes:
+          # Re-normalised after splitting: `_votes` normalised the whole
+          # label, so the parts falling out of a bucket have never been
+          # through the alias table.  `electro pop/electro rock` split into
+          # `electro pop`, which ALIAS maps to `electropop` and never got the
+          # chance to -- leaving both spellings in the vocabulary, which is
+          # the case collision the audit exists to catch.
+          for name in filter(None, (normalise(part)
+                                    for part in split_bucket(whole))):
+            # The tag noise filter belongs here too.  It only ever ran on the
+            # descriptive tags, so a shelf label that `umbrella()` failed to
+            # classify fell through into the genre list instead -- which is
+            # how "best of 2026" became a genre.
+            if _squash(name) in banned or TAG_NOISE.search(name):
+                continue
             share = min(vote / peak_vote, 1.0)
             scores[name] = scores.get(name, 0.0) + share * trust
             sources.setdefault(name, [])
@@ -233,8 +347,8 @@ def collect(by_source: dict[str, Iterable[Any]], top: int = 12) -> dict[str, Any
     }
 
 
-def collect_tags(by_source: dict[str, Iterable[Any]], top: int = 20
-                 ) -> list[dict[str, Any]]:
+def collect_tags(by_source: dict[str, Iterable[Any]], top: int = 20,
+                 exclude: Iterable[str] | None = None) -> list[dict[str, Any]]:
     """Descriptive tags that are not genres -- `dark`, `nocturnal`, `party`.
 
     Kept separate from the genre vote because they answer a different question,
@@ -243,12 +357,18 @@ def collect_tags(by_source: dict[str, Iterable[Any]], top: int = 20
     """
     scores: dict[str, float] = {}
     sources: dict[str, list[str]] = {}
+    # Listeners tag a record with the artist who made it.  True, and useless as
+    # a description -- and it drops a proper name into a mood vocabulary, where
+    # it then looks like every other value in the column.
+    banned = {_squash(x) for x in (exclude or []) if x}
+    banned.discard("")
     for source, items in by_source.items():
         votes = _votes(items)
         peak_vote = max((v for _n, v in votes), default=0.0) or 1.0
         for name, vote in votes:
-            if umbrella(name) or TAG_NOISE.search(name):
-                continue  # a genre, or somebody's private shelf label
+            if (umbrella(name) or TAG_NOISE.search(name)
+                    or _squash(name) in banned):
+                continue  # a genre, a shelf label, or the artist's own name
             scores[name] = scores.get(name, 0.0) + min(vote / peak_vote, 1.0)
             sources.setdefault(name, [])
             if source not in sources[name]:

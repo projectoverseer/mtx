@@ -8,11 +8,12 @@ or formula it implements so an output number can be traced back to a method.
 from __future__ import annotations
 
 import math
-from typing import Iterable, Sequence
+from typing import Iterable, NamedTuple, Sequence
 
 import numpy as np
 from scipy import signal as sps
 
+from .parallel import ordered_window
 from .util import EPS, db_amp, db_pow
 
 # ------------------------------------------------------------------ K-weighting
@@ -165,19 +166,39 @@ def _abs_max_axis(a: np.ndarray, axis: int) -> np.ndarray:
     return np.maximum(a.max(axis=axis), -a.min(axis=axis))
 
 
-def _scan_segment(seg: np.ndarray, oversample: int, start_frame: int, sr: float,
-                  thr_lin: list[float], state: dict, keep_env: bool,
-                  drop_head: int, keep_len: int) -> np.ndarray | None:
-    """Oversample one segment and fold it into the running scan state.
+class _Chunk(NamedTuple):
+    """Everything one oversampled chunk contributes, with no shared state.
+
+    Keeping this pure is what lets the oversampling run on a thread pool:
+    `upfirdn` releases the GIL, so the expensive half scales, while the fold
+    back into the running scan stays serial and in chunk order -- which is
+    what an excursion straddling a chunk boundary needs to be counted once.
+    """
+
+    peaks: np.ndarray          # per-channel peak within this chunk
+    top: float                 # highest interpolated magnitude, any channel
+    top_index: int             # its position, in oversampled samples
+    edges: list[int]           # rising edges above each threshold, internal
+    first: list[bool]          # whether the chunk opens above each threshold
+    last: list[bool]           # whether it closes above each threshold
+    env: np.ndarray | None     # the max-envelope, when the caller wants it
+
+
+def _scan_chunk(x: np.ndarray, oversample: int, lo: int, hi: int,
+                drop_head: int, keep_len: int, thr_lin: list[float],
+                keep_env: bool) -> _Chunk | None:
+    """Oversample one chunk and reduce it to what the scan state needs.
 
     Channels are oversampled one at a time.  A reduction across the short axis
     of an (n, 2) array is an order of magnitude slower than the same reduction
     over two contiguous vectors, and at 16x this array has tens of millions of
     rows.
     """
+    seg = x[lo:hi]
     a = drop_head * oversample
     b = a + keep_len * oversample
     env: np.ndarray | None = None
+    peaks = np.zeros(seg.shape[1])
     for c in range(seg.shape[1]):
         col = np.ascontiguousarray(seg[:, c])
         up = sps.resample_poly(col, oversample, 1, window=("kaiser", 5.0))
@@ -185,35 +206,52 @@ def _scan_segment(seg: np.ndarray, oversample: int, start_frame: int, sr: float,
         if block.size == 0:
             return None
         au = np.abs(block)
-        pk = float(au.max())
-        if pk > state["peaks"][c]:
-            state["peaks"][c] = pk
-        env = au if env is None else np.maximum(env, au)
+        peaks[c] = float(au.max())
+        env = au if env is None else np.maximum(env, au, out=env)
     if env is None or env.size == 0:
         return None
     k = int(np.argmax(env))
     top = float(env[k])
-    if top > state["best"]:
-        state["best"] = top
-        state["best_time"] = (start_frame + k / oversample) / float(sr)
-    for j, t in enumerate(thr_lin):
+    edges: list[int] = []
+    first: list[bool] = []
+    last: list[bool] = []
+    for t in thr_lin:
         if top <= t:
-            # Nothing in this segment reaches the threshold; no scan needed.
-            state["prev_above"][j] = False
+            # Nothing in this chunk reaches the threshold; no scan needed.
+            edges.append(0)
+            first.append(False)
+            last.append(False)
             continue
         above = env > t
-        # An "over" is one contiguous excursion, not one sample.
-        state["counts"][j] += int((np.diff(above.astype(np.int8)) == 1).sum())
-        if above[0] and not state["prev_above"][j]:
+        # An "over" is one contiguous excursion, not one sample.  Counting the
+        # 0->1 transitions directly costs one pass over a boolean array; going
+        # via diff() on an int8 copy costs three, over tens of millions of
+        # samples per chunk.
+        edges.append(int(np.count_nonzero(above[1:] & ~above[:-1])))
+        first.append(bool(above[0]))
+        last.append(bool(above[-1]))
+    return _Chunk(peaks, top, k, edges, first, last, env if keep_env else None)
+
+
+def _fold_chunk(state: dict, ch: _Chunk, start_frame: int, sr: float,
+                oversample: int) -> None:
+    """Merge one chunk's contribution into the running scan.  Order matters."""
+    np.maximum(state["peaks"], ch.peaks, out=state["peaks"])
+    if ch.top > state["best"]:
+        state["best"] = ch.top
+        state["best_time"] = (start_frame + ch.top_index / oversample) / float(sr)
+    for j in range(len(ch.edges)):
+        state["counts"][j] += ch.edges[j]
+        if ch.first[j] and not state["prev_above"][j]:
             state["counts"][j] += 1
-        state["prev_above"][j] = bool(above[-1])
-    return env if keep_env else None
+        state["prev_above"][j] = ch.last[j]
 
 
 def true_peak_scan(x: np.ndarray, sr: float, oversample: int,
                    thresholds_dbtp: Sequence[float] = (),
                    env_hop_s: float | None = 0.001,
-                   chunk: int = 1 << 18, overlap: int = 4096) -> dict:
+                   chunk: int = 1 << 18, overlap: int = 4096,
+                   workers: int = 1) -> dict:
     """One oversampling pass; everything the true-peak metrics need.
 
     Returns the per-channel peak, the time of the overall peak, and the count of
@@ -250,23 +288,32 @@ def true_peak_scan(x: np.ndarray, sr: float, oversample: int,
     state = {"peaks": np.zeros(n_ch), "best": 0.0, "best_time": None,
              "counts": [0] * len(thr_lin), "prev_above": [False] * len(thr_lin)}
 
+    def _run(task: tuple[int, int, int, int, int, int]) -> _Chunk | None:
+        lo, hi, drop_head, keep_len, _start, _run_idx = task
+        return _scan_chunk(x, oversample, lo, hi, drop_head, keep_len,
+                           thr_lin, env_hop_s is not None)
+
     if env_hop_s is not None:
         hop_out = max(1, int(round(env_hop_s * sr * oversample)))
         env_parts: list[np.ndarray] = []
         carry = np.zeros(0, dtype=np.float32)
+        tasks: list[tuple[int, int, int, int, int, int]] = []
         i = 0
         while i < n:
             lo = max(0, i - overlap)
             hi = min(n, i + chunk + overlap)
-            env = _scan_segment(x[lo:hi], oversample, i, sr, thr_lin, state,
-                                True, i - lo, min(i + chunk, n) - i)
-            if env is not None:
-                joined = np.concatenate([carry, env]) if carry.size else env
-                m = (joined.size // hop_out) * hop_out
-                if m:
-                    env_parts.append(joined[:m].reshape(-1, hop_out).max(axis=1))
-                carry = joined[m:]
+            tasks.append((lo, hi, i - lo, min(i + chunk, n) - i, i, 0))
             i += chunk
+        for res, task in zip(ordered_window(_run, tasks, workers), tasks):
+            if res is None:
+                continue
+            _fold_chunk(state, res, task[4], sr, oversample)
+            env = res.env
+            joined = np.concatenate([carry, env]) if carry.size else env
+            m = (joined.size // hop_out) * hop_out
+            if m:
+                env_parts.append(joined[:m].reshape(-1, hop_out).max(axis=1))
+            carry = joined[m:]
         if carry.size:
             env_parts.append(np.array([carry.max()]))
         envelope = np.concatenate(env_parts) if env_parts else np.zeros(0)
@@ -303,19 +350,24 @@ def true_peak_scan(x: np.ndarray, sr: float, oversample: int,
             runs.append((k * block, min((j + 1) * block, n)))
             k = j + 1
         scanned_samples = 0
-        for s, e in runs:
-            lo = max(0, s - support - 8)
-            hi = min(n, e + support + 8)
+        tasks = []
+        for r_idx, (s, e) in enumerate(runs):
             for i in range(s, e, chunk):
                 seg_end = min(i + chunk, e)
                 a = max(0, i - support - 8)
                 b = min(n, seg_end + support + 8)
-                _scan_segment(x[a:b], oversample, i, sr, thr_lin, state, False,
-                              i - a, seg_end - i)
+                tasks.append((a, b, i - a, seg_end - i, i, r_idx))
                 scanned_samples += seg_end - i
-            # Nothing between runs can be above any threshold, so an excursion
-            # never spans a gap.
-            state["prev_above"] = [False] * len(thr_lin)
+        current_run = 0
+        for res, task in zip(ordered_window(_run, tasks, workers), tasks):
+            if task[5] != current_run:
+                # Nothing between runs can be above any threshold, so an
+                # excursion never spans a gap.
+                state["prev_above"] = [False] * len(thr_lin)
+                current_run = task[5]
+            if res is None:
+                continue
+            _fold_chunk(state, res, task[4], sr, oversample)
         scanned = scanned_samples / float(n)
     return {
         "peak_per_channel": state["peaks"].astype(np.float64),

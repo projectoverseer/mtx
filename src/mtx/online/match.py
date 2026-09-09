@@ -43,6 +43,65 @@ _DASH_SUFFIX = re.compile(
     r".*\bmix\b.*|single|radio edit)$", re.IGNORECASE)
 
 
+def pad_date(value) -> str:
+    """`1999` and `1999-06-08` compared on the same scale.
+
+    ISO 8601 sorts lexically only when every part is present.  Left short, a
+    year-only date sorts *before* every dated release in that year, which is
+    how a bootleg dated `1999` beat an album dated `1999-06-08`.  Filled with
+    the earliest the date could mean, so the ordering is a lower bound rather
+    than an invention.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return "9999-99-99"
+    parts = text.split("-")
+    while len(parts) < 3:
+        parts.append("01")
+    return "-".join(p.zfill(4) if i == 0 else p.zfill(2)
+                    for i, p in enumerate(parts[:3]))
+
+
+def earliest_date(values) -> str | None:
+    """The earliest of several dates, at the best precision available.
+
+    `2020` and `2020-06-29` are the same claim at two resolutions, not two
+    dates one of which is earlier.  Taking the string minimum picks the vague
+    one and throws the day away; 365 of 1,321 corpus releases were dated to
+    the year for exactly that reason.  So: earliest year, then the most
+    precise reading inside it.
+    """
+    dates = [str(v).strip() for v in (values or []) if v]
+    if not dates:
+        return None
+    year = pad_date(min(dates, key=pad_date))[:4]
+    same_year = [d for d in dates if pad_date(d)[:4] == year]
+    precise = [d for d in same_year if len(d) >= 7]
+    return min(precise or same_year, key=pad_date)
+
+
+def consensus_date(values) -> tuple[str | None, int, int]:
+    """The date the sources agree on, not the earliest one of them offers.
+
+    Taking the minimum lets a single wrong row rewrite history: five providers
+    put `Efecto` on 2022-05-06 and iTunes returned 2018-12-24, so the corpus
+    dated it 2018.  Sources vote by year, the year with the most votes wins,
+    and ties go to the earlier year -- a reissue should not outvote an
+    original just by being catalogued more often.
+
+    Returns `(date, votes, total)` so a caller can see how thin the agreement
+    was rather than only what it concluded.
+    """
+    dates = [str(v).strip() for v in (values or []) if v]
+    if not dates:
+        return None, 0, 0
+    years: dict[str, list[str]] = {}
+    for d in dates:
+        years.setdefault(pad_date(d)[:4], []).append(d)
+    best = min(years, key=lambda y: (-len(years[y]), y))
+    return earliest_date(years[best]), len(years[best]), len(dates)
+
+
 def fold(text: str) -> str:
     """Lowercase, strip accents and punctuation: a key for loose comparison."""
     if not text:
@@ -75,17 +134,55 @@ def search_title(title: str) -> str:
     return t or str(title or "").strip()
 
 
+_ANY_BRACKET = re.compile(r"\s*[\(\[][^\)\]]*[\)\]]\s*")
+
+
+def bare_title(title: str) -> str:
+    """Every bracketed segment removed, whatever is in it.
+
+    `search_title` only strips brackets that open with a word it recognises as
+    packaging, which is right: it is used to ask a database a question, and
+    throwing away `(Live at Wembley)` would ask about a different recording.
+
+    But `My Everything (Debut Single 2015)` is not packaging by that list and
+    is not part of the name either, and Last.fm has never heard of it. So this
+    exists as a *last* attempt, after the careful ones have missed: blunter
+    than is safe as a default, and worth trying when the alternative is no
+    play count at all.
+    """
+    t = _ANY_BRACKET.sub(" ", str(title or ""))
+    t = re.sub(r"\s+", " ", t).strip(" -")
+    return t or str(title or "").strip()
+
+
 def search_artist(artist: str) -> str:
     """Tag multi-value separators turned into something a search box accepts."""
     a = re.sub(r"\s*[/;\x00]\s*", ", ", str(artist or ""))
     return re.sub(r"\s+", " ", a).strip(" ,")
 
 
+# A feature credit wearing brackets.  `Ariana Grande (ft. Pharell Willians)`
+# has no whitespace before the `ft.`, so a word-boundary split leaves the
+# string whole and every name search then asks for an artist who does not
+# exist -- which is what 91 missing play counts turned out to be.
+_BRACKET_FEAT = re.compile(
+    r"\s*[\(\[]\s*(?:feat\.?|ft\.?|featuring|with|prod\.?|w/)\b[^\)\]]*[\)\]]?",
+    re.IGNORECASE)
+
+
 def primary_artist(artist: str) -> str:
     """The first credited name, for databases whose artist field holds one."""
+    text = _BRACKET_FEAT.sub("", str(artist or ""))
+    # A comma separates two artists in "Drake, 21 Savage" and separates
+    # nothing at all in "Tyler, The Creator".  Splitting the second one asks
+    # Last.fm about an artist called "Tyler", which exists, and comes back
+    # with a play count off by four orders of magnitude.
+    text = re.sub(r",\s+(?=(?:the|los|las|die|le|la)\b)", "\x01", text,
+                  flags=re.IGNORECASE)
     parts = re.split(r"\s*[/;,\x00]\s*|\s+(?:feat\.?|ft\.?|featuring|with)\s+",
-                     str(artist or ""), flags=re.IGNORECASE)
-    return next((p.strip() for p in parts if p.strip()), "")
+                     text, flags=re.IGNORECASE)
+    return next((p.replace("\x01", ", ").strip(" ([-")
+                 for p in parts if p.strip(" ([-\x01")), "")
 
 
 def ratio(a: str, b: str) -> float:
@@ -184,6 +281,22 @@ def score_candidate(local: dict[str, Any], remote: dict[str, Any],
             "notes": notes}
 
 
+def _album_rank(local_album: Any, release_titles: Any) -> int:
+    """0 when this candidate appears on the album the file says it is from.
+
+    Databases carry duplicate recording entries -- one for the album cut, one
+    somebody created while cataloguing a compilation -- and an ISRC returns
+    both.  They agree on title, artist and duration, so nothing in the score
+    separates them, but only one of them appears on the record the file was
+    ripped from.
+    """
+    want = fold(local_album or "")
+    titles = [fold(t) for t in (release_titles or []) if t]
+    if not want or not titles:
+        return 1
+    return 0 if any(want == t or want in t or t in want for t in titles) else 1
+
+
 def best(local: dict[str, Any], candidates: list[dict[str, Any]],
          by_isrc: bool = False, floor: float = 0.5
          ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
@@ -192,6 +305,13 @@ def best(local: dict[str, Any], candidates: list[dict[str, Any]],
     Returns (winner, all_scored).  The full scored list is kept so the written
     record shows what was rejected and why -- a lookup that silently picked one
     of three plausible rows would be impossible to audit later.
+
+    Ties are broken explicitly rather than by API order.  Two rows that agree
+    on duration and title score identically, and the older one is the original
+    release: the newer duplicate is a compilation entry, a re-upload or a
+    mis-credited stub.  Leaving that to `sort` stability means the answer
+    depends on the order a database chose to serialise its rows in, which is
+    not a property of the record.
     """
     scored = []
     for cand in candidates:
@@ -199,7 +319,12 @@ def best(local: dict[str, Any], candidates: list[dict[str, Any]],
         row = dict(cand)
         row["match"] = s
         scored.append(row)
-    scored.sort(key=lambda r: r["match"]["score"], reverse=True)
+    scored.sort(key=lambda r: (-r["match"]["score"],
+                               _album_rank(local.get("album"),
+                                           r.get("release_titles")),
+                               str(r.get("first_release_date") or "9999"),
+                               bool(r.get("video")),
+                               str(r.get("id") or "")))
     if scored and scored[0]["match"]["score"] >= floor:
         return scored[0], scored
     return None, scored

@@ -231,7 +231,8 @@ def analyse(src: AudioSource, collector: Collector,
     sample_peak_ch = np.max(np.abs(x), axis=0) if src.n_frames else np.zeros(src.n_ch)
     # 4x runs over the whole file because the PSR timeline needs its envelope;
     # 16x needs only a peak and the over counts, so it runs pruned.
-    scan4 = true_peak_scan(x, sr, 4, env_hop_s=PSR_ENVELOPE_HOP_S)
+    scan4 = true_peak_scan(x, sr, 4, env_hop_s=PSR_ENVELOPE_HOP_S,
+                           workers=src.threads)
     tp4_ch = scan4["peak_per_channel"]
     if profile == "quick":
         collector.warn("true_peak",
@@ -244,7 +245,7 @@ def analyse(src: AudioSource, collector: Collector,
                  "reason": "skipped by --profile quick"}
     else:
         scan16 = true_peak_scan(x, sr, 16, thresholds_dbtp=TP["over_thresholds_dbtp"],
-                                env_hop_s=None)
+                                env_hop_s=None, workers=src.threads)
         tp16_ch = scan16["peak_per_channel"]
         overs = {
             "oversampling": 16,

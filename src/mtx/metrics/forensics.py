@@ -239,7 +239,11 @@ def _effective_bit_depth(src: AudioSource, collector: Collector) -> dict[str, An
         collector.warn("forensics.effective_bit_depth", "all samples are zero")
         return {"effective_bits": 0, "container_bits": None,
                 "reason": "file is digital silence"}
-    lsb = np.abs(nz.astype(np.int64)) & (-np.abs(nz.astype(np.int64)))
+    # |v| & -|v| isolates the lowest set bit.  int64 first, because negating
+    # the most negative int32 overflows; and once, not twice -- the cast is
+    # over every non-zero sample in the file.
+    mag = np.abs(nz.astype(np.int64))
+    lsb = mag & -mag
     tz = np.log2(lsb).astype(np.int32)
     sig_bits = 32 - tz
     hist = np.bincount(np.clip(sig_bits, 0, 32), minlength=33)

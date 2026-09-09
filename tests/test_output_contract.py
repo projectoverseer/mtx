@@ -101,3 +101,65 @@ def test_params_block_is_emitted_with_the_result(analysed):
         assert group in res["params"], f"params.{group} is missing"
     assert res["params"]["profile"]["profile"] == "quick"
     assert res["params"]["profile"]["skipped_in_quick"]
+
+
+@pytest.fixture(scope="module")
+def full_profile(tmp_path_factory):
+    """A short file with a beat, a chord and a tail, analysed at full profile."""
+    d = tmp_path_factory.mktemp("full")
+    t = np.arange(int(25 * SR)) / SR
+    rng = np.random.default_rng(0)
+    y = sum(0.25 * np.sin(2 * np.pi * f * t) for f in (110.0, 138.6, 164.8))
+    env = np.exp(-((t * 2) % 1.0) * 8)
+    y = y * (0.5 + 0.5 * env) + 0.02 * rng.standard_normal(t.size)
+    path = d / "full.flac"
+    sf.write(path, np.stack([y, y * 0.98], axis=1) * 0.6, SR, subtype="PCM_24")
+    return str(path)
+
+
+def test_a_full_profile_run_is_reproducible_including_the_encode_pass(full_profile):
+    """The headline promise, over the path that shells out to ffmpeg.
+
+    `delivery.encode` runs an external encoder in a temporary directory and
+    reads the result back.  Nothing about that may reach the document: not a
+    temp path, not a timestamp, not a byte that differs between two runs of the
+    same encoder on the same machine.
+    """
+    a = analyze_file(full_profile, profile="full")
+    b = analyze_file(full_profile, profile="full")
+    for res in (a, b):
+        for field in RUN_VOLATILE_FIELDS:
+            section, key = field.split(".")
+            res[section].pop(key, None)
+    from mtx.util import jsonable
+    assert (json.dumps(jsonable(a), sort_keys=True, allow_nan=False)
+            == json.dumps(jsonable(b), sort_keys=True, allow_nan=False))
+    # And the blocks that only exist at full profile really ran.
+    assert a["delivery"]["available"]
+    assert a["harmony"]["available"] and a["rhythm"]["available"]
+    assert a["coverage"]["feature_count"] > 500
+
+
+def test_the_musical_blocks_are_null_with_a_reason_under_quick(analysed):
+    _, res, _ = analysed
+    for block in ("harmony", "rhythm", "form", "delivery"):
+        assert res[block]["available"] is False, block
+        assert "quick" in res[block]["reason"], block
+    # And the headline says nothing rather than guessing.
+    for key in ("beats_per_bar", "chord_count", "chorus_count",
+                "vocal_range_p5_p95_semitones"):
+        assert res["headline"][key] is None, key
+
+
+def test_coverage_covers_the_whole_document(analysed):
+    _, res, _ = analysed
+    mask = res["coverage"]
+    assert mask["feature_count"] > 300
+    # Every top-level measurement block appears in the mask.
+    for group in ("loudness", "spectrum", "stereo", "dynamics", "forensics",
+                  "structure", "processing", "harmony", "rhythm", "form",
+                  "delivery", "lyrics", "version"):
+        assert group in mask["by_group"], group
+    # Provenance is not a measurement.
+    assert "params" not in mask["by_group"]
+    assert "run" not in mask["by_group"]

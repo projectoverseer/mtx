@@ -36,9 +36,14 @@ def resample_to(x: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
 class AudioSource:
     """Decoded audio plus the derived representations the metrics need."""
 
-    def __init__(self, path: str, collector: Collector):
+    def __init__(self, path: str, collector: Collector, threads: int = 1):
         self.path = path
         self.collector = collector
+        # How many threads a metric may use inside this one file.  Carried on
+        # the source rather than threaded through every `analyse()` signature:
+        # every metric module already has the source in hand, and only the
+        # true-peak scan currently has a GIL-releasing hot loop to spend it on.
+        self.threads = max(1, int(threads))
         self.info = sf.info(path)
         self.sr: int = int(self.info.samplerate)
         self.n_ch: int = int(self.info.channels)
@@ -179,7 +184,20 @@ class AudioSource:
 
     @property
     def band_mid(self) -> np.ndarray:
+        """mid at band_sr.
+
+        At or below the cap there is no resampling, so `band_x` is `x` in
+        float64 and this is arithmetic `mid` has already done -- bit for bit,
+        because float32 to float64 is exact and both sides then work in
+        float64.  Returning it saves a second full-length float64 array per
+        source, and a stems run holds five sources, so on a 44.1 kHz track it
+        is about a gigabyte of a second copy of the same answer.  Nothing
+        writes to either view in place; if something ever does, this has to
+        become a copy again.
+        """
         def build():
+            if self.sr <= BAND_SR_CAP:
+                return self.mid
             bx = self.band_x
             if self.n_ch == 1:
                 return bx[:, 0]
@@ -188,7 +206,10 @@ class AudioSource:
 
     @property
     def band_side(self) -> np.ndarray:
+        """side at band_sr.  Aliases `side` below the cap; see `band_mid`."""
         def build():
+            if self.sr <= BAND_SR_CAP:
+                return self.side
             bx = self.band_x
             if self.n_ch == 1:
                 return np.zeros(bx.shape[0])

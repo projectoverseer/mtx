@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -35,6 +36,13 @@ MIN_INTERVAL = {
     "api.listenbrainz.org": 0.25,
 }
 DEFAULT_INTERVAL = 0.5
+
+# Per-host pacing state, shared by every Client in the process so that a
+# thread pool cannot multiply the request rate by its worker count.
+# `setdefault` on a plain dict is atomic under the GIL, which is all the
+# protection the lock registry itself needs.
+_HOST_LOCKS: dict[str, "threading.Lock"] = {}
+_HOST_LAST_CALL: dict[str, float] = {}
 
 # 429 and 503 are the two "come back later" answers these APIs use.
 RETRY_STATUS = (429, 500, 502, 503, 504)
@@ -59,6 +67,8 @@ class Client:
         self.log = log or (lambda _m: None)
         self.offline = offline
         self.refresh = refresh
+        # The `fetched_utc` of the most recent response, cache hit or not.
+        self.last_fetched_utc: str | None = None
         self.timeout = timeout
         self.max_retries = max_retries
         self._last_call: dict[str, float] = {}
@@ -99,11 +109,24 @@ class Client:
     # -- fetch ---------------------------------------------------------------
 
     def _wait(self, host: str) -> None:
+        """Hold the per-host interval, across every client in this process.
+
+        The pacing is a promise to the *host*, not a property of one client
+        object, so the last-call clock is module-level and guarded by a lock.
+        A caller that enriches a corpus with a thread pool would otherwise get
+        one clock per client and issue N requests a second to MusicBrainz,
+        which answers 503 and is entitled to.
+
+        Held for the whole sleep, so two threads cannot both read the same
+        clock, both decide they may go, and both fire together.
+        """
         interval = MIN_INTERVAL.get(host, DEFAULT_INTERVAL)
-        elapsed = time.monotonic() - self._last_call.get(host, 0.0)
-        if elapsed < interval:
-            time.sleep(interval - elapsed)
-        self._last_call[host] = time.monotonic()
+        with _HOST_LOCKS.setdefault(host, threading.Lock()):
+            elapsed = time.monotonic() - _HOST_LAST_CALL.get(host, 0.0)
+            if elapsed < interval:
+                time.sleep(interval - elapsed)
+            _HOST_LAST_CALL[host] = time.monotonic()
+            self._last_call[host] = _HOST_LAST_CALL[host]
 
     def get_json(self, url: str, headers: dict[str, str] | None = None
                  ) -> tuple[Any | None, str | None]:
@@ -112,6 +135,10 @@ class Client:
             cached = self._read_cache(url)
             if cached is not None:
                 self.stats["hit"] += 1
+                # When the provider actually said this, not when we asked the
+                # cache.  A play count is a reading, and a reading carries the
+                # moment it was taken or it is not a reading.
+                self.last_fetched_utc = cached.get("fetched_utc")
                 return cached.get("body"), cached.get("error")
         if self.offline:
             self.stats["skipped"] += 1
@@ -131,8 +158,9 @@ class Client:
                     raw = resp.read()
                 body = json.loads(raw.decode("utf-8", "replace")) if raw else None
                 self.stats["miss"] += 1
+                self.last_fetched_utc = _utc()
                 self._write_cache(url, {"url": url, "body": body, "error": None,
-                                        "fetched_utc": _utc()})
+                                        "fetched_utc": self.last_fetched_utc})
                 return body, None
             except urllib.error.HTTPError as exc:
                 if exc.code == 404:

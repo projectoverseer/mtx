@@ -17,22 +17,30 @@ import unicodedata
 from typing import Any
 
 from . import __version__
-
-AUDIO_EXTENSIONS = (".flac", ".wav", ".aif", ".aiff", ".w64", ".caf", ".ogg",
-                    ".opus", ".mp3", ".m4a", ".aac", ".wv", ".ape")
+from .parallel import cpu_count, default_workers
+from .scan import AUDIO_EXTENSIONS
+from .util import BAD_FS_CHARS, safe_component
 
 
 def _log(msg: str) -> None:
-    print(f"[mtx] {msg}", file=sys.stderr, flush=True)
-
-
-# Characters no Windows path component may contain (POSIX only bars "/").
-_BAD_FS_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+    try:
+        print(f"[mtx] {msg}", file=sys.stderr, flush=True)
+    except UnicodeEncodeError:
+        # A legacy console codepage must not be able to end a library scan
+        # halfway through because one album is called "÷".
+        enc = getattr(sys.stderr, "encoding", None) or "ascii"
+        safe = f"[mtx] {msg}".encode(enc, errors="replace").decode(enc, "replace")
+        print(safe, file=sys.stderr, flush=True)
 
 
 def _sanitise_component(s: str) -> str:
-    """Make a tag value usable as a single path component."""
-    return re.sub(r"\s+", " ", _BAD_FS_CHARS.sub("_", s)).strip()
+    """Make a tag value usable as a single path component.
+
+    Half of the rule: the characters.  The other half -- what a name may not
+    end in -- `safe_component()` applies to the assembled folder name, which is
+    where the end of it actually is.
+    """
+    return re.sub(r"\s+", " ", BAD_FS_CHARS.sub("_", s)).strip()
 
 
 def _join_artists(raw: str) -> str:
@@ -66,8 +74,8 @@ def _folder_name(path: str, res: dict[str, Any] | None = None) -> str:
         name = title
     else:
         name = ""
-    name = name[:150].strip().rstrip(". ")  # Windows: no trailing dot or space
-    return name or os.path.splitext(os.path.basename(path))[0]
+    name = safe_component(name[:150].strip(), fallback="")
+    return name or safe_component(os.path.splitext(os.path.basename(path))[0])
 
 
 def _default_out(base_out: str | None, path: str,
@@ -173,17 +181,27 @@ def cmd_join(args: argparse.Namespace) -> int:
 
 
 def _enrich_targets(path: str) -> list[str]:
-    """The analysed folders under `path`: itself, or its immediate children."""
+    """Every analysed folder at or under `path`, at any depth.
+
+    `mtx scan` mirrors the library tree, so an analysed track sits at
+    `<out>/Artist/Album/Track/analysis.json` -- three levels below the root
+    the user naturally passes here.  Walking only the immediate children
+    would report "no analysis.json" on a fully scanned library, so the walk
+    is recursive.  A folder holding an `analysis.json` is a leaf: nothing
+    below it is searched, and cache directories are skipped.
+    """
     if os.path.isfile(path):
         return [os.path.dirname(os.path.abspath(path)) or "."]
     if os.path.isfile(os.path.join(path, "analysis.json")):
         return [path]
     out = []
-    for name in sorted(os.listdir(path)):
-        sub = os.path.join(path, name)
-        if os.path.isdir(sub) and os.path.isfile(os.path.join(sub, "analysis.json")):
-            out.append(sub)
-    return out
+    for root, dirs, files in os.walk(path):
+        dirs[:] = sorted(d for d in dirs
+                         if not d.startswith(".") and d != "stems")
+        if "analysis.json" in files:
+            out.append(root)
+            dirs[:] = []          # an analysed folder is a leaf
+    return sorted(out)
 
 
 def cmd_enrich(args: argparse.Namespace) -> int:
@@ -194,7 +212,7 @@ def cmd_enrich(args: argparse.Namespace) -> int:
     section whose content depends on what MusicBrainz looked like this morning
     cannot live inside that promise.
     """
-    from .online import ALL_PROVIDERS, DEFAULT_PROVIDERS, KEYED_PROVIDERS, enrich
+    from .online import ALL_PROVIDERS, KEYED_PROVIDERS, enrich
     from .split import load_analysis
 
     if not os.path.exists(args.path):
@@ -287,7 +305,12 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         return 1
     t0 = time.time()
     res = analyze_file(args.file, profile=args.profile, want_stems=args.stems,
-                       log=lambda s: _log(f"  {s}"))
+                       log=lambda s: _log(f"  {s}"),
+                       threads=getattr(args, "jobs", None),
+                       stems_model=getattr(args, "stems_model", None),
+                       declared_path=getattr(args, "declared", None),
+                       want_transcript=bool(getattr(args, "transcribe", False)),
+                       want_embedding=bool(getattr(args, "embed", False)))
     out_dir = args.out if args.out and args.single_out else _default_out(args.out, args.file, res)
     written = write_outputs(res, out_dir, json_only=args.json_only,
                             plots=args.plots, src_path=args.file,
@@ -382,7 +405,10 @@ def cmd_batch(args: argparse.Namespace) -> int:
         _log(f"[{i}/{len(files)}] {os.path.basename(path)}")
         try:
             res = analyze_file(path, profile=args.profile, want_stems=args.stems,
-                               log=lambda s: _log(f"  {s}"))
+                               log=lambda s: _log(f"  {s}"),
+                               stems_model=getattr(args, "stems_model", None),
+                               want_transcript=bool(getattr(args, "transcribe", False)),
+                               want_embedding=bool(getattr(args, "embed", False)))
         except Exception as exc:
             failures += 1
             _log(f"  failed: {exc!r}")
@@ -426,15 +452,61 @@ def cmd_batch(args: argparse.Namespace) -> int:
     return 1 if failures and not rows else 0
 
 
+def cmd_scan(args: argparse.Namespace) -> int:
+    """Measure a library, an artist or an album -- whatever the path covers."""
+    from .scan import NoRootRegistered, run_scan
+
+    if not os.path.exists(args.path):
+        _log(f"error: no such file or directory: {args.path}")
+        return 1
+    # A scan's workers are separate processes, and both of these have to reach
+    # the demucs call inside each of them; the environment is what a child
+    # inherits, where a parsed flag would have to be threaded through analyze.
+    device = getattr(args, "stems_device", "auto")
+    segment = getattr(args, "stems_segment", None)
+    if device not in ("auto", None) or segment:
+        from .metrics.stems import ENV_DEVICE, ENV_SEGMENT
+        if device not in ("auto", None):
+            os.environ[ENV_DEVICE] = device
+        if segment:
+            os.environ[ENV_SEGMENT] = str(segment)
+    try:
+        stats = run_scan(
+            args.path, out=args.out, library_root=args.library_root,
+            profile=args.profile, jobs=args.jobs,
+            stems_jobs=getattr(args, "stems_jobs", None),
+            stems_lookahead=getattr(args, "stems_lookahead", None),
+            prune_stems=bool(getattr(args, "prune_stems", False)),
+            force=args.force,
+            recheck=args.recheck, stems=args.stems, plots=args.plots,
+            json_only=args.json_only, max_part_bytes=parse_part_size(args),
+            stems_model=getattr(args, "stems_model", None),
+            transcribe=bool(getattr(args, "transcribe", False)),
+            embed=bool(getattr(args, "embed", False)),
+            dry_run=args.dry_run, no_summary=args.no_summary,
+            dedup=not getattr(args, "no_dedup", False), log=_log)
+    except NoRootRegistered as exc:
+        _log(f"error: {exc}")
+        return 1
+    except ValueError as exc:
+        _log(f"error: {exc}")
+        return 1
+    print(stats["out_dir"])
+    if stats["failed"] and not stats["done"]:
+        return 1
+    return 0
+
+
 def cmd_compare(args: argparse.Namespace) -> int:
     from .compare import compare_files
 
     _check_readable(args.file_a)
     _check_readable(args.file_b)
     out_dir = args.out or os.path.join(
-        "mtx_out", "compare_" +
-        os.path.splitext(os.path.basename(args.file_a))[0] + "__vs__" +
-        os.path.splitext(os.path.basename(args.file_b))[0])
+        "mtx_out", safe_component(
+            "compare_" +
+            os.path.splitext(os.path.basename(args.file_a))[0] + "__vs__" +
+            os.path.splitext(os.path.basename(args.file_b))[0]))
     paths = compare_files(args.file_a, args.file_b, out_dir,
                           null_test=args.null_test, profile=args.profile,
                           max_part_bytes=parse_part_size(args), log=_log)
@@ -516,6 +588,70 @@ def cmd_validate_dr(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_cohort(args: argparse.Namespace) -> int:
+    """Where each track sits among comparable records.
+
+    A separate command over a separate file, on purpose: a per-track
+    measurement must not change because of what else is in the folder.
+    """
+    from .cohort import build, render
+
+    if not os.path.exists(args.path):
+        _log(f"error: no such file or directory: {args.path}")
+        return 1
+    try:
+        doc = build(args.path, neighbours=args.neighbours, log=_log)
+    except ValueError as exc:
+        _log(f"error: {exc}")
+        return 1
+    out_dir = args.out or (args.path if os.path.isdir(args.path) else ".")
+    os.makedirs(out_dir, exist_ok=True)
+    from .util import jsonable
+    j = os.path.join(out_dir, "cohort.json")
+    with open(j, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(jsonable(doc), f, indent=1, sort_keys=True, ensure_ascii=False,
+                  allow_nan=False)
+        f.write("\n")
+    m = os.path.join(out_dir, "cohort.md")
+    with open(m, "w", encoding="utf-8", newline="\n") as f:
+        f.write(render(doc))
+    h = doc["hygiene"]
+    _log(f"{h['tracks']} track(s), {h['distinct_artists']} artist(s), "
+         f"{len(doc['cohorts'])} cohort(s)")
+    for problem in h["problems"]:
+        _log(f"  corpus hygiene: {problem}")
+    _log(f"  cohort.json: {j}")
+    _log(f"  cohort.md: {m}")
+    print(out_dir)
+    return 0
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    """Flat tables at track and track x section level."""
+    from .export import export
+
+    if not os.path.exists(args.path):
+        _log(f"error: no such file or directory: {args.path}")
+        return 1
+    out_dir = args.out or (args.path if os.path.isdir(args.path) else ".")
+    try:
+        stats = export(args.path, out_dir, level=args.level, fmt=args.format,
+                       log=_log)
+    except ValueError as exc:
+        _log(f"error: {exc}")
+        return 1
+    _log(f"{stats['analyses_found']} analysis file(s): "
+         f"{stats['tracks']} track row(s) x {stats['track_columns']} column(s), "
+         f"{stats['section_rows']} section row(s) x "
+         f"{stats['section_columns']} column(s)")
+    for name, path in stats["written"].items():
+        _log(f"  {name}: {path}")
+    for fail in stats["failed"]:
+        _log(f"  failed: {fail}")
+    print(out_dir)
+    return 0
+
+
 def cmd_selftest(args: argparse.Namespace) -> int:
     from .selftest import run_selftest
     return run_selftest(verbose=not args.quiet)
@@ -538,9 +674,24 @@ def build_parser() -> argparse.ArgumentParser:
                    help="write directly into --out instead of --out/<basename>/")
     a.add_argument("--profile", choices=("quick", "full"), default="full")
     a.add_argument("--plots", action="store_true", help="also write plots/*.png")
+    a.add_argument("--stems-model", metavar="NAME",
+                   help="demucs model to separate with (default htdemucs); "
+                        "htdemucs_6s splits guitar and piano out of `other`")
+    a.add_argument("--declared", metavar="FILE",
+                   help="a declared.json sidecar; its values are reported with "
+                        "source=declared and never merged into a measured field")
+    a.add_argument("--transcribe", action="store_true",
+                   help="transcribe the vocal stem for a time-aligned lyric "
+                        "(optional backend, needs --stems)")
+    a.add_argument("--embed", action="store_true",
+                   help="compute a learned embedding vector (optional backend)")
     a.add_argument("--stems", action="store_true",
                    help="separate stems with demucs and measure each")
     a.add_argument("--json-only", action="store_true", help="skip digest.md")
+    a.add_argument("--jobs", "-j", type=int, metavar="N",
+                   help="threads to use inside this one file (default "
+                        f"{default_workers()} here); only the true-peak "
+                        "oversampling pass can spend them")
     a.add_argument("--blind", action="store_true",
                    help="also write predict.md (the headline redacted to a form) "
                         "and print only its path, so a prediction can be "
@@ -563,6 +714,9 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--profile", choices=("quick", "full"), default="full")
     b.add_argument("--plots", action="store_true")
     b.add_argument("--stems", action="store_true")
+    b.add_argument("--stems-model", metavar="NAME")
+    b.add_argument("--transcribe", action="store_true")
+    b.add_argument("--embed", action="store_true")
     b.add_argument("--json-only", action="store_true")
     b.add_argument("--csv-schema", choices=("internal", "corpus", "masters"),
                    default="internal",
@@ -570,6 +724,77 @@ def build_parser() -> argparse.ArgumentParser:
                         "properties so the CSV imports as a populated table")
     _add_part_size_args(b)
     b.set_defaults(func=cmd_batch)
+
+    sc = sub.add_parser("scan",
+                        help="measure every unmeasured file under a path "
+                             "(album, artist or whole library), in parallel")
+    sc.add_argument("path", nargs="?", default=".",
+                    help="what to measure: an album, an artist, or the library "
+                         "root (default: the current directory)")
+    sc.add_argument("--out", metavar="DIR",
+                    help="root of the mirror tree results are written to; "
+                         "remembered per library root, so it only has to be "
+                         "given once (default ./mtx_out on a first scan)")
+    sc.add_argument("--library-root", metavar="DIR",
+                    help="what the mirror tree's paths are relative to "
+                         "(default: the path being scanned, on a first scan)")
+    sc.add_argument("--jobs", "-j", type=int, metavar="N",
+                    help=f"parallelism budget (default {default_workers()} here: "
+                         f"{cpu_count()} core(s) less headroom, capped at 8). "
+                         "Spent on worker processes first, then on threads "
+                         "within a file when fewer files than workers remain")
+    sc.add_argument("--force", action="store_true",
+                    help="re-measure everything, including files that already "
+                         "have a current result")
+    sc.add_argument("--recheck", action="store_true",
+                    help="decide staleness by hashing each source file instead "
+                         "of trusting its size and modification time")
+    sc.add_argument("--dry-run", action="store_true",
+                    help="list what would be measured, and why, then stop")
+    sc.add_argument("--no-summary", action="store_true",
+                    help="skip rewriting summary.csv over the scanned subtree")
+    sc.add_argument("--no-dedup", action="store_true",
+                    help="measure every copy of a file separately, instead of "
+                         "copying the result across files with identical bytes")
+    sc.add_argument("--profile", choices=("quick", "full"), default="full")
+    sc.add_argument("--plots", action="store_true")
+    sc.add_argument("--stems", action="store_true")
+    sc.add_argument("--stems-model", metavar="NAME",
+                    help="demucs model (default htdemucs); htdemucs_6s splits "
+                         "guitar and piano out of `other`")
+    sc.add_argument("--stems-device", choices=("auto", "cuda", "cpu"),
+                    default="auto",
+                    help="where to separate (default auto: the GPU if torch "
+                         "can see one). On a GPU the separations are done "
+                         "up front, a few at a time, before the pool starts")
+    sc.add_argument("--stems-jobs", type=int, metavar="N",
+                    help="separations to run on the card at once (default: "
+                         "what its memory holds, about 900 MiB each, capped "
+                         "at 4). One stream leaves a card two thirds busy; "
+                         "the rest of a track is decode and wav writing")
+    sc.add_argument("--stems-lookahead", type=int, metavar="N",
+                    help="how many tracks separation may run ahead of "
+                         "measuring (default: enough to keep every worker "
+                         "fed). Each one waiting is four wavs on disk, so "
+                         "raise it only to ride out a run of long tracks")
+    sc.add_argument("--prune-stems", action="store_true",
+                    help="delete each track's stems once its measurement is "
+                         "written. Stems are cache -- 165 MB a track, "
+                         "reproducible from the master -- and a library needs "
+                         "more disk for them than for the library. Without "
+                         "this a whole-library scan fills the disk")
+    sc.add_argument("--stems-segment", type=int, metavar="SECONDS",
+                    help="seconds of audio demucs holds on the device at once. "
+                         "Lower it if a small card runs out of memory; the "
+                         "default tries 7.8 and steps down only on a failure")
+    sc.add_argument("--transcribe", action="store_true",
+                    help="transcribe the vocal stem for a time-aligned lyric "
+                         "(optional backend, needs --stems)")
+    sc.add_argument("--embed", action="store_true",
+                    help="compute a learned embedding vector (optional backend)")
+    sc.add_argument("--json-only", action="store_true", help="skip digest.md")
+    _add_part_size_args(sc)
+    sc.set_defaults(func=cmd_scan)
 
     c = sub.add_parser("compare", help="level-matched comparison of two files")
     c.add_argument("file_a")
@@ -631,6 +856,25 @@ def build_parser() -> argparse.ArgumentParser:
                                    "MTX_DR14_VALIDATION overrides)")
     v.add_argument("--show", action="store_true", help="print the record and exit")
     v.set_defaults(func=cmd_validate_dr)
+
+    ch = sub.add_parser("cohort",
+                        help="where each track sits among comparable records")
+    ch.add_argument("path", help="a folder of analysed folders")
+    ch.add_argument("--out", metavar="DIR",
+                    help="where cohort.json and cohort.md go (default: PATH)")
+    ch.add_argument("--neighbours", type=int, default=5, metavar="N",
+                    help="nearest neighbours per track (0 to skip)")
+    ch.set_defaults(func=cmd_cohort)
+
+    ex = sub.add_parser("export",
+                        help="flat track and track x section tables over a "
+                             "folder of analyses")
+    ex.add_argument("path", help="a folder of analysed folders")
+    ex.add_argument("--out", metavar="DIR", help="output directory (default: PATH)")
+    ex.add_argument("--level", choices=("track", "section", "both"), default="both")
+    ex.add_argument("--format", choices=("csv", "parquet", "both"), default="csv",
+                    help="parquet needs pyarrow; CSV is always written")
+    ex.set_defaults(func=cmd_export)
 
     s = sub.add_parser("selftest", help="synthetic signals with known answers")
     s.add_argument("--quiet", action="store_true")

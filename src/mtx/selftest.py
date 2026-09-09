@@ -153,6 +153,40 @@ def t_pruned_scan_equivalence(s: Suite) -> None:
             "identical to the full scan")
 
 
+def t_threaded_scan_equivalence(s: Suite) -> None:
+    """Threading the oversampling must not change a single number.
+
+    The scan folds chunk results into running state, and an excursion that
+    straddles a chunk boundary is only counted once if the chunks arrive in
+    order.  This is the regression test for that: the same signal scanned on
+    one thread and on several has to give bit-identical answers, envelope
+    included.
+    """
+    from .dsp import true_peak_scan
+
+    rng = np.random.default_rng(11)
+    # Long enough to cross several chunk boundaries, and hot enough that the
+    # over counting has boundaries to get wrong.
+    x = (rng.standard_normal((SR * 25, 2)) * 0.25).astype(np.float64)
+    x += np.repeat(_sine(997.0, SR * 25 / SR, 0.72)[:, None], 2, axis=1)
+    x = np.clip(x, -0.999, 0.999)
+    thr = [0.0, -0.3, -1.0]
+    for label, kw in (("4x with envelope", dict(env_hop_s=0.001)),
+                      ("16x pruned", dict(env_hop_s=None, thresholds_dbtp=thr))):
+        ov = 4 if "4x" in label else 16
+        one = true_peak_scan(x, SR, ov, workers=1, chunk=1 << 16, **kw)
+        many = true_peak_scan(x, SR, ov, workers=4, chunk=1 << 16, **kw)
+        same = (one["peak"] == many["peak"]
+                and one["peak_time_s"] == many["peak_time_s"]
+                and one["over_counts"] == many["over_counts"]
+                and np.array_equal(one["peak_per_channel"], many["peak_per_channel"])
+                and np.array_equal(one["envelope"], many["envelope"]))
+        s.check(f"{label} scan is identical on 1 and 4 threads", same,
+                f"peak {many['peak']:.9f}, overs {many['over_counts']}, "
+                f"envelope {many['envelope'].size} points",
+                "bit-identical to the single-threaded scan")
+
+
 def t_clipped_below_full_scale(s: Suite) -> None:
     """Trap #1: a hard-clipped sine whose ceiling sits below -0.1 dBFS."""
     from .metrics import dynamics as dyn
@@ -335,6 +369,7 @@ TESTS: list[tuple[str, Callable[[Suite], None]]] = [
     ("sine loudness and peak conventions", t_sine_loudness),
     ("inter-sample peaks", t_intersample_peak),
     ("pruned vs full true-peak scan", t_pruned_scan_equivalence),
+    ("single- vs multi-threaded true-peak scan", t_threaded_scan_equivalence),
     ("clipping below full scale (trap #1)", t_clipped_below_full_scale),
     ("independent stereo noise", t_noise_stereo),
     ("bass fundamental resolution", t_bass_fundamentals),

@@ -296,7 +296,18 @@ def _key(src: AudioSource, librosa, collector: Collector) -> dict[str, Any]:
         collector.low_confidence("structure.key", "low",
                                  f"top two candidates ({top[1]}, {runner[1]}) are "
                                  f"within {margin:.3f} correlation")
+    # `estimate_tuning` returns fractions of a chroma bin, and a bin is a
+    # semitone -- so the deviation is in semitones, not in octaves, and the
+    # reference pitch it implies moves by a twelfth of that.
     tuning = float(librosa.estimate_tuning(y=y, sr=sr))
+    cents = tuning * 100.0
+    if abs(cents) >= PARAMS["structure"]["tuning_report_cents"]:
+        collector.low_confidence(
+            "structure.tuning", "medium",
+            f"the master sits {cents:+.0f} cents from A440 (A4 = "
+            f"{440.0 * 2.0 ** (tuning / 12.0):.1f} Hz). Chroma is estimated "
+            "against the track's own reference, so key and chords are "
+            "unaffected; note names elsewhere are still named from A440")
     return {
         "available": True,
         "key": top[1], "correlation": top[0],
@@ -304,9 +315,16 @@ def _key(src: AudioSource, librosa, collector: Collector) -> dict[str, Any]:
         "margin": margin,
         "confidence": conf,
         "method": "mean chroma-CQT correlated against Krumhansl-Schmuckler profiles",
-        "tuning_cents": tuning * 100.0,
-        "implied_a4_hz": 440.0 * (2.0 ** (tuning)),
+        "tuning_cents": cents,
+        "implied_a4_hz": 440.0 * (2.0 ** (tuning / 12.0)),
         "tuning_method": "librosa.estimate_tuning",
+        "tuning_note": "deviation from A440 within one semitone. The estimate "
+                       "wraps at +/-50 cents, so a master a whole semitone "
+                       "off -- Baroque A=415, a tape played a semitone fast "
+                       "-- reads as 0 cents and shifts the reported key by a "
+                       "semitone instead. chroma-CQT estimates the reference "
+                       "from the track itself, so a fractional detune does "
+                       "not move the key, the chords or the form clustering.",
     }
 
 

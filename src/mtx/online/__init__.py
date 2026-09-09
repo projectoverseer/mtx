@@ -236,6 +236,18 @@ def enrich(analysis: dict[str, Any], cache_dir: str | None = None,
             out["errors"].append(f"{name}: {err}")
         log(f"{name}: {'ok' if res.get('available') else 'no match'}"
             f" ({res.get('requests', 0)} request(s))")
+        if name == "musicbrainz" and res.get("available"):
+            # The providers that run after this one search by name, and the
+            # name in the file's tags is often "A / B (ft. C)" with a typo in
+            # C.  MusicBrainz has already resolved it; handing that on turns a
+            # miss into a hit without a single extra request.
+            rec = res.get("recording") or {}
+            artists = [a.get("name") for a in (res.get("artists") or [])
+                       if isinstance(a, dict) and a.get("name")]
+            if artists:
+                local["resolved_artist"] = artists[0]
+            if rec.get("title"):
+                local["resolved_title"] = rec["title"]
 
     # -- genre vote ----------------------------------------------------------
 
@@ -254,13 +266,22 @@ def enrich(analysis: dict[str, Any], cache_dir: str | None = None,
         "discogs:genre": dg.get("genres"),
         "file:tag": [local["genre_tag"]] if local.get("genre_tag") else None,
     }
-    out["genres"] = genre.collect({k: v for k, v in genre_sources.items() if v})
+    artist_names = [local.get("artist") or ""]
+    artist_names += [a.get("name") for a in (mb.get("artists") or [])
+                     if isinstance(a, dict)]
+    out["genres"] = genre.collect(
+        {k: v for k, v in genre_sources.items() if v}, exclude=artist_names)
+    # Every name attached to this record, so that "billie eilish" cannot end
+    # up in a mood vocabulary alongside "nocturnal" and "party".
+    artist_names += [p.get("name") for p in
+                     ((out.get("credits") or {}).get("main artist") or [])
+                     if isinstance(p, dict)]
     out["descriptive_tags"] = genre.collect_tags({
         "musicbrainz:recording": mb.get("tags_recording"),
         "musicbrainz:release-group": mb.get("tags_release_group"),
         "lastfm:track": lf.get("tags_track"),
         "lastfm:artist": lf.get("tags_artist"),
-    })
+    }, exclude=artist_names)
 
     # -- cross-checks --------------------------------------------------------
 
@@ -278,14 +299,35 @@ def enrich(analysis: dict[str, Any], cache_dir: str | None = None,
         "file_tag": local.get("date") or None,
         "musicbrainz_release": (mb.get("release") or {}).get("date"),
         "musicbrainz_first": (mb.get("release_group") or {}).get("first_release_date"),
+        # The earliest release group the recording appears on anywhere, which
+        # is when the *song* came out rather than when this package did.
+        "musicbrainz_song": mb.get("first_release_date"),
         "deezer": dz_track.get("release_date"),
         "itunes": ((out.get("itunes") or {}).get("track") or {}).get("release_date"),
     }
-    known = sorted(d for d in dates.values() if d)
+    known = [d for d in dates.values() if d]
+    earliest = match.earliest_date(known)
+    agreed, votes, total = match.consensus_date(known)
     out["cross_checks"]["release_date"] = {
         "sources": dates,
-        "earliest": known[0] if known else None,
-        "agree": len({d[:10] for d in known}) <= 1 if known else None,
+        # When this release came out, by majority.  One provider returning a
+        # wrong year must not be able to redate the record on its own.
+        "consensus": agreed,
+        "consensus_votes": votes,
+        "sources_with_a_date": total,
+        # The earliest any source offers, kept because a reissue and an
+        # original genuinely differ and the gap is the finding.
+        "earliest": earliest,
+        # When the *song* first appeared anywhere, which is a different
+        # question from when this package did: a 2015 documentary soundtrack
+        # carries recordings from 2003.
+        "song_first_release": mb.get("first_release_date"),
+        # `2020` and `2020-06-29` are one claim at two resolutions.  Taking a
+        # plain string minimum kept the vague one and threw the day away, which
+        # is why 365 of 1,321 releases were dated only to the year.
+        "precision": {4: "year", 7: "month"}.get(len(agreed or ""), "day")
+        if agreed else None,
+        "agree": len({str(d)[:4] for d in known}) <= 1 if known else None,
     }
 
     # -- rolled up -----------------------------------------------------------
@@ -316,6 +358,14 @@ def enrich(analysis: dict[str, Any], cache_dir: str | None = None,
               (out.get(p) or {} for p in providers)
               if isinstance(r, dict) and isinstance(r.get("match"), dict)]
     out["match_confidence"] = round(sum(scores) / len(scores), 4) if scores else 0.0
+    # When the play counts were actually read, which on a cached run is not
+    # when this run happened.  An observation dated today carrying yesterday's
+    # number is worse than no observation: it looks like a fresh reading, and
+    # a daily pipeline would mint one every morning forever.
+    stamps = [(out.get(p) or {}).get("fetched_utc")
+              for p in ("lastfm", "deezer")]
+    stamps = [s for s in stamps if s]
+    out["popularity_observed_utc"] = min(stamps) if stamps else None
     out["cache"] = dict(client.stats)
     out["elapsed_seconds"] = round(time.time() - t0, 3)
     return out

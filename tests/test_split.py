@@ -114,3 +114,44 @@ def test_a_long_list_is_cut_into_absolute_slices(tmp_path):
     for a, b in zip(slices, slices[1:]):
         assert a[1] == b[0], "slices are consecutive and absolute"
     assert load_analysis(str(tmp_path / "analysis.json")) == doc
+
+
+def test_a_re_run_leaves_no_parts_from_the_last_one(tmp_path):
+    """A folder holds one result, not the union of every result written there.
+
+    `mtx scan --force` re-analyses into a folder that already has output, and a
+    smaller document needs fewer parts.  Orphans are never read -- the index
+    names the parts it owns -- but a stale `analysis.part07.json` sitting next
+    to a current `analysis.part01.json` is indistinguishable from real data to
+    anyone reading the folder.
+    """
+    big = {"spectrum": {"ltas": list(range(40000))}, "headline": {"lufs_i": -8.0}}
+    first = write_analysis(big, str(tmp_path), max_bytes=20_000)
+    assert len(first) > 4
+
+    small = {"spectrum": {"ltas": list(range(2000))}, "headline": {"lufs_i": -8.0}}
+    second = write_analysis(small, str(tmp_path), max_bytes=20_000)
+    assert len(second) < len(first)
+
+    on_disk = {n for n in os.listdir(str(tmp_path)) if n.startswith("analysis.part")}
+    assert on_disk == {n for n in second if n.startswith("analysis.part")}
+    assert load_analysis(str(tmp_path / "analysis.json")) == small
+
+
+def test_shrinking_below_the_cap_clears_every_part(tmp_path):
+    write_analysis({"spectrum": {"ltas": list(range(40000))}}, str(tmp_path),
+                   max_bytes=20_000)
+    assert any(n.startswith("analysis.part") for n in os.listdir(str(tmp_path)))
+    tiny = {"headline": {"lufs_i": -8.0}}
+    written = write_analysis(tiny, str(tmp_path), max_bytes=20_000)
+    assert list(written) == ["analysis.json"]
+    assert not [n for n in os.listdir(str(tmp_path)) if n.startswith("analysis.part")]
+    assert load_analysis(str(tmp_path / "analysis.json")) == tiny
+
+
+def test_pruning_only_touches_its_own_stem(tmp_path):
+    """A `comparison.*` split in the same folder is not this document's to clean."""
+    (tmp_path / "comparison.part01.json").write_text("{}", encoding="utf-8")
+    write_analysis({"spectrum": {"ltas": list(range(40000))}}, str(tmp_path),
+                   max_bytes=20_000)
+    assert (tmp_path / "comparison.part01.json").exists()

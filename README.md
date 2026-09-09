@@ -54,6 +54,10 @@ with the measured value for each. It exits non-zero if anything fails.
 mtx analyze <file> [--out DIR] [--profile quick|full] [--plots] [--stems]
                    [--blind] [--sections A,B,C] [--digest-budget 20k] [--json-only]
                    [--max-part-size 4.5m] [--no-split]
+mtx scan [PATH] [--out DIR] [--library-root DIR] [-j N] [--force] [--recheck]
+                [--dry-run] [--profile quick|full] [--json-only] [--no-summary]
+                [--no-dedup] [--stems] [--stems-model NAME]
+                [--stems-device auto|cuda|cpu] [--stems-segment SECONDS]
 mtx batch <dir> [--out DIR] [--recursive] [--csv summary.csv]
                 [--csv-schema internal|corpus]
 mtx compare <fileA> <fileB> [--out DIR] [--null-test]
@@ -67,6 +71,9 @@ mtx --version
 
 - `analyze` — the main path. `--profile full` is the default; `quick` skips the
   expensive DSP (see the profile table below).
+- `scan` — the way to measure more than one file. Takes an album, an artist or a
+  whole library, measures in parallel, skips what it has already measured, and
+  survives being interrupted. See *Scanning a library* below.
 - `batch` — one JSON per file plus a single CSV of headline metrics, one row per
   track. This is how you bootstrap a reference library from records you own.
   `--csv-schema corpus` names the columns after the properties a corpus
@@ -91,6 +98,87 @@ mtx --version
   embedded tags; the filename is used when the file carries no title tag.
 - Progress goes to stderr; stdout carries only the output path.
 - Exit codes: `0` success, `1` unreadable input, `2` a self-test assertion failed.
+
+### Scanning a library
+
+`mtx scan` measures whatever the path covers. The scope is the only thing that
+changes between these three:
+
+```text
+mtx scan "E:\Music"                        # the whole library
+mtx scan "E:\Music\Ed Sheeran"             # one artist
+mtx scan "E:\Music\Ed Sheeran\÷"           # one album
+mtx scan                                   # whatever the shell is sitting in
+```
+
+Results land in a mirror of the library tree, so a track measured as part of a
+library scan and the same track measured on its own are the same folder:
+
+```text
+E:\Music\Ed Sheeran\÷\04. Shape of You.flac
+E:\mtx_out\Ed Sheeran\÷\04. Shape of You\analysis.json
+                                          \digest.md
+                                          \corpus_row.json
+                                          \mtx_source.json
+```
+
+That mapping needs to know where the library starts, so say it once:
+
+```text
+mtx scan "E:\Music" --out "E:\mtx_out" --dry-run
+```
+
+The root is recorded (in the user config directory, not in the music folder,
+which is never written to) and every later `mtx scan` from any level underneath
+resolves to the same tree with no flags at all. Until a root is registered,
+`mtx scan` refuses to guess one rather than strand a first scan's results in a
+tree the next one will not look in.
+
+**Nothing is measured twice.** Each output folder carries `mtx_source.json`, a
+receipt naming the file it came from — size, modification time, sha256, profile,
+schema version. A scan reads those, not the audio, so a library that is already
+measured is re-checked in under a second. A track is measured again only when
+its source changed, the profile changed, or the schema version moved:
+
+```text
+[mtx] 597 file(s) found: 585 already measured, 12 to do
+```
+
+Because the receipt is written per track, an interrupted scan is resumable:
+stop it with Ctrl-C, run it again, and it picks up where it left off. There is
+no progress file to lose.
+
+**And not twice under two names.** Every number mtx reports is a function of the
+audio bytes, so a single sitting next to the album it was lifted from has one
+measurement between the two files — the second copy adopts it instead of
+spending the minutes again, which with `--stems` is most of a scan:
+
+```text
+[mtx] 37 file(s) found: 0 already measured, 34 to do, 3 identical to another file
+[mtx] copied Watermelon Sugar.flac: same bytes as 02. Watermelon Sugar.flac
+```
+
+Copies are found by sha256, and the twin may have been measured a month ago
+under a different album — the receipts already in the mirror tree are what is
+searched. Only files that share a size with something are ever hashed, so a
+library with no duplicates in it is never read to discover that. A duplicate's
+folder is an ordinary result, digest and corpus row and all; `run.duplicate_of`
+in its `analysis.json` names the file the numbers were measured on. The one
+input that does not travel with the bytes is a `declared.json` sidecar, since it
+sits next to the audio: two copies that disagree about what was declared are
+measured separately.
+
+- `--force` re-measures everything.
+- `--no-dedup` measures every copy separately.
+- `--recheck` decides staleness by hashing each source rather than trusting its
+  modification time. Slower, and the right choice after copying a library
+  between drives, which rewrites every mtime.
+- `--dry-run` lists what would be measured and why, and stops.
+- `-j N` sets the parallelism budget (see *Profiles and performance*).
+
+`summary.csv` is rewritten over the scanned subtree at the end of every run,
+covering every track under it that has a result — including ones measured on an
+earlier run — with the same column names `--csv-schema corpus` uses.
 
 ### Predicting before measuring
 
@@ -445,14 +533,223 @@ Convention, stated in the output as well: `mid = (L+R)/2`, `side = (L-R)/2`.
 | `reverb` | s, dB | Schroeder reverse integration after strong onsets, per octave band: T20, T30, early-to-late, tail L/R correlation | `reverb` |
 | `transient_density` | per s | per-band envelope rises of 6 dB within 20 ms | — |
 
+### Harmony (`harmony`)
+
+The chord track. Not a learned model: binary chord-tone templates matched by
+Pearson correlation against beat-synchronous chroma, smoothed by a Viterbi pass
+with one self-transition probability, so every number is reproducible from
+`params.harmony` alone and adds no dependency.
+
+| Metric | Unit | Method | Parameter |
+| --- | --- | --- | --- |
+| `chords[]` | s | 13 qualities x 12 roots plus a no-chord state, merged into segments with a per-segment match score | `harmony` |
+| `chords[].inversion`, `slash_label` | — | the chord root against a low-register (C1, two-octave) chroma | — |
+| `harmonic_rhythm` | per bar, per s | chord changes, with the caveat that a bar comes from `structure.tempo` | — |
+| `degrees` | % | roman-numeral reduction against `structure.key`; diatonic vs borrowed chord time | — |
+| `loop` | bars | shortest period in 1/2/4/8/16 bars whose chord sets repeat above the threshold | `loop_candidate_bars` |
+| `cadences` | count | V-I, IV-I, V-vi, I-V degree transitions | `cadence_degrees` |
+| `pedal_points[]` | s | the bass note holds while the chord root moves | `pedal_min_chords` |
+| `modulation` | — | sliding-window Krumhansl-Schmuckler; always `confidence: low` | `modulation` |
+| `key_from_chords` | — | the key whose scale explains the most chord time, plus tonic evidence | `key_from_chords` |
+| `key_cross_check` | — | the chord-track key against `structure.key`; a disagreement is a FLAG | — |
+
+**Measured accuracy.** Against seven published, human-transcribed chord charts
+the recogniser spends **82% of chord time** on a chord whose root and triad
+quality appear in the chart (86% at root level). `key_from_chords` got **4 of 7**
+published keys; `structure.key` got 5 of 7 on the same tracks. So the chord
+track is a genuine second opinion on the key and not a better one, its failure
+mode is the relative major/minor, and the block says so with a confidence.
+
+### Rhythm (`rhythm`)
+
+A tempo is not a groove: without a downbeat there is no bar.
+
+| Metric | Unit | Method | Parameter |
+| --- | --- | --- | --- |
+| `downbeats` | — | meter and phase that maximise the mean downbeat accent, where accent is the z-scored sum of onset strength, 20–120 Hz energy and chroma change at each beat | `meters` |
+| `tempo_octave` | ratio | onset strength at the midpoints between beats, and the weaker of the two alternating beat phases | `octave_check` |
+| `swing` | ratio | median position of the off-beat onset nearest each beat midpoint; 0.5 is straight, 0.667 is a triplet shuffle | `swing` |
+| `grid.deviation` | ms | onset-to-nearest-grid distance at 5.8 ms onset resolution, with a programmed-grid inference | `grid_subdivision` |
+| `syncopation` | per bar | Longuet-Higgins & Lee weights over a 16-step bar | — |
+| `beat_position_profile` | dB | kick- and snare-band level per position in the bar; four-on-the-floor and backbeat are only claimed once a kick pattern exists | — |
+| `pulse_rate` | per beat | onsets per beat per section, and half/double-time switches | — |
+
+**A caveat the block reports on itself.** `structure.tempo` picks one metrical
+level, and on the seven reference tracks it reported half the published tempo
+once and double it once. `tempo_octave` measures the ambiguity but does not
+resolve it: on that set it raised no false alarm on the four correct tempos and
+detected none of the three wrong ones, because the classes overlap. Read the
+two ratios, and read `bar_count` and `changes_per_bar` knowing what they are
+divided by.
+
+### Song form (`form`)
+
+Two stages, kept apart. Sections are clustered into **letters** by cosine
+distance over their measured vectors and consecutive same-letter sections are
+merged into **parts** — that is the measurement. Function names (verse, chorus,
+bridge) are an **inference** over it by the rules in `params.form`, and every
+label carries the evidence that produced it and a confidence.
+
+Two guards keep the inference from overreaching, because it is the one part of
+the tool where a wrong answer looks exactly like a right one:
+
+- **A section that sings is never merged with one that does not**, whatever the
+  cosine distance says, whenever a vocals stem exists to say which is which.
+  Vocal presence is measured; the distance is a guess. Without this an
+  instrumental hook and the final chorus sung over it merge into one letter —
+  measurably, on real records, because the hook dominates the timbre of both —
+  and the track loses a chorus.
+- **`section` is the floor of the label ladder.** A part no rule can name is
+  named that, counted in `form.unnamed_part_count`, and raised as a
+  low-confidence note; `bridge` is withheld from an unrepeated part louder than
+  the chorus, which is the one thing a bridge characteristically is not.
+
+So `chorus_count` counts only the parts the rules could name, and the digest
+says so on the row itself:
+
+```text
+Form                  ABCDCDCEA (inferred; 1 of 9 parts unnamed)
+Chorus                2 x, 39.6 % of the track (inferred; 1 of 9 parts unnamed)
+```
+
+That is a real limit, not a formality. Where the letters are wrong the form is
+wrong, and the honest signal is the unnamed count next to it.
+
+Gives what people actually ask a record: time to the first chorus in seconds
+and as a fraction, intro length, time to vocal entry, chorus count and share,
+whether the second chorus is arranged up from the first, ending type, and
+loopability. An optional `allin1` model is reported beside the measurement,
+never merged into it.
+
+### Delivery conditions (`delivery`)
+
+What the master does once it is distributed — all local, all offline, and one
+of the two things an unfinished mix can actually use.
+
+| Metric | Unit | Method | Parameter |
+| --- | --- | --- | --- |
+| `encode` | LUFS, dBTP, dB | ffmpeg encode to AAC 256 and Opus 128, decoded back and re-measured; new true-peak overs and HF damage | `encodes` |
+| `small_speaker` | %, LU | what survives a 400 Hz – 8 kHz band-pass | `small_speaker_band_hz` |
+| `mono_fold` | LU, dB | the mono sum, loudness-weighted and per octave | — |
+| `excerpts` | LUFS, dBTP | the first 15 s, the first 30 s, and the chorus as a 15 s clip | `excerpt_s` |
+
+### Lyrics (`lyrics`)
+
+A **declared** lyric beats a **tag** beats a **transcript**, and the source
+travels with the text. Language is detected before anything English-specific
+runs: the syllable counter and the readability score decline rather than
+produce a meaningless number. Shape (counts, type-token ratio, repetition,
+compression ratio, longest and most repeated n-gram, pronouns, title
+occurrences) is measured; valence and concreteness need a lexicon that does not
+ship with mtx and report `available: false` with what to install.
+
+### Declared metadata (`declared`) and version identity (`version`)
+
+For your own unreleased work the splits, the publisher and the lyric are not
+missing — they are unentered. A `declared.json` sidecar supplies them, and every
+value is reported with `source: "declared"` and never merged into a measured
+field or into `online.*`. Version identity is derived from tags alone: two files
+that agree on `work_key` and differ on `markers` are two versions of one song.
+
+### Coverage (`coverage`)
+
+One uniform mask over the whole document: which of the N features are present,
+and how far each is trusted, so a consumer does not have to rediscover that by
+walking the document itself.
+
 ### Stems (`stems`, only with `--stems`, rendered as `## STEMS` in the digest)
 
 `demucs` (htdemucs, 4 stems) runs locally and the loudness, dynamics, spectrum
 and stereo metric sets are computed on each stem, plus its level relative to the
-mix in dB and LUFS. Separated stems are cached under `~/.cache/mtx/stems` so
-re-runs are cheap. Every stem-derived number carries `source: "separated"`,
-because separation artefacts are real and a stem measurement is not a mix
-measurement.
+mix in dB and LUFS. Separated stems are cached under `~/.cache/mtx/stems`,
+**keyed on the file's contents**, so re-runs are free and the same master
+separates once however many copies of it your library holds. Every stem-derived
+number carries `source: "separated"`, because separation artefacts are real and
+a stem measurement is not a mix measurement. `--stems-model htdemucs_6s` splits
+guitar and piano out of `other` at no new dependency.
+
+**Separation is the expensive half of a stems run, and it goes on the GPU if
+there is one.** `--stems-device` defaults to `auto`: the card when torch can see
+one, the CPU otherwise. The two are scheduled differently, because the
+constraint is different:
+
+- On the **CPU**, separations run inside the scan's worker processes, several
+  files at a time, one core each. Give the scan as many workers as you have
+  physical cores (`-j 6` on a six-core machine) — this is the one phase that
+  will use them all.
+- On a **GPU**, a card holds one separation, not four, so they are taken out of
+  the pool and run up front, back to back, each with the whole card and every
+  core for the decode and write around it. The pool that follows finds them all
+  cached and spends its processes on the DSP.
+
+Card memory is what limits separation, not card speed, and the knob is
+`--stems-segment` — the seconds of audio held on the device at once. You should
+not need it: mtx starts at 7.8 s and steps down only when the card actually
+reports out of memory, remembers what fitted, and starts there for every later
+track rather than rediscovering it per file. If nothing fits it falls back to
+the CPU, because slow beats absent.
+
+Separation is also the gate on four measurements that only exist once there is
+more than one signal, all computed from a single load of the stems:
+
+- **`masking`** — every other stem number in this tool is measured in isolation
+  or against the mix. This measures each stem *against another stem*, which is
+  the whole of mix engineering: a per-band masking matrix, spectral overlap per
+  pair, masking release across sections, and the vocal-to-instrumental balance
+  per section. Plus, from the vocal stem alone: sibilance behaviour as a dB/dB
+  slope (de-esser evidence), the high-pass corner, reverb send and pre-delay,
+  and tempo-synced delay throws.
+- **`melody`** — `librosa.pyin` on the vocal and bass stems. Read
+  `range.p5_p95_semitones`: checked against two published vocal ranges the
+  duration-weighted percentiles landed within a semitone of both, while the raw
+  extremes came out 40–58 semitones wide, because a monophonic tracker on a
+  separated stem makes octave errors on 7–12% of note time and one of them sets
+  the maximum. Those outliers are counted and reported rather than hidden.
+  Also intervals, phrases, vibrato, chromaticism, contour per section,
+  sung-vs-rapped, and a **pitch-quantisation signature** — grid deviation and
+  note-to-note transition time, reported as forensics and never as a verdict
+  about a singer.
+- **`arrangement`** — entry and exit per stem in seconds and bars, concurrent
+  source count over time, drum-machine evidence, 808 behaviour and glide,
+  vocal stacking, lead-versus-backing balance and call-and-response.
+- **`microtiming`** — "the drums are dragging" as the median onset deviation
+  from the beat grid, per stem. Read `median_minus_common_mode_ms`: the beat
+  tracker and the onset detector each carry a constant lag which is identical
+  for every stem and cancels between them.
+
+---
+
+## `cohort` — where a track sits among comparable records
+
+`-7.77 LUFS` means nothing on its own. `mtx cohort <folder>` reads a folder of
+analysed folders and writes `cohort.json` and `cohort.md` **beside** them: per
+metric, the percentile and z-score within a `(genre, year)` cohort, within the
+whole corpus and within the same artist's other tracks, plus a distance to the
+cohort centroid and nearest neighbours.
+
+**It is deliberately not part of `analyze`.** A per-track measurement must not
+depend on what else happens to be in the folder — that would break
+reproducibility, which is property one. The absolute numbers are never touched.
+
+Cohort labels come from `enrich` for published records and from a declared
+sidecar for an unreleased one, which is the useful direction: a mix in progress
+can be positioned against the released records it is competing with, provided
+you state what it should be compared to. The most specific cohort with enough
+members wins, and the fallback is recorded.
+
+The **corpus hygiene** report is part of the output, not a footnote: it names a
+corpus too small or too dominated by one artist for its percentiles to mean
+anything. `typicality.mean_abs_z` is a distance from the cohort centre, not a
+rating.
+
+## `export` — flat tables at track and section level
+
+`mtx export <folder>` writes `mtx_tracks.csv` (one row per track, every scalar
+under its dotted path) and `mtx_sections.csv` (one row per track x section,
+joining the measured section vector to the form label, the per-section masking
+indices, pulse rate, melodic contour and arrangement density). Parquet too,
+when `pyarrow` is installed. The per-section vectors are the most valuable part
+of the dump and were previously the hardest to get at.
 
 ---
 
@@ -514,6 +811,66 @@ Notes on how that is achieved, since the numbers are otherwise surprising:
 - The band split, the long-term spectra and the librosa features (onset
   envelope, chroma-CQT) are each computed once per run and shared.
 
+### Where a full run actually goes
+
+Profiled on a 3:54 track, 44.1 kHz / 24-bit stereo, full profile, no stems:
+
+| Stage | Time | Share |
+| --- | --- | --- |
+| loudness, true peak, DR | 16.6 s | 33% |
+| processing forensics | 9.0 s | 18% |
+| structure, tempo, key | 6.9 s | 14% |
+| spectrum | 5.8 s | 11% |
+| stereo field | 4.7 s | 9% |
+| source forensics | 4.6 s | 9% |
+| dynamics | 1.8 s | 4% |
+| file, container, decode | 1.2 s | 2% |
+
+Inside that, the four heaviest leaves are the true-peak oversampling
+(`resample_poly`: 12.9 s on one thread, 10.5 s of it the 16x pass), the HPSS
+median filters (5.4 s), the zero-phase band filters (`sosfiltfilt`, 5.5 s
+across 21 calls) and roughly twenty thousand short FFTs from the per-frame
+Welch loops.
+
+The 16x pass is also where the pruning described above stops helping. It is
+still exact, but on a master that runs into a limiter the bound it tests is
+cleared nearly everywhere: on the track above it scanned **98.5%** of the file.
+Pruning earns its keep on dynamic material and is close to free on modern pop,
+which is the material this tool is usually pointed at — so that pass is
+threaded rather than relied on to skip work.
+
+### Two layers of parallelism, which never multiply
+
+Between files there is no shared state, so `mtx scan` runs **one process per
+physical core**. Within one file only some of the work can be threaded, because
+only some of it lets go of the GIL — measured here, on scipy 1.18 / numpy 2.5:
+
+| Primitive | Used by | GIL | 4 threads |
+| --- | --- | --- | --- |
+| `resample_poly` / `upfirdn` | true peak | released | 3.8x |
+| `ndimage.median_filter` | HPSS | released | 3.1x |
+| `lfilter` | K-weighting | released | 2.7x |
+| `sosfilt` / `sosfiltfilt` | band split | **held** | 1.2x |
+| `welch`, `rfft` | every spectrum | **held** | 1.1x |
+
+So threads are spent on the true-peak scan and nowhere else; the GIL-bound
+majority of the work is why the between-files layer is the one that matters.
+`-j N` is a single budget covering both: processes are taken first, and threads
+only pick up the slack when fewer files remain than there is room to run. On a
+6-core machine `-j 5` means five processes with one thread each while there is a
+queue, and one process with five threads for the last file.
+
+Threading the true-peak scan changes no output. The oversampling of each chunk
+is pure, and the results are folded back into the running scan in chunk order,
+so an inter-sample over that straddles a chunk boundary is still counted once.
+`mtx selftest` asserts that a scan on one thread and on four are bit-identical,
+envelope included, and the whole 309,611-value `analysis.json` of a real track
+is unchanged at every thread count.
+
+Memory is the other limit: about 0.5 GB of resident memory per worker on a
+44.1 kHz track (measured), and proportionally more at higher rates, so the
+default stops at 8 workers however many cores are present.
+
 Memory is proportional to duration: the file is decoded once into float32 in
 chunked reads, and band-split work runs at `min(native_sr, 48000)` because every
 analysis band tops out at 20 kHz. Forensics deliberately run at the file's own
@@ -542,6 +899,14 @@ mtx selftest    # the synthetic-signal suite
 ```
 
 `SCHEMA.md` documents every field of `analysis.json`.
+
+`GAPS.md` documents what the tool does **not** measure — an audit of the musical
+content that never reaches the dump (harmony, melody, groove, song form,
+instrument identity, inter-stem masking, lyric meaning), what each gap would
+cost, which of them must stay outside `src/mtx/` to keep the tool's five
+properties intact, and which need the song to have been *released* before their
+data exists at all. Ten of the twelve are available on an unreleased master.
+Read it before proposing a new metric module.
 
 ## Licence
 
