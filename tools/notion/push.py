@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 from client import Notion, NotionError            # noqa: E402
 from env import load_env                          # noqa: E402
-from rows import (OBSERVATION_SCHEMA, body_blocks, database_schema,  # noqa: E402
+from rows import (body_blocks, database_schema,  # noqa: E402
                   load_cohorts, load_folder, load_identities,
                   load_outcomes,
                   observations_for,
@@ -47,8 +47,30 @@ from schema import PROPERTIES, TRAIT_VERSION, dig  # noqa: E402
 
 from mtx.cli import _enrich_targets               # noqa: E402
 
-TRACKS_DB = "Corpus"
-OBSERVATIONS_DB = "Corpus Observations"
+TRACKS_DB = "Tracks"
+OBSERVATIONS_DB = "Track Observations"
+
+# Workspace v4 (2026-10-04): the one 230-column Corpus table is three tables that share Title and sha256 --
+# Tracks (which track it is), Track Sound (how it sounds), Track Writing (how it is written).  split.json says
+# which table each column lives in and holds the four database ids; a column schema.py gains later and
+# split.json does not name goes to Tracks.  Corpus called the musical key "Key"; v4 keeps "Key" for a row's own
+# identifier, so that one column is renamed on the way out.
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "split.json"), encoding="utf-8") as _fh:
+    SPLIT = json.load(_fh)
+PARTS = ("tracks", "sound", "writing")
+PART_NAMES = {"tracks": "Tracks", "sound": "Track Sound", "writing": "Track Writing"}
+
+
+def split_props(props: dict) -> dict[str, dict]:
+    """One page's properties (or the schema), divided among the three tables."""
+    out: dict[str, dict] = {part: {} for part in PARTS}
+    for name, value in props.items():
+        if name in SPLIT["shared"]:
+            for part in PARTS:
+                out[part][name] = value
+        else:
+            out[SPLIT["table"].get(name, "tracks")][SPLIT["rename"].get(name, name)] = value
+    return out
 
 
 def log(msg: str) -> None:
@@ -188,41 +210,30 @@ def add_new_properties(api: Notion, db_id: str, wanted: dict) -> list[str]:
 
 
 def ensure_databases(api: Notion, parent: str, state: State,
-                     dry_run: bool) -> tuple[str, str]:
+                     dry_run: bool) -> tuple[dict[str, str], str]:
+    """The three track tables and the observations table, by the ids in split.json.
+
+    The tables exist (workspace v4 built them and migrated every row), so nothing is created or looked up by
+    title here.  A state file written against the one Corpus table holds page ids of that table: it is emptied,
+    and `reconcile` rebuilds it from the three tables by sha256.  The stamps are kept, because the migrated rows
+    hold exactly what was last pushed.
+    """
     if dry_run:
-        return "dry-tracks", "dry-observations"
+        return {part: "dry-" + part for part in PARTS}, "dry-observations"
 
+    ids = SPLIT["databases"]
     known = state.data.get("databases") or {}
-    if known.get("tracks") and known.get("observations"):
-        # Still push the schema: a property added to schema.py that never
-        # reached the live database makes every page fail with "Could not find
-        # property".  But send only the properties that are actually missing.
-        add_new_properties(api, known["tracks"], database_schema())
-        return known["tracks"], known["observations"]
-
-    existing = api.find_databases(parent)
-    tracks = existing.get(TRACKS_DB)
-    observations = existing.get(OBSERVATIONS_DB)
-
-    if tracks:
-        # Adding properties to a live database is safe and lets the schema
-        # grow without a rebuild; removing them is not, so this only adds.
-        add_new_properties(api, tracks, database_schema())
-        log(f"reusing {TRACKS_DB} ({tracks})")
-    else:
-        tracks = api.create_database(parent, TRACKS_DB, database_schema())["id"]
-        log(f"created {TRACKS_DB} ({tracks})")
-
-    if observations:
-        log(f"reusing {OBSERVATIONS_DB} ({observations})")
-    else:
-        observations = api.create_database(parent, OBSERVATIONS_DB,
-                                           OBSERVATION_SCHEMA)["id"]
-        log(f"created {OBSERVATIONS_DB} ({observations})")
-
-    state.data["databases"] = {"tracks": tracks, "observations": observations}
-    state.save()
-    return tracks, observations
+    if any(known.get(part) != ids[part] for part in PARTS):
+        state.data["tracks"] = {}
+        state.data["databases"] = dict(ids)
+        state.save()
+        log("state: now on Tracks / Track Sound / Track Writing; pages are reconciled by sha256")
+    # Still push the schema: a property added to schema.py that never reached the live table makes every page
+    # fail with "Could not find property".  But send only the properties that are actually missing.
+    wanted = split_props(database_schema())
+    for part in PARTS:
+        add_new_properties(api, ids[part], wanted[part])
+    return {part: ids[part] for part in PARTS}, ids["observations"]
 
 
 # Files whose content ends up on a track's page.  `mtx_source.json` is in the
@@ -347,7 +358,7 @@ def observation_key(row: dict) -> tuple[str, str, str]:
     return (text("Track sha256"), select("Metric"), day)
 
 
-def reconcile(api: Notion, db_id: str, state: State) -> int:
+def reconcile(api: Notion, db_id: dict[str, str], state: State) -> int:
     """Rebuild the pushed-set from Notion itself, by sha256.
 
     The state file is an optimisation, not the record.  If it is lost, stale,
@@ -356,15 +367,17 @@ def reconcile(api: Notion, db_id: str, state: State) -> int:
     is far more annoying to clean up than a re-push is to wait for.  So the
     live database is asked once at startup and believed over the file.
     """
-    known = dict(state.data.get("tracks") or {})
+    known = {sha: dict(pages) for sha, pages in (state.data.get("tracks") or {}).items()
+             if isinstance(pages, dict)}
     found = 0
-    for page in api.query(db_id):
-        prop = (page.get("properties") or {}).get("sha256") or {}
-        rich = prop.get("rich_text") or []
-        sha = rich[0]["text"]["content"] if rich else ""
-        if sha:
-            known[sha] = page["id"]
-            found += 1
+    for part in PARTS:
+        for page in api.query(db_id[part]):
+            prop = (page.get("properties") or {}).get("sha256") or {}
+            rich = prop.get("rich_text") or []
+            sha = rich[0]["text"]["content"] if rich else ""
+            if sha:
+                known.setdefault(sha, {})[part] = page["id"]
+                found += part == "tracks"
     state.data["tracks"] = known
     state.save()
     return found
@@ -420,17 +433,26 @@ def prune_options(api: Notion, db_id: str, log_fn=log) -> dict[str, int]:
 # --------------------------------------------------------------------------
 
 
-def push_track(api: Notion, db_id: str, doc: dict, page_id: str | None,
-               with_body: bool) -> str:
-    props = properties_for(doc)
-    if page_id:
-        api.update_page(page_id, props)
-        return page_id
-    blocks = body_blocks(doc) if with_body else []
-    page = api.create_page(db_id, props, blocks[:100])
-    if with_body and len(blocks) > 100:
-        api.append_blocks(page["id"], blocks[100:])
-    return page["id"]
+def push_track(api: Notion, db_id: dict[str, str], doc: dict, page_id: dict | None,
+               with_body: bool) -> dict[str, str]:
+    """Write one track: its row in each of the three tables.  Returns {part: page id}.
+
+    A part that already has a page is updated; one that has none is created, so a track that reached only one
+    table before an interruption is completed, never duplicated.  The page body (the full row and the section
+    blocks) is written once, on the Tracks page.
+    """
+    parts = split_props(properties_for(doc))
+    pages = dict(page_id) if isinstance(page_id, dict) else {}
+    for part in PARTS:
+        if pages.get(part):
+            api.update_page(pages[part], parts[part])
+            continue
+        blocks = body_blocks(doc) if with_body and part == "tracks" else []
+        page = api.create_page(db_id[part], parts[part], blocks[:100])
+        if len(blocks) > 100:
+            api.append_blocks(page["id"], blocks[100:])
+        pages[part] = page["id"]
+    return pages
 
 
 def dump(out_dir: str, name: str, payload) -> None:
@@ -468,16 +490,7 @@ def main() -> int:
     args = ap.parse_args()
     load_env(args.root)
 
-    if not args.dry_run and not args.parent:
-        # Only needed to *create* the databases.  Once the state file knows
-        # their ids the parent page is irrelevant, and demanding it turned
-        # every routine re-push -- including the pipeline's -- into a usage
-        # error, after the audit had already passed.
-        known = State(args.state or os.path.join(args.root,
-                                                 ".notion_state.json"))
-        if not (known.data.get("databases") or {}).get("tracks"):
-            ap.error("--parent is required the first time, to say which page "
-                     "the databases should be created under")
+    # --parent is no longer needed: the tables exist and split.json holds their ids (workspace v4).
 
     lock = Lock(os.path.join(args.root, ".notion_push.lock"))
     if not args.dry_run:
@@ -641,7 +654,8 @@ def _run(args) -> int:
     # the retry that fixed the last failure could never trigger it.
     complete = (pushed + skipped) == len(folders) and not failed
     if args.prune_options and not args.dry_run and complete:
-        for db_id, label in ((tracks_db, TRACKS_DB), (obs_db, OBSERVATIONS_DB)):
+        for db_id, label in ([(tracks_db[part], PART_NAMES[part]) for part in PARTS]
+                             + [(obs_db, OBSERVATIONS_DB)]):
             log(f"pruning unused options in {label}")
             prune_options(api, db_id)
     if args.archive_db and not args.dry_run and complete:
@@ -650,7 +664,7 @@ def _run(args) -> int:
             db_id = existing.get(title)
             if not db_id:
                 log(f"archive: no database titled {title!r} under the parent")
-            elif db_id in (tracks_db, obs_db):
+            elif db_id in list(tracks_db.values()) + [obs_db]:
                 log(f"archive: refusing to archive {title!r} -- it is a "
                     f"database this run just wrote to")
             else:

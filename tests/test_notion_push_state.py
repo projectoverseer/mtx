@@ -158,6 +158,9 @@ def test_the_state_file_survives_a_missing_stamps_key(tmp_path):
 
 # --- create or update --------------------------------------------------------
 
+DBS = {"tracks": "db-tracks", "sound": "db-sound", "writing": "db-writing"}
+
+
 class _Api:
     """Records which Notion call a push would make."""
 
@@ -191,17 +194,35 @@ def test_a_known_page_is_updated_not_duplicated(api):
     true the moment a changed stamp could put it there.  Every amended
     analysis would have published a duplicate page beside the original.
     """
-    got = push.push_track(api, "db", {}, "existing-page", False)
+    pages = {"tracks": "p-tracks", "sound": "p-sound", "writing": "p-writing"}
+    got = push.push_track(api, DBS, {}, pages, False)
 
-    assert api.calls == [("update", "existing-page")]
-    assert got == "existing-page"
+    assert api.calls == [("update", "p-tracks"), ("update", "p-sound"), ("update", "p-writing")]
+    assert got == pages
 
 
 def test_an_unknown_track_creates_a_page(api):
-    got = push.push_track(api, "db", {}, None, False)
+    """One row in each of the three tables (workspace v4: Tracks, Track Sound, Track Writing)."""
+    got = push.push_track(api, DBS, {}, None, False)
 
-    assert api.calls == [("create", "db")]
-    assert got == "new-page"
+    assert api.calls == [("create", "db-tracks"), ("create", "db-sound"), ("create", "db-writing")]
+    assert got == {"tracks": "new-page", "sound": "new-page", "writing": "new-page"}
+
+
+def test_a_track_half_written_is_completed_not_duplicated(api):
+    """A track whose Tracks row exists and whose other two do not gets those two, and no second Tracks row."""
+    got = push.push_track(api, DBS, {}, {"tracks": "p-tracks"}, False)
+
+    assert api.calls == [("update", "p-tracks"), ("create", "db-sound"), ("create", "db-writing")]
+    assert got == {"tracks": "p-tracks", "sound": "new-page", "writing": "new-page"}
+
+
+def test_columns_go_to_their_table_and_the_musical_key_is_renamed():
+    parts = push.split_props({"Title": "t", "sha256": "s", "LUFS-I": -9, "BPM": 120, "Key": "C", "Album": "a"})
+
+    assert all(parts[p]["Title"] == "t" and parts[p]["sha256"] == "s" for p in push.PARTS)
+    assert parts["sound"]["LUFS-I"] == -9 and parts["writing"]["BPM"] == 120 and parts["tracks"]["Album"] == "a"
+    assert parts["writing"]["Musical key"] == "C" and not any("Key" in parts[p] for p in push.PARTS)
 
 
 # --- which failures are worth waiting out ------------------------------------
