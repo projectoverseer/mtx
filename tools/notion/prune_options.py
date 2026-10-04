@@ -116,12 +116,19 @@ def main() -> int:
     load_env(args.root)
 
     state = State(args.state or os.path.join(args.root, ".notion_state.json"))
-    db_id = (state.data.get("databases") or {}).get("tracks")
-    if not db_id:
+    dbs = state.data.get("databases") or {}
+    ids = [dbs[part] for part in ("tracks", "sound", "writing") if dbs.get(part)]
+    if not ids:
         log("error: no tracks database in the state file; run push.py first")
         return 2
 
     api = Notion(log=lambda m: None)
+    # Workspace v4: the corpus is three tables (Tracks, Track Sound, Track
+    # Writing).  Each has its own options, so each is pruned on its own.
+    return max(prune_one(api, db_id, args) for db_id in ids)
+
+
+def prune_one(api: Notion, db_id: str, args) -> int:
     try:
         schema = api.request("GET", f"/databases/{db_id}")
         pages = api.query(db_id)

@@ -46,6 +46,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "notion"))
 sys.path.insert(0, os.path.join(HERE, "..", "src"))
+from tables import merged_pages, merged_schema  # noqa: E402  (tools/notion: the three track tables as one)
 
 from env import load_env                          # noqa: E402
 
@@ -1020,13 +1021,13 @@ def check_notion(rep: Report, root: str) -> None:
 
     api = Notion(log=lambda m: None)
     try:
-        tracks_db = api.request("GET", f"/databases/{dbs['tracks']}")
+        tracks_db = merged_schema(api, dbs)      # Tracks + Track Sound + Track Writing, read as one
     except NotionError as exc:
         log(f"  Notion unreachable: {exc}")
         return
 
     used: dict[str, set[str]] = collections.defaultdict(set)
-    pages = api.query(dbs["tracks"])
+    pages = merged_pages(api, dbs)
     for page in pages:
         for name, prop in (page.get("properties") or {}).items():
             if prop.get("type") == "select" and prop.get("select"):
