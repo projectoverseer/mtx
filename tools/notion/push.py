@@ -5,9 +5,10 @@
 
 Two databases are created under the parent page and then kept in place:
 
-* **Corpus** -- one page per analysed folder.  ~150 queryable properties,
-  and the full 2,000-column row, section timeline, chord track and confidence
-  notes in the page body.
+* **Corpus** -- one page per analysed folder.  ~150 queryable properties.  With
+  `--body` the full 2,000-column row, section timeline, chord track and confidence
+  notes are also written as the page (off by default since 2026-10-04: a row of
+  the workspace is its cells; the full row is in the track's folder on disk).
 * **Corpus Observations** -- append-only.  One row per time-varying figure per
   lookup, stamped with `observed_at`.  Re-running after a later `mtx enrich
   --refresh` adds rows; it never edits the old ones, which is what makes a
@@ -476,8 +477,11 @@ def main() -> int:
                     help=("parallel pages (default 6). Pushing is latency-bound, "
                           "not throttle-bound, so this is most of the speed"))
     ap.add_argument("--state", help="resume file (default <root>/.notion_state.json)")
-    ap.add_argument("--no-body", action="store_true",
-                    help="properties only; skip the full row and section blocks")
+    ap.add_argument("--body", action="store_true",
+                    help=("also write the full row and the section blocks as the page of the Tracks row. Off since "
+                          "2026-10-04: a row of the workspace is its cells, and the full measurement stays in the "
+                          "track's folder on disk"))
+    ap.add_argument("--no-body", action="store_true", help=argparse.SUPPRESS)   # the old flag: now the default
     ap.add_argument("--skip-observations", action="store_true")
     ap.add_argument("--force", action="store_true",
                     help="re-push tracks already recorded in the state file")
@@ -488,6 +492,7 @@ def main() -> int:
                     help=("archive a database of this title under --parent "
                           "once the push succeeds; repeatable"))
     args = ap.parse_args()
+    args.no_body = not args.body
     load_env(args.root)
 
     # --parent is no longer needed: the tables exist and split.json holds their ids (workspace v4).
